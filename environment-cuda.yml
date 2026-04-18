@@ -1,0 +1,28 @@
+name: counting-env
+channels:
+  - pytorch
+  - nvidia
+  - conda-forge
+dependencies:
+  - python=3.11
+  - pip
+  - numpy
+  - pillow
+  - pandas
+  - pyyaml
+  - tqdm
+  - scipy
+  - scikit-learn
+  - opencv
+  - pytorch=2.3.*
+  - torchvision=0.18.*
+  - pytorch-cuda=12.1
+  - tensorboard
+  - pytest
+  - pytest-cov
+  - pip:
+      - typer>=0.12
+      - pydantic>=2.0
+      - albumentations
+      - timm
+      - rich

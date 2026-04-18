@@ -1,0 +1,42 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "counting"
+version = "0.1.0"
+description = "Fruit counting pipeline (inference + training)"
+requires-python = ">=3.10"
+readme = "README.md"
+dependencies = [
+  "numpy",
+  "pillow",
+  "pandas",
+  "pyyaml",
+  "pydantic>=2.0",
+  "typer>=0.12",
+  "rich",
+  "tqdm",
+  "opencv-python",
+  "torch>=2.2",
+  "torchvision",
+  "timm",
+  "albumentations",
+  "tensorboard",
+]
+
+[project.optional-dependencies]
+dev = ["pytest", "pytest-cov"]
+
+[project.scripts]
+counting = "counting.cli:app"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+markers = [
+  "slow: integration tests that load models or touch disk",
+]
+addopts = "-q"

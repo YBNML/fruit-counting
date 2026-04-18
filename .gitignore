@@ -1,0 +1,23 @@
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+.pytest_cache/
+.coverage
+htmlcov/
+.DS_Store
+
+# venv/conda artifacts inside repo
+.venv/
+env/
+
+# run outputs
+runs/
+feature_cache/
+reports/
+logs/
+*.log
+
+# editors
+.vscode/
+.idea/
