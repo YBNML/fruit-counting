@@ -4,12 +4,15 @@ from __future__ import annotations
 
 import time
 from dataclasses import dataclass
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import numpy as np
 
 from counting.io.results import CountingResult, CropMeta, StageTiming
 from counting.models.base import Stage
+
+if TYPE_CHECKING:
+    from counting.config.schema import AppConfig  # noqa: F401
 
 _REQUIRED_COUNTING_STAGE = "pseco"
 
@@ -90,7 +93,7 @@ class Pipeline:
         )
 
 
-def build_pipeline(cfg, *, device: str | None = None):
+def build_pipeline(cfg: AppConfig, *, device: str | None = None) -> Pipeline:
     """Construct a Pipeline from an AppConfig, honoring enabled flags."""
     from counting.config.hashing import config_hash
     from counting.models.classification.inference import ClassifierStage

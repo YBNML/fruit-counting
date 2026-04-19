@@ -40,3 +40,22 @@ def test_hash_ignores_device_and_output_dir():
     base = config_hash(_cfg())
     assert config_hash(_cfg(device="auto")) == base
     assert config_hash(_cfg(output_dir="./other")) == base
+
+
+def test_hash_changes_with_checkpoint_path():
+    base = config_hash(_cfg())
+
+    # Changing sam_checkpoint should change the hash
+    other = _cfg(
+        pipeline={
+            "stages": {
+                "pseco": {
+                    "enabled": True,
+                    "sam_checkpoint": "DIFFERENT.pth",
+                    "decoder_checkpoint": "b",
+                    "mlp_checkpoint": "c",
+                }
+            }
+        }
+    )
+    assert config_hash(other) != base

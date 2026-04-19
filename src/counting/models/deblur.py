@@ -37,6 +37,14 @@ class DeblurStage(Stage):
             raise RuntimeError(
                 "DeblurGANv2 source not found under external/. See spec §1 '전제 조건'."
             ) from exc
+        if self.weights:
+            import warnings
+            warnings.warn(
+                f"DeblurStage.weights={self.weights!r} is currently ignored; "
+                "DeblurInference loads a hardcoded path upstream. "
+                "Wire custom weights when Plan 2 addresses this.",
+                stacklevel=2,
+            )
         self._impl = DeblurInference()
         try:
             self._impl.model.eval()
