@@ -23,3 +23,16 @@ def test_resolve_device_cuda_without_cuda_raises(monkeypatch):
 def test_resolve_device_invalid_raises():
     with pytest.raises(ValueError, match="Unknown device"):
         resolve_device("tpu")
+
+
+def test_resolve_device_mps_without_mps_raises(monkeypatch):
+    import torch
+
+    class _FakeMPS:
+        @staticmethod
+        def is_available():
+            return False
+
+    monkeypatch.setattr(torch.backends, "mps", _FakeMPS)
+    with pytest.raises(RuntimeError, match="MPS requested"):
+        resolve_device("mps")

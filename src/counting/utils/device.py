@@ -3,10 +3,16 @@
 from __future__ import annotations
 
 import os
+import sys
 
 import torch
 
 _VALID = {"auto", "cpu", "mps", "cuda"}
+
+# Must be set before any torch MPS op is invoked. Setting at import time
+# guarantees downstream modules that import torch later still see it.
+if sys.platform == "darwin":
+    os.environ.setdefault("PYTORCH_ENABLE_MPS_FALLBACK", "1")
 
 
 def resolve_device(requested: str) -> str:
@@ -23,7 +29,6 @@ def resolve_device(requested: str) -> str:
         if torch.cuda.is_available():
             return "cuda"
         if getattr(torch.backends, "mps", None) is not None and torch.backends.mps.is_available():
-            _enable_mps_fallback()
             return "mps"
         return "cpu"
 
@@ -36,11 +41,6 @@ def resolve_device(requested: str) -> str:
         mps = getattr(torch.backends, "mps", None)
         if mps is None or not mps.is_available():
             raise RuntimeError("MPS requested but not available.")
-        _enable_mps_fallback()
         return "mps"
 
     return "cpu"
-
-
-def _enable_mps_fallback() -> None:
-    os.environ.setdefault("PYTORCH_ENABLE_MPS_FALLBACK", "1")

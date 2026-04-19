@@ -6,7 +6,7 @@ build-backend = "setuptools.build_meta"
 name = "counting"
 version = "0.1.0"
 description = "Fruit counting pipeline (inference + training)"
-requires-python = ">=3.10"
+requires-python = ">=3.11"
 readme = "README.md"
 dependencies = [
   "numpy",
@@ -17,6 +17,8 @@ dependencies = [
   "typer>=0.12",
   "rich",
   "tqdm",
+  "scipy",
+  "scikit-learn",
   "opencv-python",
   "torch>=2.2",
   "torchvision",

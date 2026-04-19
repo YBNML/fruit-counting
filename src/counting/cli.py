@@ -16,6 +16,7 @@ app = typer.Typer(add_completion=False, no_args_is_help=True)
 console = Console()
 
 
+# Suppresses Typer's single-command auto-promotion; keep even when other commands are added.
 @app.callback()
 def _main() -> None:
     """Fruit counting pipeline CLI."""
