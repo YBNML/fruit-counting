@@ -41,13 +41,21 @@ def apply_overrides(cfg: dict[str, Any], overrides: list[str]) -> dict[str, Any]
 def _set_dot_path(node: dict[str, Any], parts: list[str], value: Any) -> None:
     cur: Any = node
     for i, part in enumerate(parts[:-1]):
-        if not isinstance(cur, dict) or part not in cur:
-            raise KeyError(f"Unknown override path segment: {'.'.join(parts[: i + 1])}")
+        if not isinstance(cur, dict):
+            raise KeyError(
+                f"Cannot descend into non-dict at: {'.'.join(parts[: i + 1])}"
+            )
+        if part not in cur or not isinstance(cur[part], dict):
+            cur[part] = {} if part not in cur else cur[part]
+            if not isinstance(cur[part], dict):
+                raise KeyError(
+                    f"Cannot descend: existing value at "
+                    f"{'.'.join(parts[: i + 1])} is not a dict"
+                )
         cur = cur[part]
-    last = parts[-1]
-    if not isinstance(cur, dict) or last not in cur:
-        raise KeyError(f"Unknown override path: {'.'.join(parts)}")
-    cur[last] = value
+    if not isinstance(cur, dict):
+        raise KeyError(f"Cannot set key on non-dict at: {'.'.join(parts[:-1])}")
+    cur[parts[-1]] = value
 
 
 def _coerce(raw: str) -> Any:

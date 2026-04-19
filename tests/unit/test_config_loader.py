@@ -55,9 +55,14 @@ def test_apply_overrides_string():
     assert out["pipeline"]["stages"]["pseco"]["prompt"] == "bagged apple"
 
 
-def test_apply_overrides_rejects_bad_path():
-    with pytest.raises(KeyError):
-        apply_overrides({"a": {"b": 1}}, ["a.c=2"])
+def test_apply_overrides_creates_missing_intermediate():
+    out = apply_overrides({"a": {"b": 1}}, ["a.c=2"])
+    assert out == {"a": {"b": 1, "c": 2}}
+
+
+def test_apply_overrides_rejects_descend_through_non_dict():
+    with pytest.raises(KeyError, match="not a dict"):
+        apply_overrides({"a": 5}, ["a.b=2"])
 
 
 def test_apply_overrides_rejects_missing_equal():
@@ -82,3 +87,21 @@ def test_load_with_overrides(tmp_path):
     )
     cfg = load_config(p, overrides=["pipeline.stages.pseco.prompt=pear"])
     assert cfg.pipeline.stages.pseco.prompt == "pear"
+
+
+def test_load_with_sparse_yaml_override_creates_io_block(tmp_path):
+    p = _write(
+        tmp_path,
+        """
+        device: cpu
+        pipeline:
+          stages:
+            pseco:
+              enabled: true
+              sam_checkpoint: a
+              decoder_checkpoint: b
+              mlp_checkpoint: c
+        """,
+    )
+    cfg = load_config(p, overrides=["io.output_format=csv"])
+    assert cfg.io.output_format == "csv"

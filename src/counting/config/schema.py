@@ -14,6 +14,14 @@ class DeblurStageConfig(BaseModel):
 
 
 class PseCoStageConfig(BaseModel):
+    """Counting stage (PseCo).
+
+    Note: the default ``enabled=True`` requires all three checkpoint paths to be
+    non-empty. When constructing an instance directly (e.g. in tests), either
+    pass the three checkpoint paths OR set ``enabled=False`` to skip the check.
+    Consumers that only need a placeholder should use ``enabled=False``.
+    """
+
     model_config = ConfigDict(extra="forbid")
     enabled: bool = True
     prompt: str = "protective fruit bag"
