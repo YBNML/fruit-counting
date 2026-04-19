@@ -1,0 +1,27 @@
+device: auto
+seed: 42
+output_dir: ./runs
+
+pipeline:
+  stages:
+    deblur:
+      enabled: true
+      weights: models/deblurganv2/fpn_mobilenet.pth
+    pseco:
+      enabled: true
+      prompt: "protective fruit bag"
+      sam_checkpoint: models/PseCo/sam_vit_h.pth
+      decoder_checkpoint: models/PseCo/point_decoder_vith.pth
+      mlp_checkpoint: models/PseCo/MLP_small_box_w1_zeroshot.tar
+    sr:
+      enabled: false
+      scale: 2.0
+      max_crop_side: 500
+    classifier:
+      enabled: false
+      checkpoint: models/classification/classification_model.pt
+      threshold: 0.5
+
+io:
+  output_format: json
+  save_visualizations: false

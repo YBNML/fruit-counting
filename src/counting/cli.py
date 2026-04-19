@@ -40,5 +40,20 @@ def info() -> None:
     console.print(table)
 
 
+@app.command("validate-config")
+def validate_config(
+    path: str = typer.Argument(..., help="Path to YAML config"),
+    set_: list[str] = typer.Option(
+        None, "--set", help="Dot-path override: key.path=value", show_default=False
+    ),
+) -> None:
+    """Load and validate a YAML config. Prints resolved device."""
+    from counting.config.loader import load_config
+
+    cfg = load_config(path, overrides=set_ or None)
+    device = resolve_device(cfg.device)
+    console.print(f"[green]OK[/green] {path} (device → {device})")
+
+
 if __name__ == "__main__":
     app()
