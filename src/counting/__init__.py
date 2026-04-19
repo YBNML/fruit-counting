@@ -1,11 +1,9 @@
 """counting — fruit counting pipeline."""
 
-# Public API will grow in later tasks:
-#   - Pipeline, build_pipeline        (Task 9, 14)
-#   - load_config                      (Task 3)
-#   - CountingResult                   (Task 8)
-# Re-exports are added as each component is implemented.
+from counting.config.loader import load_config
+from counting.io.results import CountingResult
+from counting.pipeline import Pipeline, build_pipeline
 
 __version__ = "0.1.0"
 
-__all__ = ["__version__"]
+__all__ = ["__version__", "Pipeline", "build_pipeline", "load_config", "CountingResult"]

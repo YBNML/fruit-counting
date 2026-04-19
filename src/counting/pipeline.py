@@ -88,3 +88,41 @@ class Pipeline:
             config_hash=self.config_hash,
             error=error,
         )
+
+
+def build_pipeline(cfg, *, device: str | None = None):
+    """Construct a Pipeline from an AppConfig, honoring enabled flags."""
+    from counting.config.hashing import config_hash
+    from counting.models.classification.inference import ClassifierStage
+    from counting.models.deblur import DeblurStage
+    from counting.models.pseco.inference import PseCoStage
+    from counting.models.sr import SRStage
+    from counting.utils.device import resolve_device
+
+    resolved = resolve_device(device or cfg.device)
+    stages: list[Stage] = []
+
+    s = cfg.pipeline.stages
+    if s.deblur.enabled:
+        st = DeblurStage(weights=s.deblur.weights)
+        st.prepare(cfg)
+        stages.append(st)
+    if s.pseco.enabled:
+        st = PseCoStage(
+            prompt=s.pseco.prompt,
+            sam_ckpt=s.pseco.sam_checkpoint,
+            decoder_ckpt=s.pseco.decoder_checkpoint,
+            mlp_ckpt=s.pseco.mlp_checkpoint,
+        )
+        st.prepare(cfg)
+        stages.append(st)
+    if s.sr.enabled:
+        st = SRStage(scale=s.sr.scale, max_crop_side=s.sr.max_crop_side)
+        st.prepare(cfg)
+        stages.append(st)
+    if s.classifier.enabled:
+        st = ClassifierStage(checkpoint=s.classifier.checkpoint, threshold=s.classifier.threshold)
+        st.prepare(cfg)
+        stages.append(st)
+
+    return Pipeline(stages=stages, device=resolved, config_hash=config_hash(cfg))

@@ -71,5 +71,73 @@ def diagnose(
     )
 
 
+@app.command()
+def infer(
+    image: str = typer.Argument(..., help="Path to image"),
+    config: str = typer.Option(..., "--config", "-c", help="Pipeline YAML"),
+    set_: list[str] = typer.Option(None, "--set", help="Override key.path=value"),
+    output: str = typer.Option(None, "--output", "-o", help="Output JSON path (optional)"),
+) -> None:
+    """Run inference on a single image."""
+    from counting.config.loader import load_config
+    from counting.io.serialize import write_batch_json
+    from counting.pipeline import build_pipeline
+    from counting.utils.image import read_image_rgb
+
+    cfg = load_config(config, overrides=set_ or None)
+    pipe = build_pipeline(cfg)
+    arr = read_image_rgb(image)
+    result = pipe.run_numpy(arr, image_path=str(image))
+
+    console.print(
+        f"image={image} raw_count={result.raw_count} verified={result.verified_count} "
+        f"device={result.device} err={result.error or '-'}"
+    )
+    if output:
+        write_batch_json([result], output)
+        console.print(f"[green]saved[/green] {output}")
+
+
+@app.command()
+def batch(
+    image_dir: str = typer.Argument(..., help="Directory of images"),
+    config: str = typer.Option(..., "--config", "-c", help="Pipeline YAML"),
+    set_: list[str] = typer.Option(None, "--set", help="Override key.path=value"),
+    output: str = typer.Option("./runs/last_batch", help="Output directory"),
+    fmt: str = typer.Option("json", "--format", help="json | csv | both"),
+) -> None:
+    """Run inference over a directory."""
+    from pathlib import Path
+
+    from counting.config.loader import load_config
+    from counting.data.formats.imagefolder import ImageFolderDataset
+    from counting.io.serialize import write_batch_csv, write_batch_json
+    from counting.pipeline import build_pipeline
+
+    cfg = load_config(config, overrides=set_ or None)
+    if fmt not in {"json", "csv", "both"}:
+        raise typer.BadParameter("--format must be json|csv|both")
+
+    ds = ImageFolderDataset(image_dir)
+    pipe = build_pipeline(cfg)
+    results = []
+    for i, rec in enumerate(ds, 1):
+        arr = rec.read_rgb()
+        r = pipe.run_numpy(arr, image_path=str(rec.path))
+        results.append(r)
+        console.print(
+            f"[{i}/{len(ds)}] {rec.relpath} raw={r.raw_count} verified={r.verified_count} "
+            f"err={r.error or '-'}"
+        )
+
+    out_dir = Path(output)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    if fmt in {"json", "both"}:
+        write_batch_json(results, out_dir / "results.json")
+    if fmt in {"csv", "both"}:
+        write_batch_csv(results, out_dir / "results.csv")
+    console.print(f"[green]done[/green] {len(results)} images → {out_dir}")
+
+
 if __name__ == "__main__":
     app()
