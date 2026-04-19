@@ -36,3 +36,16 @@ def test_ensure_np_rgb_from_pil():
 def test_ensure_np_rgb_from_ndarray_passthrough():
     arr = np.zeros((2, 2, 3), dtype=np.uint8)
     assert ensure_np_rgb(arr) is arr
+
+
+def test_ensure_pil_from_numpy_bgr_converts_channels():
+    # Red pixel in BGR ordering (B=0, G=0, R=255)
+    arr = np.zeros((2, 2, 3), dtype=np.uint8)
+    arr[:, :, 2] = 255
+    pil = ensure_pil(arr, assume="bgr")
+    assert isinstance(pil, Image.Image)
+    # In RGB, the red channel should be 255 now at index 0
+    out = np.asarray(pil)
+    assert out[0, 0, 0] == 255
+    assert out[0, 0, 1] == 0
+    assert out[0, 0, 2] == 0

@@ -21,7 +21,7 @@ def ensure_pil(image, *, assume: Literal["rgb", "bgr"] = "rgb") -> Image.Image:
         if image.ndim == 2:
             return Image.fromarray(image)
         if image.ndim == 3 and image.shape[2] == 3:
-            arr = image if assume == "rgb" else image[..., ::-1]
+            arr = image if assume == "rgb" else np.ascontiguousarray(image[..., ::-1])
             return Image.fromarray(arr)
     raise TypeError(f"Cannot convert to PIL.Image: {type(image)}")
 
