@@ -55,5 +55,21 @@ def validate_config(
     console.print(f"[green]OK[/green] {path} (device → {device})")
 
 
+@app.command()
+def diagnose(
+    image_dir: str = typer.Argument(..., help="Directory of images"),
+    report_dir: str = typer.Option("./reports/diagnostics", help="Where to write outputs"),
+) -> None:
+    """Compute resolution/blur/exposure diagnostics for a directory."""
+    from counting.data.diagnostics import diagnose_directory
+
+    r = diagnose_directory(image_dir, report_dir=report_dir)
+    console.print(
+        f"[green]OK[/green] {r.image_count} images → {report_dir}\n"
+        f"  low_blur_ratio={r.blur['low_blur_ratio']}  "
+        f"under={r.exposure['underexposed_ratio']}  over={r.exposure['overexposed_ratio']}"
+    )
+
+
 if __name__ == "__main__":
     app()
