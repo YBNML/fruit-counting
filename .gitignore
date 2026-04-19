@@ -21,3 +21,33 @@ logs/
 # editors
 .vscode/
 .idea/
+
+# legacy code (kept locally for reference, not versioned here)
+original_code/
+
+# third-party model source (expected locally under external/)
+external/
+
+# pretrained weights & checkpoints
+models/
+*.pt
+*.pth
+*.tar
+*.ckpt
+*.safetensors
+*.onnx
+*.bin
+
+# datasets
+datasets/
+data/
+test_data/
+
+# secrets / environment
+.env
+.env.*
+*.pem
+*.key
+credentials.json
+secrets.yaml
+secrets.yml
