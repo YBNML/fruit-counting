@@ -222,5 +222,34 @@ def cache_embeddings(
     console.print(f"  hash={cache_hash}")
 
 
+_train_app = typer.Typer(help="Training entry points", no_args_is_help=True)
+app.add_typer(_train_app, name="train")
+
+
+@_train_app.command("pseco-head")
+def train_pseco_head_cli(
+    config: str = typer.Option(..., "--config", "-c"),
+    set_: list[str] = typer.Option(None, "--set"),
+    resume: str = typer.Option(None, "--resume", help="Path to last.ckpt"),
+) -> None:
+    """Fine-tune the PseCo ROIHeadMLP using cached SAM features."""
+    import yaml
+
+    from counting.config.loader import apply_overrides
+    from counting.config.train_schema import TrainAppConfig
+    from counting.models.pseco.trainer import train_pseco_head
+
+    raw = yaml.safe_load(open(config, "r", encoding="utf-8"))
+    if set_:
+        raw = apply_overrides(raw, list(set_))
+    cfg = TrainAppConfig.model_validate(raw)
+
+    if resume:
+        console.print(f"[yellow]--resume is not yet supported; running from init_mlp[/yellow]")
+
+    train_pseco_head(cfg)
+    console.print("[green]training complete[/green]")
+
+
 if __name__ == "__main__":
     app()
