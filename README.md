@@ -67,7 +67,7 @@ print(result.raw_count, result.verified_count)
 ## 진행 상황
 
 - [x] Foundation (Plan 1): 스캐폴드, 설정, 데이터 진단, 추론 파이프라인
-- [ ] PseCo 학습 (Plan 2)
+- [x] PseCo 학습 (Plan 2): SAM 피처 캐시 + ROIHeadMLP 파인튜닝
 - [ ] Classifier 학습 · SR 통합 · 정돈 (Plan 3)
 
 ## 전제 조건 (external/)
@@ -83,3 +83,33 @@ print(result.raw_count, result.verified_count)
 
 설계 문서: `docs/superpowers/specs/2026-04-19-fruit-counting-redesign-design.md`
 플랜 문서: `docs/superpowers/plans/2026-04-19-fruit-counting-foundation.md`
+
+## 학습
+
+### SAM 피처 캐싱 (학습 전 1회)
+
+```bash
+counting cache-embeddings --config configs/train/pseco_head.yaml
+```
+
+이미지 1장당 2MB (fp16). FSC-147 train (약 4800장) 기준 약 10 GB, 캐싱 시간 30~80분 (GPU).
+
+### ROIHeadMLP 파인튜닝
+
+```bash
+counting train pseco-head --config configs/train/pseco_head.yaml
+```
+
+TensorBoard:
+
+```bash
+tensorboard --logdir runs/pseco_head_v1/tensorboard
+```
+
+### 필요 파일
+
+- `models/PseCo/sam_vit_h.pth` — SAM ViT-H (2.4 GB)
+- `models/PseCo/point_decoder_vith.pth`, `models/PseCo/MLP_small_box_w1_zeroshot.tar` — PseCo 공식 가중치
+- `datasets/fsc147/` — FSC-147 이미지 + 주석 JSON
+
+`python -c "from counting.data.download import print_sam_vit_h_instructions; print_sam_vit_h_instructions('models/PseCo/sam_vit_h.pth')"` 로 SAM 다운로드 명령을 확인할 수 있습니다.
