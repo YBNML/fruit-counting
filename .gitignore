@@ -25,8 +25,12 @@ logs/
 # legacy code (kept locally for reference, not versioned here)
 original_code/
 
-# third-party model source (expected locally under external/)
-external/
+# third-party model source weights inside external/ (submodules tracked by git)
+external/**/*.pt
+external/**/*.pth
+external/**/*.tar
+external/**/*.ckpt
+external/**/*.bin
 
 # pretrained weights & checkpoints
 models/

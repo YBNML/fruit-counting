@@ -1,0 +1,3 @@
+[submodule "external/PseCo"]
+	path = external/PseCo
+	url = https://github.com/Hzzone/PseCo.git
