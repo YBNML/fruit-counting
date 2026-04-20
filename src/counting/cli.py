@@ -139,5 +139,88 @@ def batch(
     console.print(f"[green]done[/green] {len(results)} images → {out_dir}")
 
 
+@app.command("cache-embeddings")
+def cache_embeddings(
+    config: str = typer.Option(..., "--config", "-c", help="Training YAML"),
+    set_: list[str] = typer.Option(None, "--set", help="Override key.path=value"),
+    limit: int = typer.Option(0, help="If >0, only process this many images (smoke)"),
+) -> None:
+    """Precompute SAM embeddings and write to the on-disk feature cache."""
+    import hashlib
+    import yaml
+
+    from tqdm import tqdm
+
+    from counting.config.loader import apply_overrides
+    from counting.config.train_schema import TrainAppConfig
+    from counting.data.cache import FeatureCacheWriter, compute_cache_meta_hash
+    from counting.data.formats.fsc147 import FSC147Dataset
+    from counting.models.pseco.embedding import SAMImageEmbedder
+    from counting.utils.device import resolve_device
+
+    raw = yaml.safe_load(open(config, "r", encoding="utf-8"))
+    if set_:
+        raw = apply_overrides(raw, list(set_))
+    cfg = TrainAppConfig.model_validate(raw)
+
+    device = resolve_device(cfg.device)
+    if device not in {"cuda", "mps", "cpu"}:
+        raise typer.BadParameter(f"Unexpected device: {device}")
+
+    if cfg.data.format != "fsc147":
+        raise typer.BadParameter(
+            f"Only fsc147 is supported in Plan 2; got {cfg.data.format!r}"
+        )
+
+    ds = FSC147Dataset(cfg.data.root, split=cfg.data.train_split)
+
+    # Content hash over fields that, when changed, invalidate the cache.
+    sam_hash = ""
+    sam_ckpt_path = cfg.model.sam_checkpoint
+    if sam_ckpt_path:
+        h = hashlib.sha256()
+        with open(sam_ckpt_path, "rb") as f:
+            while chunk := f.read(1 << 20):
+                h.update(chunk)
+        sam_hash = h.hexdigest()[:16]
+
+    meta_for_hash = {
+        "sam_ckpt_hash": sam_hash,
+        "image_size": cfg.data.image_size,
+        "dtype": cfg.cache.dtype,
+        "dataset_root": cfg.data.root,
+        "split": cfg.data.train_split,
+        "augment_variants": cfg.cache.augment_variants,
+    }
+    cache_hash = compute_cache_meta_hash(meta_for_hash)
+
+    embedder = SAMImageEmbedder(cfg.model.sam_checkpoint, device=device)
+    console.print(f"[loading] SAM ViT-H on {device}")
+    embedder.prepare()
+
+    writer = FeatureCacheWriter(
+        cache_dir=cfg.cache.dir,
+        meta={**meta_for_hash, "hash": cache_hash},
+        shard_size=256,
+        dtype=cfg.cache.dtype,
+    )
+    writer.open()
+
+    records = list(ds)
+    if limit > 0:
+        records = records[:limit]
+
+    for rec in tqdm(records, desc="embedding"):
+        arr = rec.read_rgb()
+        emb = embedder.embed(arr).numpy()
+        writer.write(rec.relpath, emb)
+
+    writer.close()
+    embedder.cleanup()
+
+    console.print(f"[green]done[/green] cached {len(records)} images at {cfg.cache.dir}")
+    console.print(f"  hash={cache_hash}")
+
+
 if __name__ == "__main__":
     app()
