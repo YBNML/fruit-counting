@@ -32,8 +32,8 @@ external/**/*.tar
 external/**/*.ckpt
 external/**/*.bin
 
-# pretrained weights & checkpoints
-models/
+# pretrained weights & checkpoints (top-level only; src/counting/models is source code)
+/models/
 *.pt
 *.pth
 *.tar
