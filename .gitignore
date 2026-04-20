@@ -42,9 +42,9 @@ models/
 *.onnx
 *.bin
 
-# datasets
+# datasets (top-level only; src/counting/data is source code)
 datasets/
-data/
+/data/
 test_data/
 
 # secrets / environment
