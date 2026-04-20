@@ -25,6 +25,7 @@ class DiagnosticsReport:
     blur: dict[str, Any]
     exposure: dict[str, Any]
     per_image: list[dict[str, Any]] = field(default_factory=list)
+    density: dict[str, Any] | None = None
 
 
 def diagnose_directory(image_dir: str | Path, *, report_dir: str | Path) -> DiagnosticsReport:
