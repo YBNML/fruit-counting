@@ -1,7 +1,9 @@
 name: counting-env
+# For NVIDIA GPUs, including Blackwell (sm_120 / RTX 50xx) and older.
+# PyTorch is installed from the official CUDA-specific wheel index (cu128) so
+# kernels for new compute capabilities are included. Older GPUs also work with
+# cu128 builds since nvcc ships kernels for all prior archs.
 channels:
-  - pytorch
-  - nvidia
   - conda-forge
 dependencies:
   - python=3.11
@@ -14,13 +16,13 @@ dependencies:
   - scipy
   - scikit-learn
   - opencv
-  - pytorch=2.3.*
-  - torchvision=0.18.*
-  - pytorch-cuda=12.1
   - tensorboard
   - pytest
   - pytest-cov
   - pip:
+      - --extra-index-url https://download.pytorch.org/whl/cu128
+      - torch>=2.5
+      - torchvision>=0.20
       - typer>=0.12
       - pydantic>=2.0
       - albumentations
