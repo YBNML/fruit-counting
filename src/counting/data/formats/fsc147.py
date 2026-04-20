@@ -21,6 +21,13 @@ from counting.utils.image import read_image_rgb
 _VALID_SPLITS = {"train", "val", "test"}
 
 
+def _load_json(path: Path):
+    try:
+        return json.loads(path.read_text())
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"Malformed JSON in {path}: {exc}") from exc
+
+
 @dataclass(frozen=True)
 class FSC147Record:
     path: Path
@@ -47,8 +54,8 @@ class FSC147Dataset:
             if not p.exists():
                 raise FileNotFoundError(f"FSC-147 artifact missing: {p}")
 
-        splits = json.loads(split_path.read_text())
-        annotations = json.loads(ann_path.read_text())
+        splits = _load_json(split_path)
+        annotations = _load_json(ann_path)
 
         self._records: list[FSC147Record] = []
         for name in splits.get(split, []):

@@ -62,3 +62,13 @@ def test_fsc147_missing_files_raise(tmp_path):
     (tmp_path / "images_384_VarV2").mkdir()
     with pytest.raises(FileNotFoundError):
         FSC147Dataset(tmp_path, split="train")
+
+
+def test_fsc147_malformed_json_raises_with_path(tmp_path):
+    import pytest
+
+    _make_annotations(tmp_path)
+    (tmp_path / "annotation_FSC147_384.json").write_text("{ not valid json")
+
+    with pytest.raises(ValueError, match="annotation_FSC147_384.json"):
+        FSC147Dataset(tmp_path, split="train")
