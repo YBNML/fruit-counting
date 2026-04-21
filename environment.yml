@@ -24,3 +24,4 @@ dependencies:
       - albumentations
       - timm
       - rich
+      - open_clip_torch

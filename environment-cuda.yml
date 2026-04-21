@@ -32,3 +32,4 @@ dependencies:
       - matplotlib
       - ftfy
       - gpustat
+      - open_clip_torch
