@@ -8,7 +8,12 @@ from typing import Iterable
 import torch
 
 _CLIP_DIM = 512
-_CLIP_MODEL_NAME = "ViT-B-32"
+# Use the QuickGELU variant: OpenAI's original CLIP weights were trained with
+# QuickGELU activations, so loading them into the standard "ViT-B-32" (which
+# uses regular GELU) silently produces slightly different text embeddings.
+# Upstream PseCo's MLP_small_box_w1 checkpoints were trained against the
+# QuickGELU CLIP features, so we must match that here.
+_CLIP_MODEL_NAME = "ViT-B-32-quickgelu"
 _CLIP_PRETRAINED = "openai"
 
 

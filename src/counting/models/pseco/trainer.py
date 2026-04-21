@@ -50,10 +50,20 @@ class _CachedFSC147(Dataset):
         rec = self._recs[idx]
         emb = self._reader.read(rec.relpath)
         proposals = self._proposer.propose(emb)
+        # GT points come from FSC-147 annotations in the ORIGINAL image
+        # coordinate system (longest side = 384 in this dataset). PointDecoder
+        # predictions and our proposal boxes live in SAM's preprocessed space
+        # (longest side resized to 1024, then padded to 1024x1024). Scale GT
+        # points to that 1024 space so containment checks match.
+        from PIL import Image
+        with Image.open(rec.path) as im:
+            w, h = im.size
+        scale = 1024.0 / float(max(w, h))
+        scaled_points = [(x * scale, y * scale) for (x, y) in rec.points]
         return {
             "image_id": rec.relpath,
             "class_name": rec.class_name,
-            "points": rec.points,
+            "points": scaled_points,
             "embedding": torch.from_numpy(emb).to(torch.float32),
             "proposals": proposals,
             "gt_count": rec.count,
