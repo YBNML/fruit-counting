@@ -21,6 +21,7 @@ def _minimal():
             "sam_checkpoint": "models/PseCo/sam_vit_h.pth",
             "init_decoder": "models/PseCo/point_decoder_vith.pth",
             "init_mlp": "models/PseCo/MLP_small_box_w1_zeroshot.tar",
+            "clip_features_cache": "models/PseCo/clip_text_features.pt",
         },
         "cache": {
             "enabled": True,
@@ -51,6 +52,7 @@ def test_valid_parses():
     assert cfg.run_name == "pseco_head_v1"
     assert cfg.data.format == "fsc147"
     assert cfg.train.scheduler == "cosine"
+    assert cfg.model.clip_features_cache.endswith("clip_text_features.pt")
 
 
 def test_scheduler_must_be_known():
@@ -78,4 +80,11 @@ def test_early_stopping_mode_literal():
     d = _minimal()
     d["train"]["early_stopping"]["mode"] = "sideways"
     with pytest.raises(ValidationError):
+        TrainAppConfig.model_validate(d)
+
+
+def test_clip_features_cache_required_non_empty():
+    d = _minimal()
+    d["model"]["clip_features_cache"] = ""
+    with pytest.raises(ValidationError, match="clip_features_cache"):
         TrainAppConfig.model_validate(d)

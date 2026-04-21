@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from typing import Literal
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 
 class TrainDataConfig(BaseModel):
@@ -21,6 +21,14 @@ class TrainModelConfig(BaseModel):
     sam_checkpoint: str
     init_decoder: str = ""
     init_mlp: str = ""
+    clip_features_cache: str
+
+    @field_validator("clip_features_cache")
+    @classmethod
+    def _non_empty_cache_path(cls, v: str) -> str:
+        if not v.strip():
+            raise ValueError("clip_features_cache must be a non-empty path")
+        return v
 
 
 class TrainCacheConfig(BaseModel):
