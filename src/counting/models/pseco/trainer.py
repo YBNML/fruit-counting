@@ -6,6 +6,7 @@ import sys
 from pathlib import Path
 from typing import Any
 
+import numpy as np
 import torch
 import torch.nn.functional as F
 from torch.utils.data import DataLoader, Dataset
@@ -13,6 +14,8 @@ from torch.utils.data import DataLoader, Dataset
 from counting.config.train_schema import TrainAppConfig
 from counting.data.cache import FeatureCacheReader
 from counting.data.formats.fsc147 import FSC147Dataset
+from counting.models.pseco.clip_features import load_text_features
+from counting.models.pseco.labeling import assign_targets_from_points
 from counting.models.pseco.losses import pseco_head_loss
 from counting.models.pseco.proposals import PointDecoderProposer
 from counting.training.callbacks import CosineWithWarmup, EarlyStopping
@@ -28,7 +31,7 @@ def _ensure_external_on_path() -> None:
 
 
 class _CachedFSC147(Dataset):
-    """Yields (embedding_tensor, proposals, gt_points) tuples."""
+    """Yields cached embeddings + proposals + class_name + GT points."""
 
     def __init__(
         self,
@@ -49,6 +52,8 @@ class _CachedFSC147(Dataset):
         proposals = self._proposer.propose(emb)
         return {
             "image_id": rec.relpath,
+            "class_name": rec.class_name,
+            "points": rec.points,
             "embedding": torch.from_numpy(emb).to(torch.float32),
             "proposals": proposals,
             "gt_count": rec.count,
@@ -58,10 +63,29 @@ class _CachedFSC147(Dataset):
 def _collate_batch(batch: list[dict[str, Any]]) -> dict[str, Any]:
     return {
         "image_ids": [b["image_id"] for b in batch],
+        "class_names": [b["class_name"] for b in batch],
+        "points_per_image": [b["points"] for b in batch],
         "embeddings": torch.stack([b["embedding"] for b in batch]),
         "proposals": [b["proposals"] for b in batch],
         "gt_counts": torch.tensor([b["gt_count"] for b in batch], dtype=torch.float32),
     }
+
+
+def _require_classes_in_cache(
+    records: list[Any], clip_cache: dict[str, torch.Tensor], split: str
+) -> None:
+    """Fail fast if any record's class_name is missing from the CLIP cache."""
+    unknown: set[str] = set()
+    for rec in records:
+        if rec.class_name and rec.class_name not in clip_cache:
+            unknown.add(rec.class_name)
+    if unknown:
+        missing = ", ".join(sorted(unknown)[:5])
+        raise KeyError(
+            f"{split}: {len(unknown)} class(es) missing from CLIP feature cache: "
+            f"{missing}{' ...' if len(unknown) > 5 else ''}. "
+            "Re-run `counting extract-clip-features`."
+        )
 
 
 def train_pseco_head(cfg: TrainAppConfig) -> None:
@@ -72,6 +96,13 @@ def train_pseco_head(cfg: TrainAppConfig) -> None:
 
     fsc_train = FSC147Dataset(cfg.data.root, split=cfg.data.train_split)
     fsc_val = FSC147Dataset(cfg.data.root, split=cfg.data.val_split)
+
+    # --- CLIP text features: load and move to device once ---
+    clip_cache_cpu = load_text_features(cfg.model.clip_features_cache)
+    clip_cache = {name: tensor.to(device) for name, tensor in clip_cache_cpu.items()}
+
+    _require_classes_in_cache(list(fsc_train), clip_cache, cfg.data.train_split)
+    _require_classes_in_cache(list(fsc_val), clip_cache, cfg.data.val_split)
 
     reader = FeatureCacheReader(cfg.cache.dir)
 
@@ -138,28 +169,31 @@ def train_pseco_head(cfg: TrainAppConfig) -> None:
         tensorboard=cfg.logging.tensorboard,
     )
 
+    def _build_prompts(class_names: list[str]) -> list[torch.Tensor]:
+        """Return one (1, 1, 512) prompt tensor per image based on its class."""
+        return [clip_cache[cn].view(1, 1, 512) for cn in class_names]
+
     def step_fn(batch, model):
         embs = batch["embeddings"].to(device)
         gt_counts = batch["gt_counts"].to(device)
         B = embs.size(0)
 
-        # Build per-proposal ROI features and logits via the ROIHead.
-        # Placeholder simplification (documented in plan): top-16 proposals,
-        # unit-vector prompt embeddings. Real CLIP text wiring lands in Plan 3.
         bboxes_per_image = _topk_points_as_boxes(
             batch["proposals"], k=16, image_size=1024, device=device,
         )
-        prompts = _unit_prompts(batch_size=B, num_proposals=16, device=device)
+        prompts = _build_prompts(batch["class_names"])
 
-        # ROIHeadMLP.forward returns (B, num_proposals) dot-product scores —
-        # one score per (image, proposal) pair when each image has 1 text class.
-        # We treat positive/background as a binary task by thresholding at 0.
         raw_scores = model(embs, bboxes_per_image, prompts)  # (B, 16)
         raw_scores = raw_scores.reshape(B * 16)
 
-        # Cast to 2-class logits: [neg_score, pos_score] = [-s, s]
+        # Convert single-class scores into binary logits [-s, s]
         logits = torch.stack([-raw_scores, raw_scores], dim=1)  # (B*16, 2)
-        targets = torch.ones(B * 16, dtype=torch.long, device=device)
+
+        # Real pos/neg targets from GT points
+        targets_cpu = assign_targets_from_points(
+            bboxes_per_image, batch["points_per_image"]
+        )
+        targets = targets_cpu.to(device)
 
         pred_counts = (raw_scores.detach().reshape(B, 16) > 0).sum(dim=1).float()
 
@@ -179,7 +213,7 @@ def train_pseco_head(cfg: TrainAppConfig) -> None:
         bboxes = _topk_points_as_boxes(
             batch["proposals"], k=16, image_size=1024, device=device,
         )
-        prompts = _unit_prompts(batch_size=B, num_proposals=16, device=device)
+        prompts = _build_prompts(batch["class_names"])
         raw_scores = model(embs, bboxes, prompts).reshape(B, 16)  # (B, 16)
         pred_counts = (raw_scores > 0).sum(dim=1).float().cpu()
         mae = F.l1_loss(pred_counts, gt).item()
@@ -222,18 +256,3 @@ def _topk_points_as_boxes(
         ], dim=1).unsqueeze(0)
         boxes_per_image.append(boxes.to(device))
     return boxes_per_image
-
-
-def _unit_prompts(*, batch_size: int, num_proposals: int, device) -> list[torch.Tensor]:
-    """Placeholder text prompt embeddings: one unit-vector text class per image.
-
-    ROIHeadMLP expects a list of B tensors each of shape (N_text, C, 512).
-    We use N_text=1 and C=num_proposals to match the ROI embedding shape.
-    The dot product then yields (B, num_proposals) — one score per proposal.
-
-    Note: Real CLIP text embeddings are wired in Plan 3.
-    """
-    # Shape: (1, num_proposals, 512) repeated B times.
-    # N_text=1 means one text query class; C=num_proposals matches ROI count.
-    prompt = torch.ones(1, num_proposals, 512, device=device) / (512 ** 0.5)
-    return [prompt] * batch_size
