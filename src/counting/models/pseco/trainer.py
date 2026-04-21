@@ -183,21 +183,26 @@ def train_pseco_head(cfg: TrainAppConfig) -> None:
         """Return one (1, 1, 512) prompt tensor per image based on its class."""
         return [clip_cache[cn].view(1, 1, 512) for cn in class_names]
 
+    # Top-K proposals per image. Raising this from 16 -> 32 lifts the
+    # per-image count ceiling (the prediction is bounded by K) at modest
+    # compute cost, letting the model reach images with more GT objects.
+    K = 32
+
     def step_fn(batch, model):
         embs = batch["embeddings"].to(device)
         gt_counts = batch["gt_counts"].to(device)
         B = embs.size(0)
 
         bboxes_per_image = _topk_points_as_boxes(
-            batch["proposals"], k=16, image_size=1024, device=device,
+            batch["proposals"], k=K, image_size=1024, device=device,
         )
         prompts = _build_prompts(batch["class_names"])
 
-        raw_scores = model(embs, bboxes_per_image, prompts)  # (B, 16)
-        raw_scores = raw_scores.reshape(B * 16)
+        raw_scores = model(embs, bboxes_per_image, prompts)  # (B, K)
+        raw_scores = raw_scores.reshape(B * K)
 
         # Convert single-class scores into binary logits [-s, s]
-        logits = torch.stack([-raw_scores, raw_scores], dim=1)  # (B*16, 2)
+        logits = torch.stack([-raw_scores, raw_scores], dim=1)  # (B*K, 2)
 
         # Real pos/neg targets from GT points
         targets_cpu = assign_targets_from_points(
@@ -205,7 +210,7 @@ def train_pseco_head(cfg: TrainAppConfig) -> None:
         )
         targets = targets_cpu.to(device)
 
-        pred_counts = (raw_scores.detach().reshape(B, 16) > 0).sum(dim=1).float()
+        pred_counts = (raw_scores.detach().reshape(B, K) > 0).sum(dim=1).float()
 
         return pseco_head_loss(
             logits=logits,
@@ -221,10 +226,10 @@ def train_pseco_head(cfg: TrainAppConfig) -> None:
         gt = batch["gt_counts"]
         B = embs.size(0)
         bboxes = _topk_points_as_boxes(
-            batch["proposals"], k=16, image_size=1024, device=device,
+            batch["proposals"], k=K, image_size=1024, device=device,
         )
         prompts = _build_prompts(batch["class_names"])
-        raw_scores = model(embs, bboxes, prompts).reshape(B, 16)  # (B, 16)
+        raw_scores = model(embs, bboxes, prompts).reshape(B, K)  # (B, K)
         pred_counts = (raw_scores > 0).sum(dim=1).float().cpu()
         mae = F.l1_loss(pred_counts, gt).item()
         return {"mae": mae}
