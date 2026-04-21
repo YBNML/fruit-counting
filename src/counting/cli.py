@@ -262,5 +262,62 @@ def train_pseco_head_cli(
     console.print("[green]training complete[/green]")
 
 
+@app.command("extract-clip-features")
+def extract_clip_features(
+    dataset: str = typer.Option(
+        "fsc147",
+        "--dataset",
+        help="Either 'fsc147' (auto-derive from ImageClasses_FSC147.txt) or a path to a newline-delimited text file of class names.",
+    ),
+    dataset_root: str = typer.Option(
+        "./datasets/fsc147",
+        "--dataset-root",
+        help="FSC-147 root (used when --dataset=fsc147).",
+    ),
+    out: str = typer.Option(..., "--out", "-o", help="Output .pt file"),
+    device: str = typer.Option(
+        "cpu", "--device", help="cpu | mps | cuda | auto"
+    ),
+) -> None:
+    """Extract CLIP ViT-B/32 text features for a set of class names."""
+    from pathlib import Path
+
+    from counting.models.pseco.clip_features import (
+        encode_class_names,
+        save_text_features,
+    )
+    from counting.utils.device import resolve_device
+
+    if dataset == "fsc147":
+        classes_file = Path(dataset_root) / "ImageClasses_FSC147.txt"
+        if not classes_file.exists():
+            raise typer.BadParameter(f"Classes file not found: {classes_file}")
+        names: list[str] = []
+        seen: set[str] = set()
+        with classes_file.open("r", encoding="utf-8") as f:
+            for line in f:
+                line = line.rstrip("\n")
+                if not line:
+                    continue
+                parts = line.split("\t")
+                if len(parts) != 2:
+                    continue
+                cname = parts[1]
+                if cname not in seen:
+                    seen.add(cname)
+                    names.append(cname)
+    else:
+        p = Path(dataset)
+        if not p.exists():
+            raise typer.BadParameter(f"Class list file not found: {p}")
+        names = [ln.strip() for ln in p.read_text().splitlines() if ln.strip()]
+
+    resolved_device = resolve_device(device)
+    console.print(f"[loading] open_clip ViT-B/32 on {resolved_device}")
+    features = encode_class_names(names, device=resolved_device)
+    save_text_features(features, out)
+    console.print(f"[green]done[/green] {len(features)} classes → {out}")
+
+
 if __name__ == "__main__":
     app()
