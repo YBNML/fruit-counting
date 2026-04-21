@@ -15,8 +15,14 @@ def _make_annotations(root: Path):
         Image.fromarray(arr).save(imgs / name)
 
     (root / "annotation_FSC147_384.json").write_text(json.dumps({
-        "1.jpg": {"points": [[10, 10], [20, 20]], "box_examples_coordinates": [[[0, 0], [0, 30], [30, 30], [30, 0]]]},
-        "2.jpg": {"points": [[5, 5]], "box_examples_coordinates": [[[0, 0], [0, 10], [10, 10], [10, 0]]]},
+        "1.jpg": {
+            "points": [[10, 10], [20, 20]],
+            "box_examples_coordinates": [[[0, 0], [0, 30], [30, 30], [30, 0]]],
+        },
+        "2.jpg": {
+            "points": [[5, 5]],
+            "box_examples_coordinates": [[[0, 0], [0, 10], [10, 10], [10, 0]]],
+        },
         "3.jpg": {"points": [], "box_examples_coordinates": []},
     }))
     (root / "Train_Test_Val_FSC_147.json").write_text(json.dumps({
@@ -24,6 +30,10 @@ def _make_annotations(root: Path):
         "val": ["3.jpg"],
         "test": [],
     }))
+    # Tab-separated filename<TAB>class_name, one per line
+    (root / "ImageClasses_FSC147.txt").write_text(
+        "1.jpg\tapples\n2.jpg\tapples\n3.jpg\tsea shells\n"
+    )
 
 
 def test_fsc147_loads_split(tmp_path):
@@ -71,4 +81,21 @@ def test_fsc147_malformed_json_raises_with_path(tmp_path):
     (tmp_path / "annotation_FSC147_384.json").write_text("{ not valid json")
 
     with pytest.raises(ValueError, match="annotation_FSC147_384.json"):
+        FSC147Dataset(tmp_path, split="train")
+
+
+def test_fsc147_class_name_populated(tmp_path):
+    _make_annotations(tmp_path)
+    ds = FSC147Dataset(tmp_path, split="train")
+    by_name = {r.relpath: r for r in ds}
+    assert by_name["1.jpg"].class_name == "apples"
+    assert by_name["2.jpg"].class_name == "apples"
+
+
+def test_fsc147_missing_classes_file_raises(tmp_path):
+    import pytest
+
+    _make_annotations(tmp_path)
+    (tmp_path / "ImageClasses_FSC147.txt").unlink()
+    with pytest.raises(FileNotFoundError, match="ImageClasses_FSC147.txt"):
         FSC147Dataset(tmp_path, split="train")
