@@ -146,7 +146,9 @@ def train_pseco_head(cfg: TrainAppConfig) -> None:
         # Build per-proposal ROI features and logits via the ROIHead.
         # Placeholder simplification (documented in plan): top-16 proposals,
         # unit-vector prompt embeddings. Real CLIP text wiring lands in Plan 3.
-        bboxes_per_image = _topk_points_as_boxes(batch["proposals"], k=16, image_size=1024)
+        bboxes_per_image = _topk_points_as_boxes(
+            batch["proposals"], k=16, image_size=1024, device=device,
+        )
         prompts = _unit_prompts(batch_size=B, num_proposals=16, device=device)
 
         # ROIHeadMLP.forward returns (B, num_proposals) dot-product scores —
@@ -174,7 +176,9 @@ def train_pseco_head(cfg: TrainAppConfig) -> None:
         embs = batch["embeddings"].to(device)
         gt = batch["gt_counts"]
         B = embs.size(0)
-        bboxes = _topk_points_as_boxes(batch["proposals"], k=16, image_size=1024)
+        bboxes = _topk_points_as_boxes(
+            batch["proposals"], k=16, image_size=1024, device=device,
+        )
         prompts = _unit_prompts(batch_size=B, num_proposals=16, device=device)
         raw_scores = model(embs, bboxes, prompts).reshape(B, 16)  # (B, 16)
         pred_counts = (raw_scores > 0).sum(dim=1).float().cpu()
@@ -199,6 +203,7 @@ def _topk_points_as_boxes(
     k: int,
     image_size: int,
     half_side: float = 16.0,
+    device: torch.device | str = "cpu",
 ) -> list[torch.Tensor]:
     """Return per-image (1, k, 4) boxes centered on the top-k predicted points."""
     boxes_per_image: list[torch.Tensor] = []
@@ -215,7 +220,7 @@ def _topk_points_as_boxes(
             (x + half_side).clamp(max=image_size),
             (y + half_side).clamp(max=image_size),
         ], dim=1).unsqueeze(0)
-        boxes_per_image.append(boxes)
+        boxes_per_image.append(boxes.to(device))
     return boxes_per_image
 
 

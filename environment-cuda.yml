@@ -28,3 +28,7 @@ dependencies:
       - albumentations
       - timm
       - rich
+      # PseCo upstream dependencies (ops/ops.py, CLIP text extraction helpers)
+      - matplotlib
+      - ftfy
+      - gpustat
