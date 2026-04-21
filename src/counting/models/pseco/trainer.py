@@ -96,8 +96,17 @@ def train_pseco_head(cfg: TrainAppConfig) -> None:
     head = ROIHeadMLP().to(device)
     if cfg.model.init_mlp:
         state = torch.load(cfg.model.init_mlp, map_location="cpu", weights_only=False)
-        if "model" in state:
-            state = state["model"]
+        # PseCo MLP checkpoints store the state_dict under "cls_head"; other
+        # generic conventions use "model" or "state_dict". Walk whichever
+        # wrapper key is present before passing to load_state_dict.
+        if isinstance(state, dict):
+            for wrapper_key in ("cls_head", "model", "state_dict"):
+                inner = state.get(wrapper_key)
+                if isinstance(inner, dict) and any(
+                    isinstance(k, str) and "." in k for k in inner.keys()
+                ):
+                    state = inner
+                    break
         head.load_state_dict(state, strict=False)
 
     optimizer = torch.optim.AdamW(
