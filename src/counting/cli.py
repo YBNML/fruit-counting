@@ -172,7 +172,12 @@ def cache_embeddings(
             f"Only fsc147 is supported in Plan 2; got {cfg.data.format!r}"
         )
 
-    ds = FSC147Dataset(cfg.data.root, split=cfg.data.train_split)
+    # Cache train + val into the SAME cache dir so the trainer's val loader
+    # can read the same file. Deduplicate in case someone sets them equal.
+    splits_to_cache: list[str] = []
+    for s in (cfg.data.train_split, cfg.data.val_split):
+        if s not in splits_to_cache:
+            splits_to_cache.append(s)
 
     # Content hash over fields that, when changed, invalidate the cache.
     sam_hash = ""
@@ -189,7 +194,7 @@ def cache_embeddings(
         "image_size": cfg.data.image_size,
         "dtype": cfg.cache.dtype,
         "dataset_root": cfg.data.root,
-        "split": cfg.data.train_split,
+        "splits": splits_to_cache,
         "augment_variants": cfg.cache.augment_variants,
     }
     cache_hash = compute_cache_meta_hash(meta_for_hash)
@@ -206,19 +211,25 @@ def cache_embeddings(
     )
     writer.open()
 
-    records = list(ds)
-    if limit > 0:
-        records = records[:limit]
-
-    for rec in tqdm(records, desc="embedding"):
-        arr = rec.read_rgb()
-        emb = embedder.embed(arr).numpy()
-        writer.write(rec.relpath, emb)
+    total = 0
+    for split in splits_to_cache:
+        ds = FSC147Dataset(cfg.data.root, split=split)
+        records = list(ds)
+        if limit > 0:
+            records = records[:limit]
+        for rec in tqdm(records, desc=f"embed[{split}]"):
+            arr = rec.read_rgb()
+            emb = embedder.embed(arr).numpy()
+            writer.write(rec.relpath, emb)
+        total += len(records)
 
     writer.close()
     embedder.cleanup()
 
-    console.print(f"[green]done[/green] cached {len(records)} images at {cfg.cache.dir}")
+    console.print(
+        f"[green]done[/green] cached {total} images "
+        f"across splits {splits_to_cache} at {cfg.cache.dir}"
+    )
     console.print(f"  hash={cache_hash}")
 
 
