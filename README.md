@@ -67,8 +67,9 @@ print(result.raw_count, result.verified_count)
 ## 진행 상황
 
 - [x] Foundation (Plan 1): 스캐폴드, 설정, 데이터 진단, 추론 파이프라인
-- [x] PseCo 학습 (Plan 2): SAM 피처 캐시 + ROIHeadMLP 파인튜닝
-- [ ] Classifier 학습 · SR 통합 · 정돈 (Plan 3)
+- [x] PseCo 학습 인프라 (Plan 2): SAM 피처 캐시 + ROIHeadMLP 파인튜닝 루프 (placeholder objective)
+- [x] PseCo 학습 목표 수정 (Plan 3): CLIP 텍스트 피처 + pos/neg 레이블 + 좌표 스케일 수정 — **val/mae = 47.62** (5 epoch, FSC-147 val, K=32 proposals), Plan 2 degenerate baseline(50.58) 돌파
+- [ ] Classifier 학습 · SR 통합 · 정돈 (Plan 4)
 
 ## 전제 조건 (external/)
 
