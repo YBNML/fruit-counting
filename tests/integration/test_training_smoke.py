@@ -29,13 +29,14 @@ def _external_available() -> bool:
     reason="PseCo weights or external/ not present",
 )
 def test_train_pseco_head_smoke(tmp_path):
-    """Run 2 epochs on a tiny synthetic cached dataset."""
+    """Run 2 epochs on a tiny synthetic cached dataset with a fake CLIP cache."""
     import json
 
     import torch
     from PIL import Image
 
     from counting.config.train_schema import TrainAppConfig
+    from counting.models.pseco.clip_features import save_text_features
     from counting.models.pseco.trainer import train_pseco_head
 
     dataset_root = tmp_path / "fsc"
@@ -53,6 +54,9 @@ def test_train_pseco_head_smoke(tmp_path):
     (dataset_root / "Train_Test_Val_FSC_147.json").write_text(json.dumps({
         "train": ["1.jpg"], "val": ["2.jpg"], "test": [],
     }))
+    (dataset_root / "ImageClasses_FSC147.txt").write_text(
+        "1.jpg\ttestfruit\n2.jpg\ttestfruit\n"
+    )
 
     cache_dir = tmp_path / "cache"
     writer = FeatureCacheWriter(
@@ -64,6 +68,10 @@ def test_train_pseco_head_smoke(tmp_path):
     for n in names:
         writer.write(n, np.random.randn(256, 64, 64).astype(np.float16))
     writer.close()
+
+    # Fake CLIP features — random 512-d tensor for the test class
+    clip_cache_path = tmp_path / "clip.pt"
+    save_text_features({"testfruit": torch.randn(512)}, clip_cache_path)
 
     cfg = TrainAppConfig.model_validate({
         "run_name": "smoke",
@@ -78,6 +86,7 @@ def test_train_pseco_head_smoke(tmp_path):
             "sam_checkpoint": str(ROOT / "models" / "PseCo" / "sam_vit_h.pth"),
             "init_decoder": str(ROOT / "models" / "PseCo" / "point_decoder_vith.pth"),
             "init_mlp": "",
+            "clip_features_cache": str(clip_cache_path),
         },
         "cache": {
             "enabled": True, "dir": str(cache_dir),
