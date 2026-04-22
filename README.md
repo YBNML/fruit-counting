@@ -69,9 +69,20 @@ print(result.raw_count, result.verified_count)
 - [x] Foundation (Plan 1): 스캐폴드, 설정, 데이터 진단, 추론 파이프라인
 - [x] PseCo 학습 인프라 (Plan 2): SAM 피처 캐시 + ROIHeadMLP 파인튜닝 루프 (placeholder objective)
 - [x] PseCo 학습 목표 수정 (Plan 3): CLIP 텍스트 피처 + pos/neg 레이블 + 좌표 스케일 수정. FSC-147 val/mae 47.62로 placeholder baseline은 돌파했으나 **오소차드 4장 GT 검증에서 MAE 400+, prompt-agnostic으로 수렴해 사용 불가**로 판정. 체크포인트 `runs/plan3_k32/checkpoints/best.ckpt` (원격) 보존만, 기본 설정에는 미사용.
-- [ ] **Plan 4**: upstream MLP 기반 실사용 가능 추론 파이프라인 정비 (자세한 내용은 `docs/superpowers/specs/2026-04-22-plan4-direction.md`)
-  - 오소차드 검증 결과: upstream MLP + `pear in paper bag` 프롬프트 MAE=6, `apple in paper bag` MAE=22 — 파인튜닝 없이도 phone-taken 과일 이미지에서 실용 수준
-  - P4.1 방향 문서화 ✅  ·  P4.2 PseCoStage 실사용 경로로 재작성  ·  P4.3 프롬프트/하이퍼파라미터 튜닝
+- [x] **Plan 4**: upstream MLP 기반 실사용 가능 추론 파이프라인 정비 (`docs/superpowers/specs/2026-04-22-plan4-direction.md`)
+  - P4.1 방향 문서화 ✅
+  - P4.2 `PseCoStage` 재작성 (SAM → PointDecoder → SAM 박스 예측 → ROIHeadMLP → NMS → threshold, `counting infer` 실제 동작) ✅
+  - P4.3 프롬프트 + 하이퍼파라미터 grid search ✅
+- 오소차드 4장 GT 검증 요약 (P4.3 최적 설정 `score=0.15 nms=0.3`):
+
+  | image | GT | pred | \|err\| |
+  |---|---|---|---|
+  | apple_1 | 48 | 22 | 26 |
+  | apple_2 | 46 | 24 | 22 |
+  | pear_1  | 27 | 26 | **1** ⭐ |
+  | pear_2  | 54 | 59 | **5** ⭐ |
+
+  **Mean MAE 13.50** — 파인튜닝 없이 upstream MLP + 프롬프트만으로 phone-taken 배 이미지에는 실용 수준, 사과는 SAM이 검출 자체를 덜 해 개선 여지 남음.
 
 ## 전제 조건 (external/)
 

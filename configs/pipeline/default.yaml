@@ -17,8 +17,8 @@ pipeline:
       point_threshold: 0.05
       max_points: 1000
       anchor_size: 8
-      nms_threshold: 0.5
-      score_threshold: 0.10
+      nms_threshold: 0.3
+      score_threshold: 0.15
     sr:
       enabled: false
       scale: 2.0
