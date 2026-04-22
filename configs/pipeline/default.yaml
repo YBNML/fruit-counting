@@ -16,9 +16,9 @@ pipeline:
       clip_features_cache: models/PseCo/clip_text_features.pt
       point_threshold: 0.05
       max_points: 1000
-      anchor_size: 8
+      anchor_size: 24
       nms_threshold: 0.3
-      score_threshold: 0.15
+      score_threshold: 0.05
     sr:
       enabled: false
       scale: 2.0

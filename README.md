@@ -73,16 +73,16 @@ print(result.raw_count, result.verified_count)
   - P4.1 방향 문서화 ✅
   - P4.2 `PseCoStage` 재작성 (SAM → PointDecoder → SAM 박스 예측 → ROIHeadMLP → NMS → threshold, `counting infer` 실제 동작) ✅
   - P4.3 프롬프트 + 하이퍼파라미터 grid search ✅
-- 오소차드 4장 GT 검증 요약 (P4.3 최적 설정 `score=0.15 nms=0.3`):
+- 오소차드 4장 GT 검증 요약 (최적 설정 `anchor_size=24 score=0.05 nms=0.3`):
 
   | image | GT | pred | \|err\| |
   |---|---|---|---|
-  | apple_1 | 48 | 22 | 26 |
-  | apple_2 | 46 | 24 | 22 |
-  | pear_1  | 27 | 26 | **1** ⭐ |
-  | pear_2  | 54 | 59 | **5** ⭐ |
+  | apple_1 | 48 | 28 | 20 |
+  | apple_2 | 46 | 30 | 16 |
+  | pear_1  | 27 | 30 | 3 |
+  | pear_2  | 54 | 62 | 8 |
 
-  **Mean MAE 13.50** — 파인튜닝 없이 upstream MLP + 프롬프트만으로 phone-taken 배 이미지에는 실용 수준, 사과는 SAM이 검출 자체를 덜 해 개선 여지 남음.
+  **Mean MAE 11.75** — 파인튜닝 없이 upstream MLP + 프롬프트 + SAM anchor 튜닝으로 phone-taken 과수원 이미지에서 실용 수준. 사과가 여전히 -35% 언더카운트인데 SAM+PointDecoder의 검출 한계. 남은 개선은 자체 도메인 라벨링 후 파인튜닝이 필요.
 
 ## 전제 조건 (external/)
 
