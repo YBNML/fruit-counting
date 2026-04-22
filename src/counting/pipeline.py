@@ -116,6 +116,12 @@ def build_pipeline(cfg: AppConfig, *, device: str | None = None) -> Pipeline:
             sam_ckpt=s.pseco.sam_checkpoint,
             decoder_ckpt=s.pseco.decoder_checkpoint,
             mlp_ckpt=s.pseco.mlp_checkpoint,
+            clip_features_cache=s.pseco.clip_features_cache,
+            point_threshold=s.pseco.point_threshold,
+            max_points=s.pseco.max_points,
+            anchor_size=s.pseco.anchor_size,
+            nms_threshold=s.pseco.nms_threshold,
+            score_threshold=s.pseco.score_threshold,
         )
         st.prepare(cfg)
         stages.append(st)

@@ -5,14 +5,20 @@ output_dir: ./runs
 pipeline:
   stages:
     deblur:
-      enabled: true
+      enabled: false
       weights: models/deblurganv2/fpn_mobilenet.pth
     pseco:
       enabled: true
-      prompt: "protective fruit bag"
+      prompt: "apple in paper bag"
       sam_checkpoint: models/PseCo/sam_vit_h.pth
       decoder_checkpoint: models/PseCo/point_decoder_vith.pth
       mlp_checkpoint: models/PseCo/MLP_small_box_w1_zeroshot.tar
+      clip_features_cache: models/PseCo/clip_text_features.pt
+      point_threshold: 0.05
+      max_points: 1000
+      anchor_size: 8
+      nms_threshold: 0.5
+      score_threshold: 0.10
     sr:
       enabled: false
       scale: 2.0

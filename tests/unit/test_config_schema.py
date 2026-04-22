@@ -83,3 +83,25 @@ def test_io_format_options():
     d["io"]["output_format"] = "xml"
     with pytest.raises(ValidationError):
         AppConfig.model_validate(d)
+
+
+def test_pseco_hyperparameters_validate():
+    from counting.config.schema import AppConfig
+
+    d = _minimal_dict()
+    d["pipeline"]["stages"]["pseco"].update({
+        "clip_features_cache": "models/PseCo/clip_text_features.pt",
+        "point_threshold": 0.1,
+        "max_points": 500,
+        "anchor_size": 16,
+        "nms_threshold": 0.3,
+        "score_threshold": 0.2,
+    })
+    cfg = AppConfig.model_validate(d)
+    assert cfg.pipeline.stages.pseco.clip_features_cache.endswith(".pt")
+    assert cfg.pipeline.stages.pseco.anchor_size == 16
+
+    d["pipeline"]["stages"]["pseco"]["anchor_size"] = 0
+    import pytest
+    with pytest.raises(Exception):  # ValidationError on gt=0 constraint
+        AppConfig.model_validate(d)

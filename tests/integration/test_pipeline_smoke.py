@@ -21,10 +21,11 @@ def _weights_available() -> bool:
             stages["pseco"]["sam_checkpoint"],
             stages["pseco"]["decoder_checkpoint"],
             stages["pseco"]["mlp_checkpoint"],
+            stages["pseco"].get("clip_features_cache", ""),  # NEW
         ]
     if stages["deblur"]["enabled"]:
         need.append(stages["deblur"]["weights"])
-    return all((ROOT / p).exists() for p in need)
+    return all(p and (ROOT / p).exists() for p in need)
 
 
 @pytest.mark.slow
