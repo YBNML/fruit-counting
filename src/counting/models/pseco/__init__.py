@@ -1,4 +1,4 @@
-"""PseCo wrappers (inference in Plan 1)."""
+"""PseCo wrappers (inference only)."""
 
 from counting.models.pseco.inference import PseCoStage
 

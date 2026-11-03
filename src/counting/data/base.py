@@ -1,4 +1,4 @@
-"""Dataset protocol. Plan 2 extends this with point/box labels."""
+"""Dataset protocol. A future revision may extend this with point/box labels."""
 
 from __future__ import annotations
 

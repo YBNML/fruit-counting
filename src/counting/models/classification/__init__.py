@@ -1,4 +1,4 @@
-"""Classification wrappers (inference in Plan 1)."""
+"""Classification wrappers (inference only)."""
 
 from counting.models.classification.inference import ClassifierStage
 

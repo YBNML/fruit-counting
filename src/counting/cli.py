@@ -171,7 +171,7 @@ def cache_embeddings(
 
     if cfg.data.format != "fsc147":
         raise typer.BadParameter(
-            f"Only fsc147 is supported in Plan 2; got {cfg.data.format!r}"
+            f"Only fsc147 is supported for embedding caching; got {cfg.data.format!r}"
         )
 
     # Cache train + val into the SAME cache dir so the trainer's val loader

@@ -34,7 +34,8 @@ class ClassifierStage(Stage):
             from classification.core.classification_inference import ClassificationInference
         except ImportError as exc:
             raise RuntimeError(
-                "Classification source not found under external/. See spec §1 '전제 조건'."
+                "Classification source not found under external/. See the README's "
+                "prerequisites section for setup."
             ) from exc
         self._impl = ClassificationInference(ckpt_path=self.checkpoint, threshold=self.threshold)
 

@@ -30,7 +30,7 @@ class PseCoStageConfig(BaseModel):
     mlp_checkpoint: str = ""
     clip_features_cache: str = ""  # optional; if empty, encode prompt on the fly
 
-    # Inference hyperparameters (Plan 4 defaults, tuned further in P4.3)
+    # Inference hyperparameters (empirically tuned defaults)
     point_threshold: float = Field(default=0.05, ge=0.0, le=1.0)
     max_points: int = Field(default=1000, gt=0)
     anchor_size: int = Field(default=8, gt=0)

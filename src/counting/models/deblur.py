@@ -1,4 +1,4 @@
-"""DeblurGANv2 inference wrapper (read-only; no training in Plan 1)."""
+"""DeblurGANv2 inference wrapper (read-only; no training support)."""
 
 from __future__ import annotations
 
@@ -35,14 +35,15 @@ class DeblurStage(Stage):
             from DeblurGANv2.core.deblur_inference import DeblurInference
         except ImportError as exc:
             raise RuntimeError(
-                "DeblurGANv2 source not found under external/. See spec §1 '전제 조건'."
+                "DeblurGANv2 source not found under external/. See the README's "
+                "prerequisites section for setup."
             ) from exc
         if self.weights:
             import warnings
             warnings.warn(
                 f"DeblurStage.weights={self.weights!r} is currently ignored; "
                 "DeblurInference loads a hardcoded path upstream. "
-                "Wire custom weights when Plan 2 addresses this.",
+                "Wire custom weights in a future change.",
                 stacklevel=2,
             )
         self._impl = DeblurInference()

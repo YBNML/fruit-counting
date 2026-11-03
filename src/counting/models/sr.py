@@ -38,7 +38,8 @@ class SRStage(Stage):
             )
         except ImportError as exc:
             raise RuntimeError(
-                "SR-NO source not found under external/. See spec §1 '전제 조건'."
+                "SR-NO source not found under external/. See the README's "
+                "prerequisites section for setup."
             ) from exc
         self._impl = SuperResolutionModule(scale=self.scale)
 
