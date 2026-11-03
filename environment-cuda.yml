@@ -25,7 +25,7 @@ dependencies:
       - torchvision>=0.20
       - typer>=0.12
       - pydantic>=2.0
-      - albumentations
+      - albumentations<=2.0.8
       - timm
       - rich
       # PseCo upstream dependencies (ops/ops.py, CLIP text extraction helpers)

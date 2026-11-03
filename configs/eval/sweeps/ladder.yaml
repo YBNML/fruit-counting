@@ -1,0 +1,15 @@
+# Oracle ladder. Rungs without stages.dedup inherit the crop default from the base config.
+rungs:
+  L0:  {stages: {det: oracle, track: oracle,   center: truth,    dedup: oracle, assign: truth}, lift: {depth: det_depth}}
+  L1:  {stages: {det: oracle, track: landmark, center: truth,    dedup: oracle, assign: truth}, lift: {depth: det_depth}}
+  L2a: {stages: {det: oracle, track: landmark, center: truth,    assign: truth}, lift: {depth: det_depth}}
+  L2b: {stages: {det: oracle, track: landmark, center: measured, assign: truth}, lift: {depth: det_depth}}
+  L2c: {stages: {det: oracle, track: landmark, center: measured, assign: truth}, lift: {depth: box_median}}
+  L3:  {stages: {det: oracle, track: landmark, center: measured, assign: grid},  lift: {depth: box_median}}
+baselines:
+  last_box: {stages: {det: oracle, track: last_box, center: truth, dedup: oracle, assign: truth},
+             lift: {depth: det_depth}, tracker: {repair_m: 0}}
+interaction_2x2:
+  base: L2a
+  track: [oracle, landmark]
+  dedup: [oracle, crop_default]

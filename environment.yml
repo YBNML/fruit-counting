@@ -21,7 +21,7 @@ dependencies:
   - pip:
       - typer>=0.12
       - pydantic>=2.0
-      - albumentations
+      - albumentations<=2.0.8
       - timm
       - rich
       - open_clip_torch

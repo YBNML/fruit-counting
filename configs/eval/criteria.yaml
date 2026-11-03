@@ -1,0 +1,27 @@
+# Assumed thresholds.
+y1:
+  L1:
+    pear:  {e1_median: {le: 0.01}, e1_max: {le: 0.03}, dup_rate: {le: 0.02}, miss_rate: {le: 0.01}, merge_rate: {le: 0.01}}
+    apple: {e1_median: {le: 0.02}, e1_max: {le: 0.05}, dup_rate: {le: 0.03}, miss_rate: {le: 0.02}, merge_rate: {le: 0.02}}
+  L3:
+    pear:  {e1_median: {le: 0.02}, fp_off_rate: {le: 0.01}}
+    apple: {e1_median: {le: 0.04}, fp_off_rate: {le: 0.02}}
+  L5:                       # pear 45/70 deg, apple 30/50 deg only; pear 20 and apple 10 are report-only
+    pear:  {e1_median: {le: 0.08}}
+    apple: {e1_median: {le: 0.10}}
+y6:
+  L3:
+    pear:  {row_abs_e_pipe: {le: 0.02}, tree_mae_over_mean: {le: 0.04}, attribution_error: {le: 0.01},
+            pos_err_p90_m: {le: 0.05}, miss_rate: {le: 0.02}, excess_rate: {le: 0.02}}
+    apple: {row_abs_e_pipe: {le: 0.05}, tree_mae_over_mean: {le: 0.06}, attribution_error: {le: 0.01},
+            pos_err_p90_m: {le: 0.04}, miss_rate: {le: 0.05}, excess_rate: {le: 0.05}}
+  L4_base:
+    pear:  {row_abs_e_pipe: {le: 0.05}}
+    apple: {row_abs_e_pipe: {le: 0.10}}
+  L5:
+    pear:  {row_abs_e_pipe: {le: 0.08}, tree_mae_over_mean: {le: 0.12}, miss_rate: {le: 0.08}, excess_rate: {le: 0.08}}
+    apple: {row_abs_e_pipe: {le: 0.12}, tree_mae_over_mean: {le: 0.15}, miss_rate: {le: 0.12}, excess_rate: {le: 0.12}}
+detection:
+  L5:
+    pear:  {recall: {ge: 0.90}, precision: {ge: 0.90}}
+    apple: {recall: {ge: 0.85}, precision: {ge: 0.90}}

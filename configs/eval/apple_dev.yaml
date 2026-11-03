@@ -1,0 +1,16 @@
+run_name: apple_dev
+crop: apple
+split: dev                 # dev|val|test|exp; dev numbers are never used for verdicts
+tuning: true               # must be false for split=test
+runs: [~/YBNML_repo/orchard_synth/out/apple/robot3]
+truth: {variant: count1}
+passes: {pitches: null, sides: [A, B], step_m: null}
+stages: {det: oracle, track: landmark, center: measured, dedup: merge, assign: grid}
+detector: {positives: count1, cache: null, noise: null}
+lift: {depth: box_median, box_frac: 0.5, center_offset_m: {fruit: 0.02, bag: 0.03}}
+noise: {pose_trans_sigma_m: 0, pose_rot_sigma_deg: 0, pass_bias_m: 0, depth_rel_sigma: 0, depth_dropout: 0, seeds: [0]}
+tracker: {predict: pose, gate_px_frac: 0.5, gate_m: 0.05, max_gap: null, repair_m: 0.04, min_obs: 1, score_hi: 0.5, score_lo: 0.1}
+dedup: {radius_m: 0.04, band_m: 0.10}
+seed: 0
+stop_after: y6
+output_dir: runs/eval

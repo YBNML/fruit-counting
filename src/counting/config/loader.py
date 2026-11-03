@@ -4,19 +4,23 @@ from __future__ import annotations
 
 import copy
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any, Iterable, TypeVar
 
 import yaml
+from pydantic import BaseModel
 
 from counting.config.schema import AppConfig
 
+M = TypeVar("M", bound=BaseModel)
 
-def load_config(
+
+def load_yaml_model(
     path: str | Path,
+    model: type[M],
     *,
     overrides: Iterable[str] | None = None,
-) -> AppConfig:
-    p = Path(path)
+) -> M:
+    p = Path(path).expanduser()
     if not p.exists():
         raise FileNotFoundError(f"Config file not found: {p}")
     with p.open("r", encoding="utf-8") as f:
@@ -25,7 +29,15 @@ def load_config(
         raise ValueError(f"Top-level YAML must be a mapping: {p}")
     if overrides:
         raw = apply_overrides(raw, list(overrides))
-    return AppConfig.model_validate(raw)
+    return model.model_validate(raw)
+
+
+def load_config(
+    path: str | Path,
+    *,
+    overrides: Iterable[str] | None = None,
+) -> AppConfig:
+    return load_yaml_model(path, AppConfig, overrides=overrides)
 
 
 def apply_overrides(cfg: dict[str, Any], overrides: list[str]) -> dict[str, Any]:

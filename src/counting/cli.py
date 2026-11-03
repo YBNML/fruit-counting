@@ -10,7 +10,6 @@ from rich.console import Console
 from rich.table import Table
 
 from counting import __version__
-from counting.utils.device import resolve_device
 
 app = typer.Typer(add_completion=False, no_args_is_help=True)
 console = Console()
@@ -26,6 +25,8 @@ def _main() -> None:
 def info() -> None:
     """Show environment and device information."""
     import torch
+
+    from counting.utils.device import resolve_device
 
     table = Table(title=f"counting {__version__}")
     table.add_column("key")
@@ -49,6 +50,7 @@ def validate_config(
 ) -> None:
     """Load and validate a YAML config. Prints resolved device."""
     from counting.config.loader import load_config
+    from counting.utils.device import resolve_device
 
     cfg = load_config(path, overrides=set_ or None)
     device = resolve_device(cfg.device)
@@ -235,6 +237,9 @@ def cache_embeddings(
 
 _train_app = typer.Typer(help="Training entry points", no_args_is_help=True)
 app.add_typer(_train_app, name="train")
+
+from counting.evaluation.cli import eval_app  # noqa: E402
+app.add_typer(eval_app, name="eval")
 
 
 @_train_app.command("pseco-head")

@@ -23,7 +23,7 @@ dependencies = [
   "torch>=2.2",
   "torchvision",
   "timm",
-  "albumentations",
+  "albumentations<=2.0.8",
   "tensorboard",
 ]
 
@@ -40,5 +40,6 @@ where = ["src"]
 testpaths = ["tests"]
 markers = [
   "slow: integration tests that load models or touch disk",
+  "synth: reads real orchard_synth renders (excluded by default)",
 ]
-addopts = "-q"
+addopts = "-q -m 'not synth'"
