@@ -14,9 +14,9 @@ import os
 import subprocess
 import sys
 from dataclasses import dataclass
-from math import cos, floor, radians, sin, tan
+from math import ceil, cos, floor, radians, sin, tan
 from pathlib import Path
-from typing import Mapping, Sequence
+from typing import Iterable, Mapping, Sequence
 
 import numpy as np
 from PIL import Image
@@ -92,6 +92,8 @@ COUNT1 = {"visib_min": 0.25, "px_min": 20}
 SIDES = ("A", "B")
 _NEAR_M = 0.05
 _MAX_DEPTH_M = 65.535
+_LEAF_FRAC = 0.6
+_LEAF_DZ_M = 0.30
 _SEM = {"background": 0, "leaf": 1, "branch": 2, "fruit": 3, "bag": 4, "structure": 5, "net": 6,
         "ground": 7, "drip": 8}
 
@@ -245,6 +247,7 @@ def write_run(
     max_frames: int | None = None,
     dim: Mapping[int, float] | None = None,
     step_param: bool = True,
+    occlude: Mapping[int, Iterable[int]] | None = None,
 ) -> Path:
     """Write a small orchard_synth-shaped render bundle under `root` (created if needed) and return it.
 
@@ -254,10 +257,14 @@ def write_run(
     on-screen area of that square and `dim[id]` scales `vis_px` to fake
     occlusion. depth16/semantic hold the ground plane and the squares painted far
     to near; RGB and instance images are not written.
+
+    `occlude` paints a nearer patch into depth16 only, so geometry checks that read depth at
+    fruit centres fail on such a bundle.
     """
     sc = _SCENES[crop]
     pitches = tuple(float(p) for p in (sc.pitches if pitches is None else pitches))
     dim = dict(dim or {})
+    occlude = {int(oid): frozenset(int(i) for i in idxs) for oid, idxs in (occlude or {}).items()}
     width, height = size
     fx = (width / 2) / tan(radians(HFOV_DEG / 2))
     target_row = n_rows // 2
@@ -287,6 +294,17 @@ def write_run(
         for d, _, (bx0, by0, bx1, by1), is_bag in sorted(paints, key=lambda p: (-p[0], p[1])):
             depth[by0:by1, bx0:bx1] = round(d * 1000.0)
             sem[by0:by1, bx0:bx1] = _SEM["bag"] if is_bag else _SEM["fruit"]
+        for r in records:
+            if r["bbox"] is None or idx not in occlude.get(r["id"], ()):
+                continue
+            bx0, by0, bx1, by1 = r["bbox"]
+            w, h = bx1 - bx0, by1 - by0
+            a = (1 - _LEAF_FRAC) / 2
+            px0, px1 = floor(bx0 + a * w), ceil(bx1 - a * w)
+            py0, py1 = floor(by0 + a * h), ceil(by1 - a * h)
+            leaf = round((r["depth_med"] - _LEAF_DZ_M) * 1000)
+            region = depth[py0:py1, px0:px1]
+            region[(region == 0) | (region > leaf)] = leaf
         Image.fromarray(depth).save(root / f"{idx:06d}_depth16.png", compress_level=1)
         Image.fromarray(sem).save(root / f"{idx:06d}_semantic.png", compress_level=1)
         pose = {"name": f"{sc.preset}_{pitch:g}", "matrix_world": matrix, "width": width, "height": height,

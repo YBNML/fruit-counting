@@ -40,8 +40,14 @@ class DetectorConfig(BaseModel):
 
 class LiftConfig(BaseModel):
     model_config = ConfigDict(extra="forbid")
-    depth: Literal["det_depth", "box_median"] = "box_median"
+    depth: Literal["det_depth", "box_median", "box_far"] = "box_median"
+    # box_median only: side ratio of the centre rectangle of the box.
     box_frac: float = Field(default=0.5, gt=0, le=1)
+    # box_far only (far_*): scale of the ellipse inscribed in the box, depth gap (m) that splits
+    # clusters, and the least share of the in-ellipse pixels a cluster needs to be picked as the far one.
+    far_scale: float = Field(default=1.0, gt=0, le=1)
+    far_gap_m: float = Field(default=0.03, gt=0)
+    far_min_frac: float = Field(default=0.25, gt=0, le=1)
     center_offset_m: dict[Literal["fruit", "bag"], float] = Field(
         default_factory=lambda: {"fruit": 0.02, "bag": 0.03}
     )
@@ -75,6 +81,9 @@ class TrackerConfig(BaseModel):
     predict: Literal["pose"] = "pose"
     gate_px_frac: float = Field(default=0.5, gt=0)
     gate_m: float = Field(default=0.05, gt=0)
+    depth_gate: Literal["hard", "soft"] = "hard"
+    # depth_gate=soft only: extra cost of a pair inside the screen gate that fails the depth gate.
+    soft_cost: float = Field(default=0.5, ge=0)
     max_gap: int | None = Field(default=None, ge=1)
     repair_m: float = Field(default=0.04, ge=0)
     min_obs: int = Field(default=1, ge=1)
@@ -118,7 +127,8 @@ class EvalAppConfig(BaseModel):
         if self.stages.det == "cached" and self.stages.track == "oracle":
             raise ValueError("cached detector cannot use track=oracle")
         if self.stages.det == "cached" and self.lift.depth == "det_depth":
-            raise ValueError("det_depth needs oracle depth; use box_median with det=cached")
+            raise ValueError("det_depth needs oracle depth; use a box depth method (box_median or box_far) "
+                             "with det=cached")
         if self.split == "test" and self.tuning:
             raise ValueError("split=test requires tuning=false")
         return self

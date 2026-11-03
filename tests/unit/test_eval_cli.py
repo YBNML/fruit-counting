@@ -87,6 +87,41 @@ def test_eval_run_set_overrides(apple_run, tmp_path):
     assert res["kind"] == "run" and rung["y6"] is None and rung["stages"]["track"] == "last_box"
 
 
+def test_eval_run_set_list_and_null_sections(apple_run, tmp_path):
+    base = ["run", "--config", _cfg_file(tmp_path, apple_run, "apple"), "--splits", SPLITS, "--set", "stop_after=y1"]
+    ok = runner.invoke(eval_app, base + ["--set", "passes.pitches=[30]"])
+    assert ok.exit_code == 0, ok.output
+    (d,) = (tmp_path / "out" / "apple_dev").iterdir()
+    res = json.loads((d / "results.json").read_text(encoding="utf-8"))
+    assert {p["pitch"] for p in res["runs"][0]["rungs"]["run"]["y1"]["passes"]} == {30.0}
+    r = runner.invoke(eval_app, base + ["--set", "detector.noise.miss_p=0.1"])
+    assert r.exit_code == 2 and "detector.noise is not supported in this version" in r.output, r.output
+    r = runner.invoke(eval_app, base + ["--set", "lift.depth.x=1"])
+    assert r.exit_code == 2 and "error: --set: " in r.output and "not a dict" in r.output, r.output
+
+
+def test_box_far_run_records_depth_fingerprint(leaf_runs, tmp_path):
+    args = ["run", "--config", _cfg_file(tmp_path, leaf_runs[0], "apple"), "--splits", SPLITS,
+            "--set", "lift.depth=box_far", "--set", "stop_after=y1"]
+    r = runner.invoke(eval_app, args)
+    assert r.exit_code == 0, r.output
+    (d,) = (tmp_path / "out" / "apple_dev").iterdir()
+    rec = json.loads((d / "record.json").read_text(encoding="utf-8"))
+    res = json.loads((d / "results.json").read_text(encoding="utf-8"))
+    assert res["runs"][0]["rungs"]["run"]["lift_depth"] == "box_far" and rec["data"][0]["depth_fingerprint"]
+
+
+def test_box_far_ladder_records_depth_fingerprint(leaf_runs, tmp_path):
+    args = ["ladder", "--config", _cfg_file(tmp_path, leaf_runs[0], "apple"), "--rungs", "L3", "--splits", SPLITS,
+            "--set", "lift.depth=box_far", "--set", "stop_after=y1"]
+    r = runner.invoke(eval_app, args)
+    assert r.exit_code == 0, r.output
+    (d,) = (tmp_path / "out" / "apple_dev").iterdir()
+    rec = json.loads((d / "record.json").read_text(encoding="utf-8"))
+    res = json.loads((d / "results.json").read_text(encoding="utf-8"))
+    assert res["runs"][0]["rungs"]["L3"]["lift_depth"] == "box_far" and rec["data"][0]["depth_fingerprint"]
+
+
 def test_eval_ladder_rungs_and_2x2(apple_run, tmp_path):
     args = ["ladder", "--config", _cfg_file(tmp_path, apple_run, "apple"), "--rungs", "L0,L1,last_box",
             "--with-2x2", "--ladder", LADDER, "--splits", SPLITS, "--criteria", CRIT]

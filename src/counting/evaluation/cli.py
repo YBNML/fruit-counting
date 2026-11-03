@@ -214,7 +214,10 @@ def _run_eval(
     from counting.evaluation.truth import SummaryMismatch
 
     try:
-        cfg = load_yaml_model(config, EvalAppConfig, overrides=set_)
+        try:
+            cfg = load_yaml_model(config, EvalAppConfig, overrides=set_)
+        except KeyError as e:  # a --set path that cannot be descended
+            raise ValueError(f"--set: {e.args[0]}") from e
         if run_:
             cfg = cfg.model_copy(update={"runs": list(run_)})
         splits_cfg = load_yaml_model(splits_path, SplitsConfig)
@@ -255,7 +258,7 @@ def _run_eval(
         run_entries = [run_entries[i] for i in order]
 
         if kind == "run":
-            uses_box_median = cfg.lift.depth == "box_median"
+            uses_box_depth = cfg.lift.depth != "det_depth"
             extra = ""
         else:
             lift_depths = [rung["lift_depth"] for entry in run_entries for rung in entry["rungs"].values()]
@@ -264,12 +267,12 @@ def _run_eval(
                 base_patch = (ladder.get("rungs") or {}).get(base_name) \
                     or (ladder.get("baselines") or {}).get(base_name) or {}
                 lift_depths.append((base_patch.get("lift") or {}).get("depth", cfg.lift.depth))
-            uses_box_median = "box_median" in lift_depths
+            uses_box_depth = any(d != "det_depth" for d in lift_depths)
             extra = f"ladder:{hashlib.sha256(ladder_bytes).hexdigest()[:16]}:{','.join(rungs)}:{with_2x2}"
 
         fingerprints = [ctx.run.meta.fingerprint for ctx in contexts]
         data = [describe_run(ctx) for ctx in contexts]
-        if uses_box_median:
+        if uses_box_depth:
             depth_fps = [ctx.run.depth_fingerprint() for ctx in contexts]
             fingerprints += depth_fps
             data = [{**d, "depth_fingerprint": fp} for d, fp in zip(data, depth_fps)]

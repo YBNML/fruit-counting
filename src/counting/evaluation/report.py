@@ -16,7 +16,7 @@ import yaml
 
 from counting.config.eval_schema import EvalAppConfig
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 
 
 class ReproducibilityError(RuntimeError):
@@ -149,6 +149,7 @@ def _table(headers: list[str], rows: list[list[str]]) -> list[str]:
 
 
 _Y1_HEADERS = ["기울기", "면", "통로", "프레임", "U1", "G1", "e1", "Dup", "Miss", "FP_off", "3D 없음"]
+_PITCH_HEADERS = ["기울기", "패스", "e1 중앙값", "e1 최대"]
 _Y6_TREE_HEADERS = ["그루", "U", "U_정답귀속", "G6", "G6①", "G6any", "G6strict", "G6②",
                     "e_pipe", "e_cover", "e_total", "유입", "유출"]
 _LEDGER_FIELDS = ["n_pred", "n_truth", "fp_bg", "fp_off", "boundary", "dup_track", "dup_cross",
@@ -159,6 +160,7 @@ _CONTRIB_LABELS = {
     ("L2a", "L2b"): "L2a→L2b (역투영·보정)",
     ("L2b", "L2c"): "L2b→L2c (상자 깊이)",
     ("L2c", "L3"): "L2c→L3 (줄 거르기·귀속)",
+    ("L3_dd", "L3"): "L3_dd→L3 (상자 깊이)",
 }
 _OP_SYMBOL = {"le": "≤", "ge": "≥"}
 # Criteria metrics that are ratios, shown in percent like everywhere else in the report.
@@ -179,11 +181,27 @@ def _y1_rows(passes: list[dict]) -> list[list[str]]:
     return rows
 
 
+def _pitch_rows(passes: list[dict]) -> list[list[str]]:
+    rows = []
+    for pitch in sorted({p["pitch"] for p in passes}):
+        group = [p for p in passes if p["pitch"] == pitch]
+        e1s = [abs(p["e1"]) for p in group if p["e1"] is not None]
+        median = float(np.median(e1s)) if e1s else None
+        rows.append([_g(pitch), str(len(group)), _pct(median), _pct(max(e1s) if e1s else None)])
+    return rows
+
+
 def _y1_summary_line(summary: dict) -> str:
     return (f"- Y1 요약: e1 중앙값 {_pct(summary['e1_median'])}, e1 최대 {_pct(summary['e1_max'])}, "
            f"Dup율 {_pct(summary['dup_rate'])}, Miss율 {_pct(summary['miss_rate'])}, "
            f"Merge율 {_pct(summary['merge_rate'])}, FP_off율 {_pct(summary['fp_off_rate'])}, "
            f"naive U {summary['naive_U']}")
+
+
+def _depth_err_line(s: dict) -> str:
+    return (f"- 깊이 오차(상자 깊이 - 검출 깊이): n {s['n']}, 절댓값 p50 {s['p50_m']:.3f} m, "
+           f"p90 {s['p90_m']:.3f} m, p95 {s['p95_m']:.3f} m, 10 cm 넘게 가까움 {s['near_10cm']:+.1%}, "
+           f"멂 {s['far_10cm']:+.1%}")
 
 
 def _y6_tree_rows(trees: list[dict]) -> list[list[str]]:
@@ -238,14 +256,18 @@ def _y6_delta(ra: dict, rb: dict, key_path: tuple[str, ...]):
 
 
 def _contrib_table(chain: list[str], rungs: dict) -> list[str]:
-    headers = ["구간", "Δ Y1 e1 중앙값", "Δ 줄 e_pipe", "Δ 그루 MAE÷평균"]
+    headers = ["구간", "Δ Y1 e1 중앙값", "Δ Y1 e1 최대", "Δ 줄 e_pipe", "Δ 그루 MAE÷평균"]
+    pairs = list(zip(chain, chain[1:]))
+    if "L3" in rungs and "L3_dd" in rungs:
+        pairs.append(("L3_dd", "L3"))
     rows = []
-    for a, b in zip(chain, chain[1:]):
+    for a, b in pairs:
         ra, rb = rungs[a], rungs[b]
         d_e1 = _delta(ra["y1"]["summary"]["e1_median"], rb["y1"]["summary"]["e1_median"])
+        d_e1_max = _delta(ra["y1"]["summary"]["e1_max"], rb["y1"]["summary"]["e1_max"])
         d_epipe = _y6_delta(ra, rb, ("row", "e_pipe"))
         d_mae = _y6_delta(ra, rb, ("metrics", "tree_mae_over_mean"))
-        rows.append([_contrib_label(a, b), _pct(d_e1), _pct(d_epipe), _pct(d_mae)])
+        rows.append([_contrib_label(a, b), _pct(d_e1), _pct(d_e1_max), _pct(d_epipe), _pct(d_mae)])
     return _table(headers, rows)
 
 
@@ -334,6 +356,11 @@ def render_report(results: dict, *, criteria: Mapping | None) -> str:
             lines.append("**Y1**")
             lines += _table(_Y1_HEADERS, _y1_rows(rung["y1"]["passes"]))
             lines.append(_y1_summary_line(rung["y1"]["summary"]))
+            if rung["y1"]["summary"]["depth_err"] is not None:
+                lines.append(_depth_err_line(rung["y1"]["summary"]["depth_err"]))
+            lines.append("")
+            lines.append("**기울기별 Y1**")
+            lines += _table(_PITCH_HEADERS, _pitch_rows(rung["y1"]["passes"]))
             lines.append("")
             y6 = rung["y6"]
             if y6 is not None:
@@ -344,7 +371,8 @@ def render_report(results: dict, *, criteria: Mapping | None) -> str:
                 lines.append(_metrics_line(y6["metrics"]))
                 lines.append("")
 
-        if len(run.get("chain") or []) >= 2:
+        has_dd = "L3" in run["rungs"] and "L3_dd" in run["rungs"]
+        if len(run.get("chain") or []) >= 2 or has_dd:
             lines.append("**기여**")
             lines += _contrib_table(run["chain"], run["rungs"])
             lines.append("")

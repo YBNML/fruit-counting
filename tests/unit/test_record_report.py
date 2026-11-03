@@ -10,7 +10,8 @@ import yaml
 from counting.data.formats.orchard_synth import SynthRun
 from counting.evaluation.record import experiment_id, git_state
 from counting.evaluation.report import (
-    SCHEMA_VERSION, ReproducibilityError, criteria_rows, render_report, results_bytes, write_experiment,
+    SCHEMA_VERSION, ReproducibilityError, _pitch_rows, criteria_rows, render_report, results_bytes,
+    write_experiment,
 )
 from counting.evaluation.runner import describe_run, evaluate, load_ladder, prepare, run_ladder
 from tests.unit.synthfake import fake_cfg, load_splits, write_run
@@ -91,6 +92,28 @@ def test_report_null_cells(tmp_path):
     assert lines[1] == "> 합성 렌더 · 정답 자세 · 보정 전(U). 실제 정확도가 아니다."
     assert "> dev 묶음: 개발용 수치다. 판정에 쓰지 않는다." in lines
     assert "| 80 | A | 2 | 31 | 0 | 0 | - | 0 | 0 | 0 | 0 |" in lines
+    passes = res["runs"][0]["rungs"]["run"]["y1"]["passes"]
+    assert [p["depth_err"] is None for p in passes] == [False, False, True, True]   # no detection at 80 deg
+    e30 = [abs(p["e1"]) for p in passes if p["pitch"] == 30.0]
+    assert "| 기울기 | 패스 | e1 중앙값 | e1 최대 |" in lines
+    assert f"| 30 | 2 | {float(np.median(e30)):+.1%} | {max(e30):+.1%} |" in lines
+    assert "| 80 | 2 | - | - |" in lines
+
+
+def test_pitch_rows_use_abs_e1():
+    passes = [{"pitch": 30.0, "e1": -0.04}, {"pitch": 30.0, "e1": 0.02}]
+    assert _pitch_rows(passes) == [["30", "2", "+3.0%", "+4.0%"]]     # median and max of |e1|
+
+
+def test_report_depth_err_line(leaf_runs, l1_l3_report):
+    _, res = _results(leaf_runs[1])
+    s = res["runs"][0]["rungs"]["run"]["y1"]["summary"]["depth_err"]
+    text = render_report(res, criteria=None)
+    assert (f"- 깊이 오차(상자 깊이 - 검출 깊이): n {s['n']}, 절댓값 p50 {s['p50_m']:.3f} m, "
+            f"p90 {s['p90_m']:.3f} m, p95 {s['p95_m']:.3f} m, 10 cm 넘게 가까움 {s['near_10cm']:+.1%}, "
+            f"멂 {s['far_10cm']:+.1%}") in text
+    assert l1_l3_report[1].count("- 깊이 오차(") == 1          # L1 (det_depth) has no line, L3 has one
+    assert SCHEMA_VERSION == 2
 
 
 def test_contribution_row_names(apple_run):
@@ -101,6 +124,14 @@ def test_contribution_row_names(apple_run):
            "split": "dev", "crop": "apple", "runs": [{"meta": describe_run(ctx), **out}]}
     text = render_report(res, criteria=None)
     assert "| L0→L1 (추적) |" in text and "| L1→L3 |" in text
+
+
+def test_contrib_table_has_e1_max_column(l1_l3_report):
+    out, text = l1_l3_report
+    a, b = (out["rungs"][n]["y1"]["summary"]["e1_max"] for n in ("L1", "L3"))
+    assert "| 구간 | Δ Y1 e1 중앙값 | Δ Y1 e1 최대 | Δ 줄 e_pipe | Δ 그루 MAE÷평균 |" in text
+    row = next(line for line in text.splitlines() if line.startswith("| L1→L3 |"))
+    assert row.split("|")[3].strip() == f"{b - a:+.1%}"
 
 
 def test_criteria_rows_compare():

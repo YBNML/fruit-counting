@@ -4,7 +4,7 @@ import pytest
 import yaml
 from pydantic import ValidationError
 
-from counting.config.eval_schema import EvalAppConfig, LiftConfig, SplitsConfig
+from counting.config.eval_schema import EvalAppConfig, LiftConfig, SplitsConfig, TrackerConfig
 from counting.config.hashing import config_hash
 from counting.config.loader import load_yaml_model
 
@@ -79,6 +79,25 @@ def test_score_lo_above_hi_rejected():
 def test_lift_offset_by_label():
     lift = LiftConfig(center_offset_m={"bag": 0.04})
     assert lift.offset(1) == 0.04 and lift.offset(0) == 0.0
+
+
+def test_lift_depth_options():
+    lift = LiftConfig()
+    assert (lift.depth, lift.box_frac, lift.far_scale, lift.far_gap_m, lift.far_min_frac) == \
+        ("box_median", 0.5, 1.0, 0.03, 0.25)
+    assert LiftConfig(depth="box_far", far_min_frac=1.0).depth == "box_far"
+    for bad in ({"far_scale": 0}, {"far_scale": 1.5}, {"far_gap_m": 0}, {"far_min_frac": 0},
+                {"far_min_frac": 1.5}, {"depth": "box_near"}):
+        with pytest.raises(ValidationError):
+            LiftConfig(**bad)
+
+
+def test_tracker_depth_gate_options():
+    t = TrackerConfig()
+    assert (t.depth_gate, t.soft_cost) == ("hard", 0.5)
+    for bad in ({"depth_gate": "off"}, {"soft_cost": -0.1}):
+        with pytest.raises(ValidationError):
+            TrackerConfig(**bad)
 
 
 def test_splits_file():

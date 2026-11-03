@@ -76,6 +76,50 @@ def box_median_depth(boxes: np.ndarray, depth_m: np.ndarray, box_frac: float) ->
     return out
 
 
+def box_far_depth(
+    boxes: np.ndarray, depth_m: np.ndarray, scale: float, gap_m: float, min_frac: float
+) -> np.ndarray:
+    """Median depth of the farthest large depth cluster inside each (pre-completion) box's ellipse.
+
+    The ellipse is inscribed in the box and scaled by `scale` (semi-axes at
+    least 0.5 px); a pixel is inside when its centre is. The sorted finite
+    depths inside are split where consecutive values differ by more than
+    `gap_m`. The farthest cluster holding at least `min_frac` of those pixels
+    is picked, or else the largest one (the nearer one on a tie), so a front
+    leaf covering part of the box does not hide the fruit behind it. A box
+    with no finite in-image pixel inside gets NaN, without a warning.
+    """
+    boxes = np.asarray(boxes, dtype=float)
+    height, width = depth_m.shape
+    out = np.empty(len(boxes), dtype=float)
+    for i, (x0, y0, x1, y1) in enumerate(boxes):
+        c0 = int(np.floor(x0))
+        c1 = max(c0 + 1, int(np.ceil(x1)))
+        r0 = int(np.floor(y0))
+        r1 = max(r0 + 1, int(np.ceil(y1)))
+        c0, c1 = max(c0, 0), min(c1, width)
+        r0, r1 = max(r0, 0), min(r1, height)
+        if c1 <= c0 or r1 <= r0:
+            out[i] = np.nan
+            continue
+        cu, cv = (x0 + x1) / 2, (y0 + y1) / 2
+        au = max(scale * (x1 - x0) / 2, 0.5)
+        av = max(scale * (y1 - y0) / 2, 0.5)
+        rows, cols = np.mgrid[r0:r1, c0:c1]
+        inside = ((cols + 0.5 - cu) / au) ** 2 + ((rows + 0.5 - cv) / av) ** 2 <= 1.0
+        v = depth_m[r0:r1, c0:c1][inside]
+        v = np.sort(v[np.isfinite(v)])
+        if len(v) == 0:
+            out[i] = np.nan
+            continue
+        clusters = np.split(v, np.flatnonzero(np.diff(v) > gap_m) + 1)
+        sizes = np.array([len(c) for c in clusters])
+        enough = np.flatnonzero(sizes >= min_frac * len(v))
+        k = int(enough[-1]) if len(enough) else int(np.argmax(sizes))
+        out[i] = np.median(clusters[k])
+    return out
+
+
 def lift_points(
     boxes: np.ndarray, labels: np.ndarray, z: np.ndarray, camera: Camera, cfg: LiftConfig
 ) -> np.ndarray:
@@ -102,6 +146,11 @@ def lift(
         z = dets.depth_m
     else:
         if depth_img is None:
-            raise ValueError("box_median needs depth_img")
-        z = box_median_depth(dets.boxes, depth_img, cfg.box_frac)
+            raise ValueError(f"{cfg.depth} needs depth_img")
+        if cfg.depth == "box_median":
+            z = box_median_depth(dets.boxes, depth_img, cfg.box_frac)
+        elif cfg.depth == "box_far":
+            z = box_far_depth(dets.boxes, depth_img, cfg.far_scale, cfg.far_gap_m, cfg.far_min_frac)
+        else:
+            raise ValueError(f"unknown lift.depth={cfg.depth}")
     return lift_points(dets.boxes, dets.labels, z, frame.camera, cfg)

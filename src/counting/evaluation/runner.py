@@ -18,7 +18,7 @@ from typing import Mapping, Sequence
 import numpy as np
 import yaml
 
-from counting.config.eval_schema import EvalAppConfig, SplitsConfig
+from counting.config.eval_schema import EvalAppConfig, LiftConfig, SplitsConfig
 from counting.data.formats.orchard_synth import (
     FrameInput, OrchardLayout, PassKey, SceneTruth, SynthRun, read_depth_m, select_frames,
 )
@@ -32,7 +32,7 @@ from counting.evaluation.oracle_stages import (
 from counting.evaluation.truth import SummaryMismatch, TruthTables, check_summary, is_positive, truth_sets
 from counting.multiview.assign import assign_trees, in_target_row
 from counting.multiview.dedup import dedup, repair_pass
-from counting.multiview.lift import box_median_depth, lift_points
+from counting.multiview.lift import box_far_depth, box_median_depth, lift_points
 from counting.tracking.landmark import track_pass
 
 VARIANTS = ("count1", "any", "strict")
@@ -59,17 +59,33 @@ class RunContext:
     tables: dict[str, TruthTables]
     prepared: dict[str, object]
     _frame_of: dict[int, FrameInput] = field(init=False, repr=False)
-    _box_depth: dict[tuple[int, float], np.ndarray] = field(default_factory=dict, init=False, repr=False)
+    _box_depth: dict[tuple, np.ndarray] = field(default_factory=dict, init=False, repr=False)
 
     def __post_init__(self) -> None:
         self._frame_of = {f.idx: f for frames in self.passes.values() for f in frames}
 
-    def box_depth(self, idx: int, box_frac: float) -> np.ndarray:
-        """`box_median_depth` of frame `idx`'s detections; the depth16 image is read once per `box_frac`."""
-        key = (idx, float(box_frac))
+    def box_depth(self, idx: int, lift: LiftConfig) -> np.ndarray:
+        """Box depth of frame `idx`'s detections by `lift.depth` (`box_median` or `box_far`), read-only.
+
+        Cached by (idx, method, the method's own parameters), so the depth16
+        image is read once per key and a parameter the method does not use
+        shares the cached array.
+        """
+        if lift.depth == "box_median":
+            key: tuple = (idx, "box_median", float(lift.box_frac))
+        elif lift.depth == "box_far":
+            key = (idx, "box_far", float(lift.far_scale), float(lift.far_gap_m), float(lift.far_min_frac))
+        else:
+            raise ValueError(f"box_depth needs a box depth method, got lift.depth={lift.depth}")
         if key not in self._box_depth:
             depth = read_depth_m(self._frame_of[idx].depth_path)
-            self._box_depth[key] = box_median_depth(self.dets[idx].boxes, depth, box_frac)
+            boxes = self.dets[idx].boxes
+            if lift.depth == "box_median":
+                z = box_median_depth(boxes, depth, lift.box_frac)
+            else:
+                z = box_far_depth(boxes, depth, lift.far_scale, lift.far_gap_m, lift.far_min_frac)
+            z.flags.writeable = False
+            self._box_depth[key] = z
         return self._box_depth[key]
 
 
@@ -183,6 +199,20 @@ def _percentile(xs: Sequence[float], q: float) -> float | None:
     return float(np.percentile(xs, q)) if len(xs) else None
 
 
+def depth_error_stats(err: np.ndarray) -> dict | None:
+    """Stats of `err` (box depth minus detection depth, m; finite values only), or None when empty.
+
+    `near_10cm`/`far_10cm` are the fraction of `err` strictly beyond -0.10 m / +0.10 m.
+    """
+    if err.size == 0:
+        return None
+    abs_err = np.abs(err)
+    n = int(err.size)
+    return {"n": n, "p50_m": float(np.percentile(abs_err, 50)), "p90_m": float(np.percentile(abs_err, 90)),
+            "p95_m": float(np.percentile(abs_err, 95)), "near_10cm": float(np.count_nonzero(err < -0.10) / n),
+            "far_10cm": float(np.count_nonzero(err > 0.10) / n)}
+
+
 def _units(majority: np.ndarray, purity: np.ndarray, obs: Sequence[tuple[int, ...]], sel) -> list[UnitView]:
     return [UnitView(int(majority[u]), float(purity[u]), obs[u]) for u in sel]
 
@@ -194,6 +224,9 @@ def evaluate(ctx: RunContext, cfg: EvalAppConfig) -> dict:
     denominator, and the median/max/percentile of an empty set, is None.
     `cfg` is checked first (`_check_config`): an unsupported setting raises
     `NotImplementedError`, one that differs from the prepared config `ValueError`.
+    Each pass's and the summary's `depth_err` is `depth_error_stats` of box depth
+    minus detection depth (`None` under `lift.depth=det_depth`, without detector
+    depth, or with no detections).
     """
     _check_config(ctx, cfg)
     st = cfg.stages
@@ -202,12 +235,19 @@ def evaluate(ctx: RunContext, cfg: EvalAppConfig) -> dict:
     passes_out, ledgers = [], []
     tracks_list, keep_list, maj_list, obs_list = [], [], [], []
     detected_all: set[int] = set()
+    depth_errs_all: list[np.ndarray] = []
     for key, frames in ctx.passes.items():
         points = {}
+        depth_errs_pass: list[np.ndarray] = []
         for f in frames:
             D = ctx.dets[f.idx]
-            z = D.depth_m if cfg.lift.depth == "det_depth" else ctx.box_depth(f.idx, cfg.lift.box_frac)
+            z = D.depth_m if cfg.lift.depth == "det_depth" else ctx.box_depth(f.idx, cfg.lift)
             points[f.idx] = lift_points(D.boxes, D.labels, z, f.camera, cfg.lift)
+            if cfg.lift.depth != "det_depth" and D.depth_m is not None:
+                e = z - D.depth_m
+                depth_errs_pass.append(e[np.isfinite(e)])
+        depth_err = depth_error_stats(np.concatenate(depth_errs_pass)) if depth_errs_pass else None
+        depth_errs_all.extend(depth_errs_pass)
         if st.track == "oracle":   # one track per id already: no in-pass repair
             tracks = oracle_tracks(key, frames, ctx.dets, ctx.src, points)
         else:
@@ -242,7 +282,7 @@ def evaluate(ctx: RunContext, cfg: EvalAppConfig) -> dict:
             "n_tracks": len(tracks.X), "n_no3d": int((enough & ~has3d).sum()),
             "U1": U1, "G1": G1, "e1": _ratio(U1 - G1, G1),
             "trees": {str(t): {"U1": int((tree[kept] == t).sum()), "G1": g1_tree[t]} for t in ctx.layout.tree_ids},
-            "ledger": L.as_dict(), "ledger_any": L_any.as_dict(),
+            "ledger": L.as_dict(), "ledger_any": L_any.as_dict(), "depth_err": depth_err,
         })
         tracks_list.append(tracks)
         keep_list.append(keep)
@@ -252,10 +292,12 @@ def evaluate(ctx: RunContext, cfg: EvalAppConfig) -> dict:
     e1s = [abs(p["e1"]) for p in passes_out if p["e1"] is not None]
     rates = combine(ledgers).rates()
     naive_U = sum(p["U1"] for p in passes_out)
+    depth_err_summary = depth_error_stats(np.concatenate(depth_errs_all)) if depth_errs_all else None
     y1 = {"passes": passes_out,
           "summary": {"e1_median": _median(e1s), "e1_max": max(e1s) if e1s else None,
                       "dup_rate": rates["dup_rate"], "miss_rate": rates["miss_rate"],
-                      "merge_rate": rates["merge_rate"], "fp_off_rate": rates["fp_off_rate"], "naive_U": naive_U}}
+                      "merge_rate": rates["merge_rate"], "fp_off_rate": rates["fp_off_rate"], "naive_U": naive_U,
+                      "depth_err": depth_err_summary}}
     y6 = None
     if cfg.stop_after != "y1":
         y6 = _y6(ctx, cfg, tracks_list, keep_list, maj_list, obs_list, detected_all, naive_U)
@@ -368,13 +410,23 @@ def run_ladder(
     """Evaluate `rungs` (and, with `with_2x2`, the (track, dedup) 2 x 2 table on the ladder's base rung).
 
     `chain` lists the requested rungs in ladder order (baselines are not on
-    it). Rungs without `stages.dedup` inherit `cfg`'s, so `cfg` must not
-    use `stages.dedup=oracle`. Each 2 x 2 cell is evaluated with its own
-    config; its values are None under `stop_after=y1`. Every rung and cell
-    config is checked against `ctx` (`_check_config`) before any of them runs.
+    it). Every rung inherits `cfg.stages.det`; a rung without its own
+    `stages.dedup` (`L2c`, `L3`, `L3_dd`) inherits `cfg`'s; a rung without
+    its own `lift` section (`L2c`, `L3`) inherits `cfg.lift`, so it uses
+    `cfg`'s box depth method and parameters. So `cfg` must use
+    `stages.det=oracle`, `lift.depth` other than `det_depth`, and
+    `stages.dedup` other than `oracle`. Each 2 x 2 cell is evaluated with
+    its own config; its values are None under `stop_after=y1`. Every rung
+    and cell config is checked against `ctx` (`_check_config`) before any
+    of them runs.
     """
     if cfg.stages.dedup == "oracle":
         raise ValueError("ladder base config has stages.dedup=oracle; rungs need the crop default dedup mode")
+    if cfg.lift.depth == "det_depth":
+        raise ValueError("ladder base config has lift.depth=det_depth; rungs L2c and L3 use the base box depth "
+                         "method")
+    if cfg.stages.det != "oracle":
+        raise ValueError(f"ladder base config has stages.det={cfg.stages.det}; ladder rungs need oracle detections")
     configs = {name: rung_config(cfg, ladder, name) for name in rungs}
     cells: list[tuple[str, str, EvalAppConfig]] = []
     if with_2x2:

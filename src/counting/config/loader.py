@@ -57,13 +57,13 @@ def _set_dot_path(node: dict[str, Any], parts: list[str], value: Any) -> None:
             raise KeyError(
                 f"Cannot descend into non-dict at: {'.'.join(parts[: i + 1])}"
             )
-        if part not in cur or not isinstance(cur[part], dict):
-            cur[part] = {} if part not in cur else cur[part]
-            if not isinstance(cur[part], dict):
-                raise KeyError(
-                    f"Cannot descend: existing value at "
-                    f"{'.'.join(parts[: i + 1])} is not a dict"
-                )
+        if part not in cur or cur[part] is None:
+            cur[part] = {}
+        elif not isinstance(cur[part], dict):
+            raise KeyError(
+                f"Cannot descend: existing value at "
+                f"{'.'.join(parts[: i + 1])} is not a dict"
+            )
         cur = cur[part]
     if not isinstance(cur, dict):
         raise KeyError(f"Cannot set key on non-dict at: {'.'.join(parts[:-1])}")
@@ -71,7 +71,22 @@ def _set_dot_path(node: dict[str, Any], parts: list[str], value: Any) -> None:
 
 
 def _coerce(raw: str) -> Any:
-    lowered = raw.strip().lower()
+    """Coerce a raw `--set` value string.
+
+    A value starting with `[` or `{` (after stripping surrounding whitespace) is
+    parsed as a YAML flow collection, so `--set noise.seeds=[0, 1, 2]` and
+    `--set lift.center_offset_m={fruit: 0.0}` work. Inside the brackets, plain
+    YAML 1.1 scalar rules apply, not these `--set` rules, so e.g. `[1e-3]` stays
+    the string `"1e-3"` there, not a float. A malformed flow value raises
+    `ValueError`. Everything else keeps the scalar rules below (`1e-3` is a float).
+    """
+    s = raw.strip()
+    if s.startswith(("[", "{")):
+        try:
+            return yaml.safe_load(s)
+        except yaml.YAMLError as e:
+            raise ValueError(f"Override value is not valid YAML flow syntax: {raw}") from e
+    lowered = s.lower()
     if lowered in {"true", "false"}:
         return lowered == "true"
     if lowered in {"null", "none", "~"}:

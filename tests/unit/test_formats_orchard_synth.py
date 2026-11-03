@@ -237,3 +237,18 @@ def test_unreadable_png_raises_with_path(tmp_path, cut):
     p.write_bytes(data[:8] + b"garbage" if cut == "garbage" else data[: len(data) // 2])
     with pytest.raises(ValueError, match=r"000000_depth16\.png: unreadable PNG"):
         read_depth_m(p)
+
+
+def test_fake_front_leaf_patch_changes_depth16_only(leaf_runs):
+    clean, occl = leaf_runs
+    names = sorted(p.name for p in clean.iterdir())
+    assert names == sorted(p.name for p in occl.iterdir())
+    changed = [n for n in names if (clean / n).read_bytes() != (occl / n).read_bytes()]
+    assert changed and all(n.endswith("_depth16.png") and int(n[:6]) % 3 == 0 for n in changed)
+    run = SynthRun.open(occl)
+    assert run.meta.fingerprint == SynthRun.open(clean).meta.fingerprint
+    rec = next(r for r in run.truth().records[3] if r.id == 801)
+    x0, y0, x1, y1 = rec.bbox
+    a, b = read_depth_m(clean / "000003_depth16.png"), read_depth_m(occl / "000003_depth16.png")
+    assert b[(y0 + y1) // 2, (x0 + x1) // 2] == pytest.approx(rec.depth_med - 0.30, abs=1e-3)
+    assert b[y0, x0] == a[y0, x0]          # the patch covers the box centre, not its corner

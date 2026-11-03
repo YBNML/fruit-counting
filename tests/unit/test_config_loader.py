@@ -65,6 +65,28 @@ def test_apply_overrides_rejects_descend_through_non_dict():
         apply_overrides({"a": 5}, ["a.b=2"])
 
 
+def test_apply_overrides_flow_lists_and_maps():
+    out = apply_overrides({"noise": {"seeds": [0]}}, ["noise.seeds=[0, 1, 2]", "passes.pitches=[45]",
+                                                     "passes.sides=[A]", "lift.center_offset_m={fruit: 0.0}"])
+    assert out == {"noise": {"seeds": [0, 1, 2]}, "passes": {"pitches": [45], "sides": ["A"]},
+                   "lift": {"center_offset_m": {"fruit": 0.0}}}
+
+
+def test_apply_overrides_scalars_keep_old_rules():
+    assert apply_overrides({}, ["a=1e-3", "b=3", "c=null", "d=true", "e=box_far", "f=0.135"]) == \
+        {"a": 0.001, "b": 3, "c": None, "d": True, "e": "box_far", "f": 0.135}
+
+
+def test_apply_overrides_bad_flow_value():
+    with pytest.raises(ValueError, match="not valid YAML flow syntax"):
+        apply_overrides({}, ["noise.seeds=[0, 1"])
+
+
+def test_apply_overrides_descends_into_null():
+    assert apply_overrides({"detector": {"noise": None}}, ["detector.noise.miss_p=0.1"]) == \
+        {"detector": {"noise": {"miss_p": 0.1}}}
+
+
 def test_apply_overrides_rejects_missing_equal():
     with pytest.raises(ValueError):
         apply_overrides({"a": 1}, ["apple"])

@@ -5,7 +5,8 @@ Fruit do not move, so a track is a 3D landmark: its point `X` and physical size
 A detection cut by the image border is compared on its inner (uncut) edge,
 and a track ends only when its grown predicted box leaves the image. Tracks
 without 3D, and every track under `method="last_box"`, chain by IoU with the
-previous box instead.
+previous box instead. With `depth_gate="soft"` a depth-gate failure inside the
+screen gate costs `soft_cost` extra instead of being refused.
 """
 
 from __future__ import annotations
@@ -193,8 +194,9 @@ def _cost_matrix(
 ) -> np.ndarray:
     """Track x detection cost; pairs outside the gate get `_OUT`.
 
-    Tracks with a prediction this frame use the edge-aware cost and depth gate;
-    the others use `1 - IoU` with their last box.
+    Tracks with a prediction this frame use the edge-aware cost and depth gate
+    (refused when hard, `soft_cost` extra when soft); the others use `1 - IoU`
+    with their last box.
     """
     cost = np.full((len(active), len(boxes)), _OUT)
     pred = [i for i, t in enumerate(active) if t.pred is not None]
@@ -209,7 +211,11 @@ def _cost_matrix(
         depth_ok = (
             touch.any(axis=1) | np.isnan(zP) | edge_only[:, None] | (np.abs(zP - z[:, None]) <= cfg.gate_m)
         )
-        cost[pred] = np.where((c <= cfg.gate_px_frac) & depth_ok, c, _OUT)
+        screen = c <= cfg.gate_px_frac
+        if cfg.depth_gate == "soft":
+            cost[pred] = np.where(screen, np.where(depth_ok, c, c + cfg.soft_cost), _OUT)
+        else:
+            cost[pred] = np.where(screen & depth_ok, c, _OUT)
     if by_iou:
         iou = box_iou(np.stack([active[i].box for i in by_iou]), boxes)
         cost[by_iou] = np.where(iou >= _MIN_IOU, 1.0 - iou, _OUT)
