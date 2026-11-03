@@ -1417,14 +1417,14 @@ Expected: all Task 1–8 commits reach `origin/main`.
 - [ ] **Step 6: Remote sync and install open_clip_torch on remote**
 
 ```bash
-ssh kimhj@205.200.0.113 'cd ~/fruit-counting && git pull --ff-only 2>&1 | tail -3 && ~/miniforge3/bin/conda run -n counting-env pip install open_clip_torch 2>&1 | tail -3'
+ssh <train-host> 'cd ~/fruit-counting && git pull --ff-only 2>&1 | tail -3 && ~/miniforge3/bin/conda run -n counting-env pip install open_clip_torch 2>&1 | tail -3'
 ```
 Expected: pull succeeds, open_clip installation completes. (No re-creation of the conda env.)
 
 - [ ] **Step 7: Remote sanity — all unit tests green**
 
 ```bash
-ssh kimhj@205.200.0.113 'cd ~/fruit-counting && ~/miniforge3/bin/conda run -n counting-env pytest -m "not slow" -q 2>&1 | tail -3'
+ssh <train-host> 'cd ~/fruit-counting && ~/miniforge3/bin/conda run -n counting-env pytest -m "not slow" -q 2>&1 | tail -3'
 ```
 Expected: 83 passed.
 
@@ -1441,8 +1441,8 @@ No unit tests. Manual validation with concrete commands and expected outcomes.
 ```bash
 conda run -n counting-env counting extract-clip-features \
   --dataset fsc147 \
-  --dataset-root /Users/khj/YBNML_macmini/counting/FSC147_384_V2 \
-  --out /Users/khj/YBNML_macmini/counting/models/PseCo/clip_text_features.pt \
+  --dataset-root <dataset-root> \
+  --out <repo>/models/PseCo/clip_text_features.pt \
   --device cpu
 ```
 
@@ -1452,33 +1452,33 @@ If the Mac no longer has `ImageClasses_FSC147.txt` (it might have only been on r
 
 ```bash
 # Fallback: fetch ImageClasses_FSC147.txt from remote first
-scp kimhj@205.200.0.113:~/fruit-counting/datasets/fsc147/ImageClasses_FSC147.txt \
+scp <train-host>:~/fruit-counting/datasets/fsc147/ImageClasses_FSC147.txt \
   /tmp/ImageClasses_FSC147.txt
 mkdir -p /tmp/fsc-stub/
 mv /tmp/ImageClasses_FSC147.txt /tmp/fsc-stub/
 
-mkdir -p /Users/khj/YBNML_macmini/counting/models/PseCo/
+mkdir -p <repo>/models/PseCo/
 conda run -n counting-env counting extract-clip-features \
   --dataset fsc147 \
   --dataset-root /tmp/fsc-stub \
-  --out /Users/khj/YBNML_macmini/counting/models/PseCo/clip_text_features.pt \
+  --out <repo>/models/PseCo/clip_text_features.pt \
   --device cpu
 ```
 
-Expected: `done 147 classes → /Users/khj/YBNML_macmini/counting/models/PseCo/clip_text_features.pt`. First run downloads open_clip ViT-B/32 weights (~600 MB) to the local cache `~/.cache/torch/hub/`.
+Expected: `done 147 classes → <repo>/models/PseCo/clip_text_features.pt`. First run downloads open_clip ViT-B/32 weights (~600 MB) to the local cache `~/.cache/torch/hub/`.
 
 - [ ] **Step 2: Deploy CLIP cache to remote**
 
 ```bash
-scp /Users/khj/YBNML_macmini/counting/models/PseCo/clip_text_features.pt \
-  kimhj@205.200.0.113:~/fruit-counting/models/PseCo/clip_text_features.pt
+scp <repo>/models/PseCo/clip_text_features.pt \
+  <train-host>:~/fruit-counting/models/PseCo/clip_text_features.pt
 ```
 Expected: transfer completes (file is ~300 KB).
 
 - [ ] **Step 3: Kick off 5-epoch training on remote**
 
 ```bash
-ssh kimhj@205.200.0.113 "bash -lc 'rm -rf ~/fruit-counting/runs/plan3_e5 && > ~/train_plan3.log && cd ~/fruit-counting && nohup ~/miniforge3/bin/conda run -n counting-env counting train pseco-head --config configs/train/pseco_head.yaml --set train.epochs=5 --set run_name=plan3_e5 >> ~/train_plan3.log 2>&1 &' && sleep 3 && pgrep -af 'counting train pseco-head' | head -3"
+ssh <train-host> "bash -lc 'rm -rf ~/fruit-counting/runs/plan3_e5 && > ~/train_plan3.log && cd ~/fruit-counting && nohup ~/miniforge3/bin/conda run -n counting-env counting train pseco-head --config configs/train/pseco_head.yaml --set train.epochs=5 --set run_name=plan3_e5 >> ~/train_plan3.log 2>&1 &' && sleep 3 && pgrep -af 'counting train pseco-head' | head -3"
 ```
 Expected: 3 processes listed (bash wrapper, conda run wrapper, counting CLI python). Training runs in background.
 
@@ -1487,7 +1487,7 @@ Expected: 3 processes listed (bash wrapper, conda run wrapper, counting CLI pyth
 Poll with a short loop until the process ends and checkpoints exist. One-liner:
 
 ```bash
-until ssh kimhj@205.200.0.113 'test -f ~/fruit-counting/runs/plan3_e5/checkpoints/last.ckpt && ! pgrep -f "counting train pseco-head" > /dev/null'; do sleep 30; done && echo "DONE"
+until ssh <train-host> 'test -f ~/fruit-counting/runs/plan3_e5/checkpoints/last.ckpt && ! pgrep -f "counting train pseco-head" > /dev/null'; do sleep 30; done && echo "DONE"
 ```
 
 Expected: `DONE` prints once training is finished and `last.ckpt` is on disk.
@@ -1495,9 +1495,9 @@ Expected: `DONE` prints once training is finished and `last.ckpt` is on disk.
 - [ ] **Step 5: Extract TensorBoard metrics**
 
 ```bash
-ssh kimhj@205.200.0.113 '~/miniforge3/bin/conda run -n counting-env python -c "
+ssh <train-host> '~/miniforge3/bin/conda run -n counting-env python -c "
 from tensorboard.backend.event_processing.event_accumulator import EventAccumulator
-ea = EventAccumulator(\"/home/kimhj/fruit-counting/runs/plan3_e5/tensorboard\")
+ea = EventAccumulator(\"~/fruit-counting/runs/plan3_e5/tensorboard\")
 ea.Reload()
 for tag in ea.Tags()[\"scalars\"]:
     scalars = ea.Scalars(tag)

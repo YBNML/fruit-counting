@@ -109,7 +109,7 @@ git commit -m "build: add PseCo as git submodule pinned to aab6cdb"
 git push
 
 # On remote (over SSH):
-ssh kimhj@<host> 'cd ~/fruit-counting && git pull && git submodule update --init --recursive'
+ssh <train-host> 'cd ~/fruit-counting && git pull && git submodule update --init --recursive'
 ```
 
 - [ ] **Step 4: Verify upstream imports work in counting-env**
