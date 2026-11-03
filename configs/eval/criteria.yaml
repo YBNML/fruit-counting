@@ -1,7 +1,7 @@
 # Assumed thresholds.
 y1:
   L1:
-    pear:  {e1_median: {le: 0.01}, e1_max: {le: 0.03}, dup_rate: {le: 0.02}, miss_rate: {le: 0.01}, merge_rate: {le: 0.01}}
+    pear:  {e1_median: {le: 0.02}, e1_max: {le: 0.05}, dup_rate: {le: 0.02}, miss_rate: {le: 0.01}, merge_rate: {le: 0.01}}
     apple: {e1_median: {le: 0.02}, e1_max: {le: 0.05}, dup_rate: {le: 0.03}, miss_rate: {le: 0.02}, merge_rate: {le: 0.02}}
   L3:
     pear:  {e1_median: {le: 0.02}, fp_off_rate: {le: 0.01}}

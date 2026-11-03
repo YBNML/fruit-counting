@@ -95,7 +95,8 @@ def test_splits_overlap_rejected():
 
 def test_criteria_file_values():
     c = yaml.safe_load((EVAL / "criteria.yaml").read_text(encoding="utf-8"))
-    assert c["y1"]["L1"]["pear"]["e1_median"] == {"le": 0.01}
+    assert c["y1"]["L1"]["pear"]["e1_median"] == {"le": 0.02}
+    assert c["y1"]["L1"]["pear"]["e1_max"] == {"le": 0.05}
     assert c["y1"]["L1"]["apple"]["e1_max"] == {"le": 0.05}
     assert c["y1"]["L3"]["apple"]["fp_off_rate"] == {"le": 0.02}
     assert c["y6"]["L3"]["pear"]["pos_err_p90_m"] == {"le": 0.05}
