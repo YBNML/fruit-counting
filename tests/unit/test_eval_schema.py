@@ -48,9 +48,10 @@ def test_pear_dev_config_values():
 
 # Values chosen on the val bundle; val and exp configs carry them, dev configs keep the defaults.
 TUNED_ON_VAL = {
-    "apple": {"lift": {"depth": "box_far"},
+    "apple": {"stages": {"dedup": "hybrid"},
+              "lift": {"depth": "box_far"},
               "tracker": {"depth_gate": "soft", "repair_m": 0.08},
-              "dedup": {"radius_m": 0.08}},
+              "dedup": {"radius_m": 0.09, "band_m": 0.05}},
     "pear": {},
 }
 
@@ -174,8 +175,8 @@ def test_config_hash_generic_and_ignores_runtime_keys():
     assert config_hash(a) == config_hash(b) != config_hash(c)
 
 
-COMMITTED_HASHES = {"apple_dev": "38b74b45e42d9213", "pear_dev": "b85d292df18d8261", "apple_val": "825ebc81a20769d6",
-                    "apple_exp": "087d17775917d1b9", "pear_val": "8d8d2c1d3f6b4fe4", "pear_exp": "236093486cebe266"}
+COMMITTED_HASHES = {"apple_dev": "38b74b45e42d9213", "pear_dev": "b85d292df18d8261", "apple_val": "b26494b8830a44fa",
+                    "apple_exp": "7f6be6772929d5ed", "pear_val": "8d8d2c1d3f6b4fe4", "pear_exp": "236093486cebe266"}
 
 
 def test_committed_config_hashes_unchanged():
