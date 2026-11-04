@@ -9,10 +9,10 @@ from counting.data.formats.orchard_synth import (
     FrameInput, FruitGt, GtRecord, OrchardLayout, PassKey, SceneTruth, SynthRun,
 )
 from counting.evaluation.truth import (
-    SummaryMismatch, check_geometry, check_summary, is_positive, subset_table, truth_sets,
+    SummaryMismatch, check_geometry, check_summary, is_positive, pass_subsets, subset_table, truth_sets,
 )
 from counting.geometry.camera import Camera
-from tests.unit.synthfake import write_run
+from tests.unit.synthfake import move_unoccluded_box, write_run
 
 A, B = PassKey(30.0, "A", 2), PassKey(30.0, "B", 1)
 LAYOUT = OrchardLayout("apple", (0.0, 3.75, 7.5), 1, 3.75, (3, 4), (0.0, 1.25))
@@ -85,10 +85,18 @@ def test_subset_table_rows():
     assert by["drop 30"]["G6"] == 0 and by["drop 30"]["n_passes"] == 0
 
 
+def test_pass_subsets_names_and_order():
+    a10, b10 = PassKey(10.0, "A", 2), PassKey(10.0, "B", 1)
+    keys = [A, B, a10, b10]                                   # A and B are the 30 deg keys
+    assert pass_subsets(keys) == [("all", keys), ("A", [A, a10]), ("B", [B, b10]),
+                                  ("only 10", [a10, b10]), ("drop 10", [A, B]),
+                                  ("only 30", [A, B]), ("drop 30", [a10, b10])]
+
+
 def test_check_geometry_on_fake(apple_run):
     run = SynthRun.open(apple_run)
     res = check_geometry(run, run.truth(), stride=10)
-    assert res["passed"] and res["center_in_bbox"] == 1.0 and res["n_unoccluded"] > 0
+    assert res["passed"] and res["ground"] == "ok" and res["center_in_bbox"] == 1.0 and res["n_unoccluded"] > 0
     assert res["n_ground_px"] > 0 and res["ground_abs_z_median_m"] <= 0.001
 
 
@@ -98,4 +106,32 @@ def test_check_geometry_catches_depth_offset(tmp_path):
         d = np.array(Image.open(p), dtype=np.uint16)
         Image.fromarray(np.where(d > 0, np.minimum(d.astype(np.int32) + 50, 65535), 0).astype(np.uint16)).save(p)
     run = SynthRun.open(root)
-    assert check_geometry(run, run.truth(), stride=5)["passed"] is False
+    res = check_geometry(run, run.truth(), stride=5)
+    assert res["ground"] == "fail" and res["passed"] is False
+
+
+def test_check_geometry_fails_when_ground_has_no_depth(tmp_path):
+    """Ground in view but every depth16 pixel 0 (no return): the ground check applies and fails, it is not n/a."""
+    root = write_run(tmp_path, crop="apple")                    # 10 and 30 deg; 10 deg sees the ground
+    for p in root.glob("*_depth16.png"):
+        Image.fromarray(np.zeros_like(np.array(Image.open(p), dtype=np.uint16))).save(p)
+    run = SynthRun.open(root)
+    res = check_geometry(run, run.truth(), stride=10)
+    assert (res["ground"], res["passed"], res["n_ground_px"], res["ground_abs_z_median_m"]) == ("fail", False, 0, None)
+    assert res["center_in_bbox"] == 1.0 and res["n_unoccluded"] > 0   # the centre check never reads depth
+
+
+def test_check_geometry_ground_not_applicable(pear_run):
+    """45 and 70 deg passes never see the ground: the ground check is n/a and the centre check decides."""
+    run = SynthRun.open(pear_run)
+    res = check_geometry(run, run.truth(), stride=10)
+    assert res["ground"] == "n/a" and (res["n_ground_px"], res["ground_abs_z_median_m"]) == (0, None)
+    assert res["center_in_bbox"] == 1.0 and res["n_unoccluded"] == 37 and res["passed"] is True
+
+
+def test_check_geometry_center_fail_without_ground(tmp_path):
+    root = write_run(tmp_path, crop="apple", pitches=(30.0,))       # 30 deg only: no ground in view
+    move_unoccluded_box(root / "000000_frame.json")
+    run = SynthRun.open(root)
+    res = check_geometry(run, run.truth(), stride=10)
+    assert res["ground"] == "n/a" and res["center_in_bbox"] == pytest.approx(40 / 41) and res["passed"] is False

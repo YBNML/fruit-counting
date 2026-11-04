@@ -8,7 +8,7 @@ from counting.evaluation.report import results_bytes
 from counting.evaluation.runner import evaluate, load_ladder, prepare, rung_config
 from counting.evaluation.truth import check_geometry, check_summary, truth_sets
 from tests.unit.synthfake import fake_cfg, load_splits
-from tests.unit.test_runner import assert_exact
+from tests.unit.test_runner import _without_mode, assert_exact
 
 pytestmark = [pytest.mark.slow, pytest.mark.synth]
 ROOT = Path(__file__).resolve().parents[2]
@@ -46,7 +46,8 @@ def test_dev_truth_tables(rel):
 @pytest.mark.parametrize("rel", sorted(DEV))
 def test_dev_geometry(rel):
     run = _open(rel)
-    assert check_geometry(run, run.truth(), stride=20)["passed"]
+    res = check_geometry(run, run.truth(), stride=20)
+    assert res["passed"] and res["ground"] == "ok"      # these renders see the ground, so its check runs
 
 
 @pytest.mark.parametrize("rel", sorted(DEV))
@@ -113,3 +114,20 @@ def test_dev_depth_tail_remedy(rel):
     l1 = evaluate(ctx, rung_config(cfg, LADDER, "L1"))
     assert abs(l3["y6"]["row"]["e_pipe"] - e_pipe) <= 0.005
     assert abs(l1["y1"]["summary"]["e1_median"] - e1) <= 0.005
+
+
+def test_dev_hybrid_band_limits():
+    """Regression guard, not a verdict: hybrid on the dev apple render at L3 (default box depth).
+
+    Band 0 equals self_side and band 1e9 equals merge; row U measured at 8141780 with this rule.
+    """
+    rel = "apple/robot3"
+    ctx = prepare(_open(rel), fake_cfg(BASE / rel, "apple"), load_splits())
+
+    def y6(*sets):
+        return evaluate(ctx, rung_config(fake_cfg(BASE / rel, "apple", *sets), LADDER, "L3"))["y6"]
+
+    side, merge = y6("stages.dedup=self_side"), y6()
+    band0, band10, band_inf = (y6("stages.dedup=hybrid", f"dedup.band_m={b}") for b in ("0.0", "0.10", "1e9"))
+    assert (side["row"]["U"], band10["row"]["U"], merge["row"]["U"]) == (2313, 2561, 3154)
+    assert _without_mode(band0) == _without_mode(side) and _without_mode(band_inf) == _without_mode(merge)

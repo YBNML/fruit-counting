@@ -75,8 +75,8 @@ def test_prediction_modules_cannot_reach_truth():
 
 def test_eval_modules_do_not_import_torch():
     mods = ["counting.evaluation.cli", "counting.evaluation.runner", "counting.evaluation.report",
-            "counting.tracking.landmark", "counting.multiview.dedup", "counting.multiview.lift",
-            "counting.detection.oracle", "counting.data.formats.orchard_synth"]
+            "counting.evaluation.sweep", "counting.tracking.landmark", "counting.multiview.dedup",
+            "counting.multiview.lift", "counting.detection.oracle", "counting.data.formats.orchard_synth"]
     code = "import importlib, sys\n" + "".join(f"importlib.import_module({m!r})\n" for m in mods) + \
            "print('torch' in sys.modules)"
     out = python_c(code)

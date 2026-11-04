@@ -1,0 +1,7 @@
+# Screen gate, gap limit and depth gate width. gate_m rows matter under tracker.depth_gate=hard;
+# under soft keep gate_m at the crop default and read those rows as report-only.
+bases: [L1, L3]
+factors:
+  tracker.gate_px_frac: [0.4, 0.5, 0.6]
+  tracker.max_gap: [5, 10]
+  tracker.gate_m: [0.05, 0.10, 0.15, 0.20]

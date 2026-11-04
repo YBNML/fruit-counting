@@ -331,3 +331,20 @@ def write_run(
     _write_json(root / "manifest.json", manifest)
     _write_json(root / "summary.json", _summary(written, spec_trees))
     return root
+
+
+def move_unoccluded_box(frame_json: Path) -> int:
+    """Shift the first unoccluded record's bbox (visib >= 0.95, not trunc) right by its width + 2 px.
+
+    Its projected centre then falls outside the box, so the geometry centre check fails on that
+    frame. Only this frame.json changes. Returns the record id.
+    """
+    data = json.loads(frame_json.read_text(encoding="utf-8"))
+    for r in data["records"]:
+        if r["visib"] >= 0.95 and not r["trunc"] and r["bbox"] is not None:
+            x0, y0, x1, y1 = r["bbox"]
+            w = x1 - x0
+            r["bbox"] = [x0 + w + 2, y0, x1 + w + 2, y1]
+            _write_json(frame_json, data)
+            return r["id"]
+    raise AssertionError(f"{frame_json}: no unoccluded record to move")

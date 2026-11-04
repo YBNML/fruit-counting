@@ -1,0 +1,6 @@
+# Surface-to-centre offset constants moved by -5 mm and +5 mm; the baseline keeps the config constants.
+# L2c position error picks the offset and L2b is reported; L1 and L3 check the tracker and row constraints.
+bases: [L1, L2b, L2c, L3]
+combos:
+  offset_-5mm: {lift: {center_offset_m: {fruit: 0.015, bag: 0.025}}}
+  offset_+5mm: {lift: {center_offset_m: {fruit: 0.025, bag: 0.035}}}

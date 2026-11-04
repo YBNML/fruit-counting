@@ -42,6 +42,18 @@ def test_pear_dev_config_values():
     assert (cfg.tracker.gate_m, cfg.tracker.repair_m, cfg.dedup.radius_m) == (0.10, 0.09, 0.09)
 
 
+@pytest.mark.parametrize("crop", ["apple", "pear"])
+def test_val_and_exp_configs_follow_dev(crop):
+    dev = load_yaml_model(EVAL / f"{crop}_dev.yaml", EvalAppConfig)
+    splits = load_yaml_model(EVAL / "splits.yaml", SplitsConfig)
+    for split in ("val", "exp"):
+        cfg = load_yaml_model(EVAL / f"{crop}_{split}.yaml", EvalAppConfig)
+        (seed,) = getattr(splits, split)
+        assert cfg.runs == [f"~/datasets/orchard_synth/{crop}/{split}_s{seed}"]
+        assert cfg.model_dump() == {**dev.model_dump(), "run_name": f"{crop}_{split}", "split": split, "runs": cfg.runs,
+                                    "noise": {**dev.noise.model_dump(), "seeds": [0, 1, 2]}}
+
+
 def test_unknown_key_rejected():
     raw = _raw()
     raw["stages"]["bogus"] = 1

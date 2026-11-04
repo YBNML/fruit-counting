@@ -1,0 +1,5 @@
+# Frame spacing on the exp bundles, rendered every 0.025 m (the baseline keeps every frame).
+# L1 isolates the tracker (det_depth), L3 uses the config's box depth, last_box records the failure mode.
+bases: [L1, L3, last_box]
+factors:
+  passes.step_m: [0.05, 0.075, 0.15, 0.3]

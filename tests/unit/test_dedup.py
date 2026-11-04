@@ -9,7 +9,7 @@ from counting.multiview.dedup import dedup, repair_pass
 from counting.tracking.landmark import PassTracks
 
 LAYOUT = OrchardLayout("apple", (0.0, 3.75, 7.5), 1, 3.75, (3, 4, 5), (0.0, 1.25, 2.5))
-A30, B30, A50 = PassKey(30.0, "A", 2), PassKey(30.0, "B", 1), PassKey(50.0, "A", 2)
+A30, B30, A50, B50 = PassKey(30.0, "A", 2), PassKey(30.0, "B", 1), PassKey(50.0, "A", 2), PassKey(50.0, "B", 1)
 P = np.array([[0.0, 3.95, 1.5], [0.4, 3.55, 1.8], [0.9, 4.0, 1.65], [1.3, 3.6, 2.0]])
 R4 = DedupConfig(radius_m=0.04)
 
@@ -75,6 +75,46 @@ def test_self_side_keeps_own_half_and_never_crosses_sides():
 def test_self_side_merges_pitches_within_side():
     a, c = _pt(A30, [[0.5, 3.95, 1.6]]), _pt(A50, [[0.52, 3.95, 1.6]])
     assert len(dedup([a, c], _all(a, c), LAYOUT, DedupConfig(radius_m=0.09), mode="self_side").X) == 1
+
+
+def test_hybrid_band_filter_and_cross_side_rule():
+    cfg = DedupConfig(radius_m=0.09, band_m=0.03)
+    a = _pt(A30, [[1.0, 3.80, 1.6], [2.0, 3.73, 1.6]])                     # A: 5 cm on its own side, 2 cm across the plane
+    b = _pt(B30, [[1.0, 3.77, 1.6], [2.0, 3.74, 1.6], [0.5, 3.85, 1.6]])   # B: 2 cm across, 1 cm on its own side, 10 cm across
+    assert _sets(dedup([a, b], _all(a, b), LAYOUT, cfg, mode="hybrid")) == {
+        frozenset({(A30, 0)}), frozenset({(B30, 0)}), frozenset({(A30, 1), (B30, 1)})}   # (A30, 0) lies outside the band
+    assert _sets(dedup([a, b], _all(a, b), LAYOUT, cfg, mode="merge")) == {
+        frozenset({(A30, 0), (B30, 0)}), frozenset({(A30, 1), (B30, 1)}), frozenset({(B30, 2)})}
+
+
+def test_hybrid_band_zero_keeps_sides_apart():
+    c, d = _pt(A30, [[1.0, 3.76, 1.6]]), _pt(B30, [[1.0, 3.74, 1.6]])     # 2 cm apart across the plane
+    for band, n in ((0.0, 2), (0.05, 1)):
+        assert len(dedup([c, d], _all(c, d), LAYOUT, DedupConfig(radius_m=0.09, band_m=band), mode="hybrid").X) == n
+
+
+def test_hybrid_band_bounds_on_the_edge():
+    """A keeps y = row_y - band, B drops y = row_y + band, and |y - row_y| = band is not inside the band."""
+    cfg = DedupConfig(radius_m=0.09, band_m=0.25)                 # row_y 3.75: the bounds 3.5 and 4.0 are exact
+    a = _pt(A30, [[1.0, 3.5, 1.6], [3.0, 3.6, 1.6]])
+    b = _pt(B30, [[1.0, 3.5, 1.6], [2.0, 4.0, 1.6], [3.0, 3.6, 1.6]])
+    assert _sets(dedup([a, b], _all(a, b), LAYOUT, cfg, mode="hybrid")) == {
+        frozenset({(A30, 0)}), frozenset({(B30, 0)}),            # both on the band edge: not joined across sides
+        frozenset({(A30, 1), (B30, 2)})}                         # both inside the band: joined; (B30, 1) is dropped
+
+
+def test_hybrid_band_limits_match_self_side_and_merge():
+    rng = np.random.default_rng(3)
+    pts = [_pt(k, np.c_[rng.uniform(0, 2.5, 40), rng.normal(3.75, 0.06, 40), rng.uniform(1, 2, 40)])
+           for k in (A30, B30, A50, B50)]
+    keep = [rng.random(40) < 0.9 for _ in pts]
+    for band, other in ((0.0, "self_side"), (1e9, "merge")):
+        cfg = DedupConfig(radius_m=0.09, band_m=band)
+        h, o = dedup(pts, keep, LAYOUT, cfg, mode="hybrid"), dedup(pts, keep, LAYOUT, cfg, mode=other)
+        assert h.members == o.members and np.array_equal(h.X, o.X), band
+    n = [len(dedup(pts, keep, LAYOUT, DedupConfig(radius_m=0.09, band_m=0.05), mode=m).X)
+         for m in ("self_side", "hybrid", "merge")]
+    assert n == [58, 82, 102]      # the limits differ, so the equalities above are not vacuous
 
 
 def test_keep_mask_respected():

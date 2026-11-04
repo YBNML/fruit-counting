@@ -29,11 +29,13 @@ from counting.evaluation.match import match_frame, unit_majority
 from counting.evaluation.oracle_stages import (
     oracle_dedup, oracle_tracks, truth_centers, truth_row_mask, truth_trees,
 )
-from counting.evaluation.truth import SummaryMismatch, TruthTables, check_summary, is_positive, truth_sets
+from counting.evaluation.truth import (
+    SummaryMismatch, TruthTables, check_summary, is_positive, pass_subsets, truth_sets,
+)
 from counting.multiview.assign import assign_trees, in_target_row
 from counting.multiview.dedup import dedup, repair_pass
 from counting.multiview.lift import box_far_depth, box_median_depth, lift_points
-from counting.tracking.landmark import track_pass
+from counting.tracking.landmark import PassTracks, track_pass
 
 VARIANTS = ("count1", "any", "strict")
 
@@ -93,8 +95,6 @@ def _unsupported_setting(cfg: EvalAppConfig) -> str | None:
     """The first config setting this version does not support, or None."""
     if cfg.stages.det != "oracle":
         return f"stages.det={cfg.stages.det}"
-    if cfg.stages.dedup == "hybrid":
-        return "stages.dedup=hybrid"
     if not cfg.noise.is_zero():
         return "noise"
     if cfg.detector.noise is not None:
@@ -217,7 +217,20 @@ def _units(majority: np.ndarray, purity: np.ndarray, obs: Sequence[tuple[int, ..
     return [UnitView(int(majority[u]), float(purity[u]), obs[u]) for u in sel]
 
 
-def evaluate(ctx: RunContext, cfg: EvalAppConfig) -> dict:
+@dataclass(frozen=True)
+class _PassStage:
+    """One pass's stage results that Y6 reuses; `detected` is the set of truth ids its detections matched."""
+
+    key: PassKey
+    tracks: PassTracks
+    keep: np.ndarray
+    maj: np.ndarray
+    obs: list[tuple[int, ...]]
+    detected: set[int]
+    U1: int
+
+
+def evaluate(ctx: RunContext, cfg: EvalAppConfig, *, subsets: bool = False) -> dict:
     """Run the stage setting `cfg.stages` on `ctx` and score Y1 (per pass) and Y6 (per tree and row).
 
     `G1`/`G6` are the `cfg.truth.variant` truth; a ratio with a zero
@@ -227,14 +240,18 @@ def evaluate(ctx: RunContext, cfg: EvalAppConfig) -> dict:
     Each pass's and the summary's `depth_err` is `depth_error_stats` of box depth
     minus detection depth (`None` under `lift.depth=det_depth`, without detector
     depth, or with no detections).
+    With `subsets` (which needs `stop_after=y6`), the result also has `subsets`
+    (`_score_subsets`): the passes' tracks are reused, and Y6 is scored again on
+    each subset of `pass_subsets`.
     """
     _check_config(ctx, cfg)
+    if subsets and cfg.stop_after == "y1":
+        raise ValueError("--subsets needs stop_after=y6")
     st = cfg.stages
     G, G_any = ctx.tables[cfg.truth.variant], ctx.tables["any"]
     T = G.target_ids
     passes_out, ledgers = [], []
-    tracks_list, keep_list, maj_list, obs_list = [], [], [], []
-    detected_all: set[int] = set()
+    stages: list[_PassStage] = []
     depth_errs_all: list[np.ndarray] = []
     for key, frames in ctx.passes.items():
         points = {}
@@ -267,7 +284,6 @@ def evaluate(ctx: RunContext, cfg: EvalAppConfig) -> dict:
         kept = np.flatnonzero(keep)
 
         detected = {int(s) for f in frames for s in ctx.src[f.idx].tolist() if s >= 0}
-        detected_all |= detected
         units = _units(maj, pur, obs, kept)
         common = dict(units=units, track_majorities=[(0, int(maj[t])) for t in kept],
                       kept_obs_ids={i for t in kept for i in obs[t]}, detected_ids=detected)
@@ -284,10 +300,7 @@ def evaluate(ctx: RunContext, cfg: EvalAppConfig) -> dict:
             "trees": {str(t): {"U1": int((tree[kept] == t).sum()), "G1": g1_tree[t]} for t in ctx.layout.tree_ids},
             "ledger": L.as_dict(), "ledger_any": L_any.as_dict(), "depth_err": depth_err,
         })
-        tracks_list.append(tracks)
-        keep_list.append(keep)
-        maj_list.append(maj)
-        obs_list.append(obs)
+        stages.append(_PassStage(key, tracks, keep, maj, obs, detected, U1))
 
     e1s = [abs(p["e1"]) for p in passes_out if p["e1"] is not None]
     rates = combine(ledgers).rates()
@@ -300,15 +313,53 @@ def evaluate(ctx: RunContext, cfg: EvalAppConfig) -> dict:
                       "depth_err": depth_err_summary}}
     y6 = None
     if cfg.stop_after != "y1":
-        y6 = _y6(ctx, cfg, tracks_list, keep_list, maj_list, obs_list, detected_all, naive_U)
-    return {"stages": st.model_dump(), "lift_depth": cfg.lift.depth, "y1": y1, "y6": y6}
+        y6 = _y6(ctx, cfg, stages, ctx.tables)
+    out = {"stages": st.model_dump(), "lift_depth": cfg.lift.depth, "y1": y1, "y6": y6}
+    if subsets:
+        out["subsets"] = _score_subsets(ctx, cfg, stages, y6)
+    return out
 
 
-def _y6(ctx, cfg, tracks_list, keep_list, maj_list, obs_list, detected_all, naive_U) -> dict:
-    """Dedup the kept tracks of every pass into landmarks, attribute them to trees, and score the row."""
+def _score_subsets(ctx: RunContext, cfg: EvalAppConfig, stages: Sequence[_PassStage], y6_all: dict) -> list[dict]:
+    """One row per subset S of `pass_subsets`: Y6 scored on S's passes alone, against S's truth and the whole truth.
+
+    S's truth tables are rebuilt from S's frames. `U`, `G6`, `e_pipe` and `ledger`
+    (the `cfg.truth.variant` row ledger) are S's Y6 row; `e_all` and
+    `tree_mae_over_mean_all` compare S's counts with the `G6` of every pass
+    (`y6_all`). A subset with no pass has None everywhere but `S` and `n_passes`.
+    """
+    g_all = {t["tree"]: t["G6"] for t in y6_all["trees"]}
+    G_all = y6_all["row"]["G6"]
+    rows = []
+    for name, keys in pass_subsets(list(ctx.passes)):
+        if not keys:
+            rows.append({"S": name, "n_passes": 0, "U": None, "G6": None, "e_pipe": None, "e_all": None,
+                         "tree_mae_over_mean_all": None, "ledger": None})
+            continue
+        sel = [s for s in stages if s.key in keys]
+        tables = {v: truth_sets(ctx.truth, ctx.layout, {k: ctx.passes[k] for k in keys}, v) for v in VARIANTS}
+        y6 = _y6(ctx, cfg, sel, tables)
+        U = y6["row"]["U"]
+        rows.append({"S": name, "n_passes": len(keys), "U": U, "G6": y6["row"]["G6"], "e_pipe": y6["row"]["e_pipe"],
+                     "e_all": _ratio(U - G_all, G_all),
+                     "tree_mae_over_mean_all": _ratio(sum(abs(t["U"] - g_all[t["tree"]]) for t in y6["trees"]),
+                                                      sum(g_all.values())),
+                     "ledger": y6["ledger"]})
+    return rows
+
+
+def _y6(ctx: RunContext, cfg: EvalAppConfig, stages: Sequence[_PassStage], tables: Mapping[str, TruthTables]) -> dict:
+    """Dedup the kept tracks of `stages` into landmarks, attribute them to trees, and score the row.
+
+    `tables` (keys `VARIANTS`) is the truth of the frames of `stages`' passes: `ctx.tables` for every pass.
+    """
     st, layout, truth = cfg.stages, ctx.layout, ctx.truth
-    G, G_any = ctx.tables[cfg.truth.variant], ctx.tables["any"]
+    G, G_any = tables[cfg.truth.variant], tables["any"]
     T = G.target_ids
+    tracks_list, keep_list = [s.tracks for s in stages], [s.keep for s in stages]
+    maj_list, obs_list = [s.maj for s in stages], [s.obs for s in stages]
+    detected_all = set().union(*(s.detected for s in stages))
+    naive_U = sum(s.U1 for s in stages)
     if st.dedup == "oracle":
         lm, mode = oracle_dedup(tracks_list, keep_list, maj_list), "oracle"
     else:
@@ -338,7 +389,7 @@ def _y6(ctx, cfg, tracks_list, keep_list, maj_list, obs_list, detected_all, naiv
         G6, G6_2 = len(G.g6 & ids_t), G.g6_total[t]
         trees.append({
             "tree": t, "U": U, "U_truth_attr": U_truth, "G6": G6,
-            **{f"G6_{v}": len(ctx.tables[v].g6 & ids_t) for v in VARIANTS}, "G6_2": G6_2,
+            **{f"G6_{v}": len(tables[v].g6 & ids_t) for v in VARIANTS}, "G6_2": G6_2,
             **errors(U, G6, G6_2),
             "mis_in": int(((pred_tree == t) & (truth_tree != t)).sum()),
             "mis_out": int(((truth_tree == t) & (pred_tree != t)).sum()),
@@ -348,7 +399,7 @@ def _y6(ctx, cfg, tracks_list, keep_list, maj_list, obs_list, detected_all, naiv
     U_row, G6_row, G6_2_row = len(row_sel), len(G.g6), sum(G.g6_total.values())
     row_ledger = ledger(G.g6, T, row_sel)
     row = {"U": U_row, "U_truth_attr": int((truth_tree >= 0).sum()), "G6": G6_row,
-           **{f"G6_{v}": len(ctx.tables[v].g6) for v in VARIANTS}, "G6_2": G6_2_row,
+           **{f"G6_{v}": len(tables[v].g6) for v in VARIANTS}, "G6_2": G6_2_row,
            **errors(U_row, G6_row, G6_2_row), "naive_U": naive_U, "naive_ratio": _ratio(naive_U, G6_row)}
 
     sum_g6 = sum(t["G6"] for t in trees)
@@ -404,8 +455,41 @@ def rung_config(cfg: EvalAppConfig, ladder: dict, name: str) -> EvalAppConfig:
     raise ValueError(f"unknown rung {name!r}; available: {', '.join(names)}")
 
 
+def check_ladder_request(
+    cfg: EvalAppConfig, ladder: Mapping, rungs: Sequence[str], *, with_2x2: bool = False, subsets: bool = False
+) -> None:
+    """Validate a ladder request against `cfg` and `ladder` alone, before any bundle is opened.
+
+    Checks `cfg`'s base config (`stages.dedup`, `lift.depth`, `stages.det`), every
+    name in `rungs` (`rung_config` raises `unknown rung ...` for one it does not
+    know), with `with_2x2`, the `interaction_2x2` section and its base rung, and,
+    with `subsets`, that `rungs` has `L3` and `cfg` runs to `stop_after=y6`.
+    """
+    if cfg.stages.dedup == "oracle":
+        raise ValueError("ladder base config has stages.dedup=oracle; rungs need the crop default dedup mode")
+    if cfg.lift.depth == "det_depth":
+        raise ValueError("ladder base config has lift.depth=det_depth; rungs L2c and L3 use the base box depth "
+                         "method")
+    if cfg.stages.det != "oracle":
+        raise ValueError(f"ladder base config has stages.det={cfg.stages.det}; ladder rungs need oracle detections")
+    for name in rungs:
+        rung_config(cfg, ladder, name)
+    if with_2x2:
+        spec = ladder.get("interaction_2x2")
+        if not isinstance(spec, Mapping) or not {"base", "track", "dedup"} <= set(spec):
+            where = getattr(ladder, "path", None) or "ladder"
+            raise ValueError(f"{where}: with_2x2 needs an 'interaction_2x2' mapping with base, track and dedup")
+        rung_config(cfg, ladder, spec["base"])
+    if subsets:
+        if "L3" not in rungs:
+            raise ValueError("--subsets needs rung L3")
+        if cfg.stop_after == "y1":
+            raise ValueError("--subsets needs stop_after=y6")
+
+
 def run_ladder(
-    ctx: RunContext, cfg: EvalAppConfig, ladder: dict, rungs: Sequence[str], *, with_2x2: bool = False
+    ctx: RunContext, cfg: EvalAppConfig, ladder: dict, rungs: Sequence[str], *, with_2x2: bool = False,
+    subsets: bool = False,
 ) -> dict:
     """Evaluate `rungs` (and, with `with_2x2`, the (track, dedup) 2 x 2 table on the ladder's base rung).
 
@@ -418,22 +502,14 @@ def run_ladder(
     `stages.dedup` other than `oracle`. Each 2 x 2 cell is evaluated with
     its own config; its values are None under `stop_after=y1`. Every rung
     and cell config is checked against `ctx` (`_check_config`) before any
-    of them runs.
+    of them runs. With `subsets`, rung `L3` alone also gets the pass-subset
+    table (`evaluate(..., subsets=True)`).
     """
-    if cfg.stages.dedup == "oracle":
-        raise ValueError("ladder base config has stages.dedup=oracle; rungs need the crop default dedup mode")
-    if cfg.lift.depth == "det_depth":
-        raise ValueError("ladder base config has lift.depth=det_depth; rungs L2c and L3 use the base box depth "
-                         "method")
-    if cfg.stages.det != "oracle":
-        raise ValueError(f"ladder base config has stages.det={cfg.stages.det}; ladder rungs need oracle detections")
+    check_ladder_request(cfg, ladder, rungs, with_2x2=with_2x2, subsets=subsets)
     configs = {name: rung_config(cfg, ladder, name) for name in rungs}
     cells: list[tuple[str, str, EvalAppConfig]] = []
     if with_2x2:
-        spec = ladder.get("interaction_2x2")
-        if not isinstance(spec, Mapping) or not {"base", "track", "dedup"} <= set(spec):
-            where = getattr(ladder, "path", None) or "ladder"
-            raise ValueError(f"{where}: with_2x2 needs an 'interaction_2x2' mapping with base, track and dedup")
+        spec = ladder["interaction_2x2"]
         base = rung_config(cfg, ladder, spec["base"])
         for track in spec["track"]:
             for d in spec["dedup"]:
@@ -442,7 +518,7 @@ def run_ladder(
     for c in [*configs.values(), *(c for _, _, c in cells)]:
         _check_config(ctx, c)
     out = {"chain": [n for n in (ladder.get("rungs") or {}) if n in rungs],
-           "rungs": {name: evaluate(ctx, c) for name, c in configs.items()},
+           "rungs": {name: evaluate(ctx, c, subsets=subsets and name == "L3") for name, c in configs.items()},
            "interaction_2x2": None}
     if with_2x2:
         out["interaction_2x2"] = {"cells": [_cell(track, d, evaluate(ctx, c)["y6"]) for track, d, c in cells]}

@@ -2,11 +2,13 @@ import json
 import re
 from pathlib import Path
 
+import numpy as np
 import yaml
+from PIL import Image
 from typer.testing import CliRunner
 
 from counting.evaluation.cli import eval_app
-from tests.unit.synthfake import python_c, write_run
+from tests.unit.synthfake import move_unoccluded_box, python_c, write_run
 
 ROOT = Path(__file__).resolve().parents[2]
 SPLITS = str(ROOT / "configs" / "eval" / "splits.yaml")
@@ -19,6 +21,29 @@ def test_truth_ok(apple_run):
     assert res.exit_code == 0, res.output
     for text in ("summary OK", "geometry OK", "split OK", "drop 30"):
         assert text in res.output
+
+
+def test_truth_geometry_without_ground(leaf_runs, tmp_path):
+    ok = runner.invoke(eval_app, ["truth", str(leaf_runs[0]), "--check-geometry"])
+    assert ok.exit_code == 0, ok.output
+    assert ("geometry OK (center_in_bbox=1.0, n_unoccluded=41, ground=n/a (no ground pixels), "
+            "ground_abs_z_median_m=None, n_ground_px=0)") in ok.output.splitlines()
+    root = write_run(tmp_path, crop="apple", pitches=(30.0,))
+    move_unoccluded_box(root / "000000_frame.json")
+    bad = runner.invoke(eval_app, ["truth", str(root), "--check-geometry"])
+    line = next(line for line in bad.output.splitlines() if line.startswith("geometry "))
+    assert bad.exit_code == 1 and line.startswith("geometry FAIL (") and "ground=n/a (no ground pixels)" in line, \
+        bad.output
+
+
+def test_truth_geometry_fails_when_ground_has_no_depth(tmp_path):
+    root = write_run(tmp_path, crop="apple")                    # 10 deg passes see the ground
+    for p in root.glob("*_depth16.png"):
+        Image.fromarray(np.zeros_like(np.array(Image.open(p), dtype=np.uint16))).save(p)
+    res = runner.invoke(eval_app, ["truth", str(root), "--check-geometry"])
+    line = next(line for line in res.output.splitlines() if line.startswith("geometry "))
+    assert res.exit_code == 1 and "summary OK" in res.output and line.startswith("geometry FAIL (") \
+        and "ground=fail," in line and line.endswith("n_ground_px=0)"), res.output
 
 
 def test_truth_summary_mismatch_exits_1(tmp_path):
@@ -153,9 +178,9 @@ def test_eval_run_reordered_runs_stay_reproducible(apple_run, tmp_path):
 
 def test_eval_run_unsupported_option_exits_2(apple_run, tmp_path):
     args = ["run", "--config", _cfg_file(tmp_path, apple_run, "apple"), "--splits", SPLITS,
-            "--set", "stages.dedup=hybrid"]
+            "--set", "detector.cache=x"]
     r = runner.invoke(eval_app, args)
-    assert r.exit_code == 2 and "is not supported in this version" in r.output
+    assert r.exit_code == 2 and "detector.cache is not supported in this version" in r.output
 
 
 def test_truth_malformed_summary_exits_2(tmp_path):
@@ -175,6 +200,13 @@ def test_truth_corrupt_depth_png_exits_2(tmp_path):
     assert res.exit_code == 2 and "000000_depth16.png: unreadable PNG" in res.output, res.output
 
 
+def test_eval_run_bad_flow_value_exits_2(tmp_path):
+    cfg = _cfg_file(tmp_path, tmp_path / "missing", "apple")
+    r = runner.invoke(eval_app, ["run", "--config", cfg, "--splits", SPLITS, "--set", "passes.pitches=[30"])
+    assert r.exit_code == 2 and "error: Override value is not valid YAML flow syntax: [30" in r.output, r.output
+    assert "--set:" not in r.output
+
+
 def test_eval_run_malformed_manifest_exits_2(tmp_path):
     run = write_run(tmp_path / "bundle", crop="apple", pitches=(30.0,), max_frames=4)
     p = run / "manifest.json"
@@ -183,3 +215,33 @@ def test_eval_run_malformed_manifest_exits_2(tmp_path):
     p.write_text(json.dumps(m), encoding="utf-8")
     res = runner.invoke(eval_app, ["run", "--config", _cfg_file(tmp_path, run, "apple"), "--splits", SPLITS])
     assert res.exit_code == 2 and "manifest.json: missing field 'trees'" in res.output, res.output
+
+
+def test_eval_ladder_refuses_bad_request_before_reading_bundles(tmp_path):
+    cfg = _cfg_file(tmp_path, tmp_path / "missing", "apple")
+    no_2x2 = tmp_path / "no_2x2.yaml"
+    no_2x2.write_text("rungs: {L3: {}}\n", encoding="utf-8")
+    for extra, phrase in ((["--set", "lift.depth=det_depth"], "ladder base config has lift.depth=det_depth"),
+                          (["--rungs", "L3,L9"], "unknown rung 'L9'"),
+                          (["--ladder", str(no_2x2), "--with-2x2"], "with_2x2 needs an 'interaction_2x2' mapping"),
+                          (["--rungs", "L1", "--subsets"], "--subsets needs rung L3"),
+                          (["--rungs", "L3", "--subsets", "--set", "stop_after=y1"], "--subsets needs stop_after=y6")):
+        r = runner.invoke(eval_app, ["ladder", "--config", cfg, "--splits", SPLITS, *extra])
+        assert r.exit_code == 2 and phrase in r.output and "manifest.json" not in r.output, r.output
+
+
+def test_eval_ladder_subsets_need_L3_and_get_their_own_id(leaf_runs, tmp_path):
+    base = ["ladder", "--config", _cfg_file(tmp_path, leaf_runs[0], "apple"), "--splits", SPLITS]
+    bad = runner.invoke(eval_app, base + ["--rungs", "L1", "--subsets"])
+    assert bad.exit_code == 2 and "--subsets needs rung L3" in bad.output, bad.output
+    for extra in (["--subsets"], []):
+        r = runner.invoke(eval_app, base + ["--rungs", "L1,L3", *extra])
+        assert r.exit_code == 0, r.output             # a second id, not a reproducibility failure
+    found = {}
+    for d in (tmp_path / "out" / "apple_dev").iterdir():
+        rungs = json.loads((d / "results.json").read_text(encoding="utf-8"))["runs"][0]["rungs"]
+        found["subsets" in rungs["L3"]] = (rungs, (d / "report.md").read_text(encoding="utf-8"))
+    assert set(found) == {True, False}
+    (with_s, report), (without, _) = found[True], found[False]
+    assert "subsets" not in with_s["L1"] and [r["S"] for r in with_s["L3"]["subsets"]][-1] == "drop 30"
+    assert "**패스 묶음 (L3)**" in report and with_s["L3"]["y6"] == without["L3"]["y6"]

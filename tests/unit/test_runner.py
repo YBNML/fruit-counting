@@ -138,7 +138,7 @@ def test_stop_after_y1_and_naive(apple_run):
 
 
 def test_unsupported_options_refused(apple_run):
-    for s in ("stages.det=oracle_noisy", "stages.dedup=hybrid", "noise.pose_trans_sigma_m=0.01"):
+    for s in ("stages.det=oracle_noisy", "detector.cache=x", "noise.pose_trans_sigma_m=0.01"):
         with pytest.raises(NotImplementedError, match="is not supported in this version"):
             _ctx(apple_run, "apple", s)
 
@@ -147,7 +147,6 @@ def test_patched_ladder_is_checked_against_prepare(apple_run, monkeypatch):
     """A hand-edited rung may not use unsupported settings or change what prepare fixed (frames, detections)."""
     ctx, cfg = _ctx(apple_run, "apple")
     refused = {"stages.det=oracle_noisy": {"stages": {"det": "oracle_noisy"}},
-               "stages.dedup=hybrid": {"stages": {"dedup": "hybrid"}},
                "detector.cache": {"detector": {"cache": "x"}},
                "detector.noise": {"detector": {"noise": {"p": 0.1}}},
                "noise": {"noise": {"pose_trans_sigma_m": 0.01}}}
@@ -166,8 +165,9 @@ def test_patched_ladder_is_checked_against_prepare(apple_run, monkeypatch):
         with pytest.raises(exc, match=phrase):
             run_ladder(ctx, cfg, ladder, ["L0", "bad"])
         assert calls == [], phrase   # checked before any rung runs
-    ladder = {"rungs": LADDER["rungs"], "interaction_2x2": {"base": "L2a", "track": ["oracle"], "dedup": ["hybrid"]}}
-    with pytest.raises(NotImplementedError, match="stages.dedup=hybrid is not supported in this version"):
+    ladder = {"rungs": {**LADDER["rungs"], "bad": {"detector": {"cache": "x"}}},
+              "interaction_2x2": {"base": "bad", "track": ["oracle"], "dedup": ["oracle"]}}
+    with pytest.raises(NotImplementedError, match="detector.cache is not supported in this version"):
         run_ladder(ctx, cfg, ladder, ["L0"], with_2x2=True)
     assert calls == []
 
@@ -290,13 +290,16 @@ def test_box_depth_cache_keyed_by_method_and_readonly(leaf_runs, monkeypatch):
 
 def test_box_far_ignores_front_leaf(leaf_ctx, leaf_runs):
     clean, occl = _leaf(leaf_ctx, leaf_runs, "lift.depth=box_far")
-    assert _leaf_pred(occl) == _leaf_pred(clean)        # the far cluster is the fruit behind the patch
+    assert _leaf_pred(occl) == _leaf_pred(clean) == ([(16, 16, 0), (12, 12, 0)], [6, 7, 6], 19)
+    assert _dup(occl) == _dup(clean) == 4        # the far cluster is the fruit behind the patch
 
 
 def test_soft_gate_absorbs_front_leaf_tail(leaf_ctx, leaf_runs):
-    hard = _leaf(leaf_ctx, leaf_runs)[1]
+    hard_clean, hard = _leaf(leaf_ctx, leaf_runs)
     soft = _leaf(leaf_ctx, leaf_runs, "tracker.depth_gate=soft")[1]
     assert 5 * _dup(soft) < _dup(hard)
+    assert _leaf_pred(soft) == _leaf_pred(hard_clean) == ([(18, 18, 0), (12, 12, 0)], [7, 7, 7], 21)   # no over-merge
+    assert _dup(soft) == _dup(hard_clean) == 6 and soft["y1"]["summary"]["merge_rate"] == 0.0
 
 
 def test_depth_error_stats_values():
@@ -355,6 +358,76 @@ def test_L3_dd_row_drawn_without_a_chain(leaf_ctx, leaf_runs):
     assert out["chain"] == ["L3"]
     lines = render_report(_ladder_results(leaf_ctx[0], out), criteria=None).splitlines()
     assert "**기여**" in lines and any(line.startswith("| L3_dd→L3 (상자 깊이) |") for line in lines)
+
+
+def _without_mode(y6):
+    return {k: v for k, v in y6.items() if k != "mode"}
+
+
+def test_hybrid_dedup_runs_and_meets_its_band_limits(leaf_ctx, leaf_runs):
+    root = leaf_runs[0]
+    y6 = {name: evaluate(leaf_ctx[0], fake_cfg(root, "apple", *sets))["y6"] for name, sets in (
+        ("self_side", ["stages.dedup=self_side"]), ("merge", []),
+        ("band0", ["stages.dedup=hybrid", "dedup.band_m=0.0"]), ("band_inf", ["stages.dedup=hybrid", "dedup.band_m=1e9"]))}
+    assert (y6["self_side"]["row"]["U"], y6["merge"]["row"]["U"]) == (18, 21)
+    assert y6["band0"]["mode"] == y6["band_inf"]["mode"] == "hybrid"
+    assert _without_mode(y6["band0"]) == _without_mode(y6["self_side"])
+    assert _without_mode(y6["band_inf"]) == _without_mode(y6["merge"])
+
+
+def test_subsets_exact_at_L0(apple_run, pear_run):
+    for root, crop, pitches in ((apple_run, "apple", (10, 30)), (pear_run, "pear", (45, 70))):
+        ctx, cfg = _ctx(root, crop)
+        res = evaluate(ctx, rung_config(cfg, LADDER, "L0"), subsets=True)
+        assert [r["S"] for r in res["subsets"]] == ["all", "A", "B", *(f"{w} {p}" for p in pitches for w in ("only", "drop"))]
+        for r in res["subsets"]:
+            assert r["n_passes"] > 0 and r["U"] == r["G6"] and r["e_pipe"] == 0.0, r
+            assert all(r["ledger"][k] == 0 for k in ZERO), r
+        first, y6 = res["subsets"][0], res["y6"]
+        assert (first["U"], first["G6"], first["ledger"]) == (y6["row"]["U"], y6["row"]["G6"], y6["ledger"])
+        if crop == "pear":                        # one side sees part of the row: coverage against all
+            assert [r["e_all"] for r in res["subsets"][1:3]] == pytest.approx([-0.4, -0.6])
+            assert [r["tree_mae_over_mean_all"] for r in res["subsets"][1:3]] == pytest.approx([0.4, 0.6])
+
+
+def test_subsets_match_runs_restricted_to_those_passes(leaf_ctx, leaf_runs):
+    root = leaf_runs[0]
+    res = evaluate(leaf_ctx[0], fake_cfg(root, "apple"), subsets=True)
+    by = {r["S"]: r for r in res["subsets"]}
+    assert list(by) == ["all", "A", "B", "only 30", "drop 30"]
+    assert by["drop 30"] == {"S": "drop 30", "n_passes": 0, "U": None, "G6": None, "e_pipe": None,
+                             "e_all": None, "tree_mae_over_mean_all": None, "ledger": None}
+    y6 = res["y6"]
+    assert by["all"] == {"S": "all", "n_passes": 2, "U": y6["row"]["U"], "G6": y6["row"]["G6"],
+                         "e_pipe": y6["row"]["e_pipe"], "e_all": y6["row"]["e_pipe"],
+                         "tree_mae_over_mean_all": y6["metrics"]["tree_mae_over_mean"], "ledger": y6["ledger"]}
+    for name in ("A", "B"):
+        ctx_s, cfg_s = _ctx(root, "apple", f"passes.sides=[{name}]")
+        alone = evaluate(ctx_s, cfg_s)["y6"]
+        assert (by[name]["U"], by[name]["G6"], by[name]["e_pipe"], by[name]["ledger"]) == \
+            (alone["row"]["U"], alone["row"]["G6"], alone["row"]["e_pipe"], alone["ledger"])
+    assert [(by[n]["U"], by[n]["G6"]) for n in ("all", "A", "B")] == [(21, 12), (18, 12), (12, 12)]
+    assert [by[n]["e_all"] for n in ("A", "B")] == pytest.approx([0.5, 0.0])
+    assert [by[n]["tree_mae_over_mean_all"] for n in ("A", "B")] == pytest.approx([0.5, 0.0])
+    with pytest.raises(ValueError, match="--subsets needs stop_after=y6"):
+        evaluate(leaf_ctx[0], fake_cfg(root, "apple", "stop_after=y1"), subsets=True)
+
+
+def test_ladder_subsets_on_L3_only_and_in_report(leaf_ctx, leaf_runs):
+    cfg = fake_cfg(leaf_runs[0], "apple")
+    with pytest.raises(ValueError, match="--subsets needs rung L3"):
+        run_ladder(leaf_ctx[0], cfg, LADDER, ["L1"], subsets=True)
+    out = run_ladder(leaf_ctx[0], cfg, LADDER, ["L1", "L3"], subsets=True)
+    assert "subsets" not in out["rungs"]["L1"] and len(out["rungs"]["L3"]["subsets"]) == 5
+    lines = render_report(_ladder_results(leaf_ctx[0], out), criteria=None).splitlines()
+    a = next(r for r in out["rungs"]["L3"]["subsets"] if r["S"] == "A")
+    L = a["ledger"]
+    assert "**패스 묶음 (L3)**" in lines
+    assert "| 묶음 | 패스 | U | G6 | e_pipe | e(전부) | 그루 MAE÷평균(전부) | Dup | Miss | FP_off | FP_bg |" in lines
+    assert (f"| A | 1 | 18 | 12 | {a['e_pipe']:+.1%} | {a['e_all']:+.1%} | {a['tree_mae_over_mean_all']:+.1%} | "
+            f"{L['dup_track'] + L['dup_cross']} | {L['miss_det'] + L['miss_drop'] + L['miss_merge']} | "
+            f"{L['fp_off']} | {L['fp_bg']} |") in lines
+    assert "| drop 30 | 0 | - | - | - | - | - | - | - | - | - |" in lines
 
 
 def test_depth_err_null_without_detector_depth(leaf_runs):

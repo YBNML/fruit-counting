@@ -1,0 +1,8 @@
+# Dedup mode and band on L3. Run once per radius with --set dedup.radius_m=<value>.
+bases: [L3]
+combos:
+  self_side: {stages: {dedup: self_side}}
+  merge: {stages: {dedup: merge}}
+  hybrid_0.05: {stages: {dedup: hybrid}, dedup: {band_m: 0.05}}
+  hybrid_0.10: {stages: {dedup: hybrid}, dedup: {band_m: 0.10}}
+  hybrid_0.15: {stages: {dedup: hybrid}, dedup: {band_m: 0.15}}

@@ -1,0 +1,5 @@
+# Box depth method x depth gate. L1 always runs det_depth, so lift.depth is listed as overridden there.
+bases: [L1, L3]
+product:
+  lift.depth: [box_median, box_far]
+  tracker.depth_gate: [hard, soft]

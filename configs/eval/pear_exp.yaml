@@ -1,0 +1,16 @@
+run_name: pear_exp
+crop: pear
+split: exp                 # spacing runs: small scene, one pitch
+tuning: true               # must be false for split=test
+runs: [~/datasets/orchard_synth/pear/exp_s300]
+truth: {variant: count1}
+passes: {pitches: null, sides: [A, B], step_m: null}
+stages: {det: oracle, track: landmark, center: measured, dedup: self_side, assign: grid}
+detector: {positives: count1, cache: null, noise: null}
+lift: {depth: box_median, box_frac: 0.5, center_offset_m: {bag: 0.04}}
+noise: {pose_trans_sigma_m: 0, pose_rot_sigma_deg: 0, pass_bias_m: 0, depth_rel_sigma: 0, depth_dropout: 0, seeds: [0, 1, 2]}
+tracker: {predict: pose, gate_px_frac: 0.5, gate_m: 0.10, max_gap: null, repair_m: 0.09, min_obs: 1, score_hi: 0.5, score_lo: 0.1}
+dedup: {radius_m: 0.09, band_m: 0.10}
+seed: 0
+stop_after: y6
+output_dir: runs/eval

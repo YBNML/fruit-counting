@@ -1,0 +1,4 @@
+# In-pass repair radius from x1 to x2 of the crop default.
+bases: [L1, L3]
+factors:
+  tracker.repair_m: [0.09, 0.1125, 0.135, 0.1575, 0.18]

@@ -1,4 +1,4 @@
-"""Ground-truth sets, the summary.json self-check, the subset table and the geometry check.
+"""Ground-truth sets, the summary.json self-check, the pass subsets and their table, and the geometry check.
 
 Everything here reads `SceneTruth`/`FruitGt`/`GtRecord` from an orchard_synth
 bundle, so only evaluation and oracle code should import this module (the
@@ -120,14 +120,26 @@ def check_summary(
                 raise SummaryMismatch(f"tree {t} {variant} union: recount {a} != summary {b}")
 
 
+def pass_subsets(keys: Sequence[PassKey]) -> list[tuple[str, list[PassKey]]]:
+    """Named pass subsets of `keys`: `all`, `A`, `B`, then `only {p:g}` and `drop {p:g}` per pitch, ascending.
+
+    Each list keeps the order of `keys`; a subset may be empty (`drop 30` when 30 is the only pitch).
+    """
+    keys = list(keys)
+    out = [("all", keys), ("A", [k for k in keys if k.side == "A"]), ("B", [k for k in keys if k.side == "B"])]
+    for p in sorted({k.pitch_deg for k in keys}):
+        out.append((f"only {p:g}", [k for k in keys if k.pitch_deg == p]))
+        out.append((f"drop {p:g}", [k for k in keys if k.pitch_deg != p]))
+    return out
+
+
 def subset_table(
     truth: SceneTruth, layout: OrchardLayout, passes: Mapping[PassKey, Sequence[FrameInput]]
 ) -> list[dict]:
-    """G6 (count1) for `all`, each side, and each pitch dropped/kept, against `all` and the grand total."""
+    """G6 (count1) for each subset of `pass_subsets`, against `all` and the grand total."""
     tt_all = truth_sets(truth, layout, passes, "count1")
     g6_all = len(tt_all.g6)
     total = sum(tt_all.g6_total.values())
-    pitches = sorted({key.pitch_deg for key in passes})
 
     def row(name: str, subset: Mapping[PassKey, Sequence[FrameInput]]) -> dict:
         g6 = len(truth_sets(truth, layout, subset, "count1").g6)
@@ -135,15 +147,7 @@ def subset_table(
                 "ratio_all": (g6 / g6_all) if g6_all else None,
                 "ratio_total": (g6 / total) if total else None}
 
-    rows = [
-        row("all", passes),
-        row("A", {k: v for k, v in passes.items() if k.side == "A"}),
-        row("B", {k: v for k, v in passes.items() if k.side == "B"}),
-    ]
-    for p in pitches:
-        rows.append(row(f"only {p:g}", {k: v for k, v in passes.items() if k.pitch_deg == p}))
-        rows.append(row(f"drop {p:g}", {k: v for k, v in passes.items() if k.pitch_deg != p}))
-    return rows
+    return [row(name, {k: passes[k] for k in keys}) for name, keys in pass_subsets(list(passes))]
 
 
 def check_geometry(run: SynthRun, truth: SceneTruth, *, stride: int = 10) -> dict:
@@ -151,10 +155,15 @@ def check_geometry(run: SynthRun, truth: SceneTruth, *, stride: int = 10) -> dic
 
     1. Unoccluded records (`visib >= 0.95`, not `trunc`, with a `bbox`): their
        ground-truth 3D center, projected, must fall inside `bbox`.
-    2. Ground pixels (`semantic == 7` with valid depth), back-projected: the
-       recovered world `|z|` must be near 0 (the ground plane).
+    2. Ground pixels (`semantic == 7`) with valid depth, back-projected: the
+       recovered world `|z|` must be near 0 (the ground plane). `n_ground_px`
+       counts the back-projected pixels.
+
+    When no sampled frame shows a ground pixel, whatever its depth, the ground check
+    is "n/a" and only the centre check decides. Ground in view with no valid depth
+    fails the ground check.
     """
-    n_unoccluded = n_in_bbox = n_ground_px = 0
+    n_unoccluded = n_in_bbox = n_ground_px = n_ground_seen = 0
     ground_abs_z: list[float] = []
     for f in run.frames[::stride]:
         for r in truth.records.get(f.idx, ()):
@@ -170,7 +179,9 @@ def check_geometry(run: SynthRun, truth: SceneTruth, *, stride: int = 10) -> dic
         with Image.open(run.semantic_path(f.idx)) as im:
             sem = np.array(im)
         depth_m = read_depth_m(f.depth_path)
-        rows, cols = np.nonzero((sem == _GROUND_SEMANTIC) & ~np.isnan(depth_m))
+        ground_px = sem == _GROUND_SEMANTIC
+        n_ground_seen += int(np.count_nonzero(ground_px))
+        rows, cols = np.nonzero(ground_px & ~np.isnan(depth_m))
         n = len(rows)
         if n == 0:
             continue
@@ -183,9 +194,12 @@ def check_geometry(run: SynthRun, truth: SceneTruth, *, stride: int = 10) -> dic
 
     center_in_bbox = (n_in_bbox / n_unoccluded) if n_unoccluded else None
     median = float(np.median(ground_abs_z)) if ground_abs_z else None
-    passed = bool(
-        center_in_bbox == 1.0 and n_unoccluded > 0 and n_ground_px > 0
-        and median is not None and median <= 0.001
-    )
+    if n_ground_seen == 0:
+        ground = "n/a"
+    elif median is not None and median <= 0.001:
+        ground = "ok"
+    else:
+        ground = "fail"
+    passed = bool(center_in_bbox == 1.0 and n_unoccluded > 0 and ground != "fail")
     return {"center_in_bbox": center_in_bbox, "n_unoccluded": n_unoccluded,
-            "ground_abs_z_median_m": median, "n_ground_px": n_ground_px, "passed": passed}
+            "ground_abs_z_median_m": median, "n_ground_px": n_ground_px, "ground": ground, "passed": passed}

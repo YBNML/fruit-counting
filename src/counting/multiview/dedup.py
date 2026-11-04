@@ -4,7 +4,10 @@
 groups that hold tracks of the same pass observed in a common frame: one
 camera saw both, so they are different fruit. `repair_pass` uses it to join
 the split pieces of a track inside one pass; `dedup` uses it to fuse tracks
-of all passes into landmarks.
+of all passes into landmarks. Its `hybrid` mode keeps tracks within `band_m`
+past the centre plane and joins tracks of different sides only when both lie
+inside the band, so band 0 equals `self_side` and an unbounded band equals
+`merge`.
 """
 
 from __future__ import annotations
@@ -113,13 +116,17 @@ def repair_pass(tracks: PassTracks, radius_m: float) -> PassTracks:
     )
 
 
-def side_filter(tracks: PassTracks, layout: OrchardLayout, mode: str) -> np.ndarray:
+def side_filter(tracks: PassTracks, layout: OrchardLayout, mode: str, band_m: float = 0.0) -> np.ndarray:
     """Tracks a pass contributes under `mode`.
 
     `self_side` keeps an aisle-A pass's tracks with `y >= row_y` and an
-    aisle-B pass's tracks with `y < row_y`; every other mode keeps all tracks.
+    aisle-B pass's tracks with `y < row_y`; `hybrid` moves both bounds
+    `band_m` past the centre plane (A: `y >= row_y - band_m`, B:
+    `y < row_y + band_m`); every other mode keeps all tracks.
     """
     y = np.asarray(tracks.X, dtype=float).reshape(-1, 3)[:, 1]
+    if mode == "hybrid":
+        return y >= layout.row_y - band_m if tracks.pass_key.side == "A" else y < layout.row_y + band_m
     if mode != "self_side":
         return np.ones(len(y), dtype=bool)
     return y >= layout.row_y if tracks.pass_key.side == "A" else y < layout.row_y
@@ -149,22 +156,32 @@ def dedup(
     layout: OrchardLayout,
     cfg: DedupConfig,
     *,
-    mode: Literal["self_side", "merge"],
+    mode: Literal["self_side", "merge", "hybrid"],
 ) -> Landmarks:
     """Fuse the kept tracks of all passes into landmarks within `cfg.radius_m`.
 
     A track enters when its `keep` entry is True and `side_filter` passes it.
     `merge` joins tracks of any passes; `self_side` joins only tracks of
-    passes on the same aisle side.
+    passes on the same aisle side. `hybrid` keeps tracks within `cfg.band_m`
+    past the centre plane and joins tracks of different sides only when
+    both lie inside the band (`|y - row_y| < cfg.band_m`), so band 0 equals
+    `self_side` and an unbounded band equals `merge`.
     """
-    if mode not in ("self_side", "merge"):
+    if mode not in ("self_side", "merge", "hybrid"):
         raise ValueError(f"unknown dedup mode: {mode!r}")
     items: list[tuple[int, int]] = []   # (pass index, track number); position = cluster item number
     for i, (tracks, k) in enumerate(zip(passes, keep, strict=True)):
-        use = np.asarray(k, dtype=bool) & side_filter(tracks, layout, mode)
+        use = np.asarray(k, dtype=bool) & side_filter(tracks, layout, mode, cfg.band_m)
         items.extend((i, int(t)) for t in np.flatnonzero(use))
     X = np.array([passes[i].X[t] for i, t in items], dtype=float).reshape(-1, 3)
     side = [passes[i].pass_key.side for i, _ in items]
-    allow = (lambda a, b: side[a] == side[b]) if mode == "self_side" else None
+    allow: Callable[[int, int], bool] | None
+    if mode == "self_side":
+        allow = lambda a, b: side[a] == side[b]
+    elif mode == "hybrid":
+        near = (np.abs(X[:, 1] - layout.row_y) < cfg.band_m).tolist()   # inside the band around the plane
+        allow = lambda a, b: side[a] == side[b] or (near[a] and near[b])
+    else:                                                                # merge: no side rule
+        allow = None
     groups = cluster(X, [{i: passes[i].frames[t]} for i, t in items], cfg.radius_m, allow=allow)
     return landmarks_from_groups(passes, [[items[j] for j in g] for g in groups])

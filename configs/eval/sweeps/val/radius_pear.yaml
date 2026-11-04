@@ -1,0 +1,4 @@
+# Dedup radius from x1 to x2 of the crop default. L1 uses oracle dedup and only checks the tracker constraints.
+bases: [L1, L3]
+factors:
+  dedup.radius_m: [0.09, 0.1125, 0.135, 0.1575, 0.18]
