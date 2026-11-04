@@ -80,6 +80,29 @@ class Camera:
         u, v = uv[:, 0], uv[:, 1]
         return (u >= -0.5) & (u < self.width - 0.5) & (v >= -0.5) & (v < self.height - 0.5)
 
+    def perturbed(self, rng: np.random.Generator, trans_sigma_m: float, rot_sigma_deg: float,
+                  bias_m: np.ndarray | None = None) -> "Camera":
+        """A copy of this camera with its pose perturbed by Gaussian translation and rotation noise.
+
+        The new center is `C + trans_sigma_m * t (+ bias_m)` and the new orientation rotates this
+        camera's axes by a Rodrigues rotation vector `radians(rot_sigma_deg) * w`, both `t` and `w`
+        drawn from `rng`. `K`, `width` and `height` are unchanged.
+        """
+        t, w = rng.standard_normal(3), rng.standard_normal(3)
+        C = self.C + trans_sigma_m * t
+        if bias_m is not None:
+            C = C + bias_m
+        omega = radians(rot_sigma_deg) * w
+        theta = np.linalg.norm(omega)
+        if theta == 0.0:
+            R_c2w = self.R_c2w.copy()
+        else:
+            axis = omega / theta
+            Kx = np.array([[0.0, -axis[2], axis[1]], [axis[2], 0.0, -axis[0]], [-axis[1], axis[0], 0.0]])
+            R_rel = np.eye(3) + np.sin(theta) * Kx + (1 - np.cos(theta)) * (Kx @ Kx)
+            R_c2w = self.R_c2w @ R_rel
+        return Camera(K=self.K, R_c2w=R_c2w, C=C, width=self.width, height=self.height)
+
 
 def box_centers(boxes: np.ndarray) -> np.ndarray:
     """Convert pixel-edge boxes `[x0, y0, x1, y1)` to OpenCV pixel-center coordinates."""

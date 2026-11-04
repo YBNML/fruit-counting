@@ -9,7 +9,7 @@ import numpy as np
 from counting.config.eval_schema import EvalAppConfig
 from counting.data.formats.orchard_synth import SceneTruth, SynthRun
 from counting.evaluation.runner import evaluate, prepare
-from tests.unit.synthfake import fake_cfg, load_splits, python_c
+from tests.unit.synthfake import DET_NOISE, ctx_with, fake_cfg, load_splits, python_c
 
 ROOT = Path(__file__).resolve().parents[2]
 SRC = ROOT / "src" / "counting"
@@ -25,27 +25,52 @@ def _permute(truth, rng):
     return SceneTruth(recs, fruits, truth.totals, truth.count1, truth.summary)
 
 
+def _random_src(ctx, rng):
+    return {k: rng.integers(10**6, 2 * 10**6, size=len(v)) for k, v in ctx.src.items()}
+
+
 def _pred(res):
     return ([(p["U1"], p["n_tracks"], p["n_no3d"]) for p in res["y1"]["passes"]],
             [t["U"] for t in res["y6"]["trees"]], res["y6"]["n_landmarks"])
 
 
-def test_shuffled_truth_ids_do_not_change_predictions(apple_run, pear_run):
+def test_shuffled_truth_ids_do_not_change_predictions(apple_run, pear_run, ctx_of):
     for root, crop in ((apple_run, "apple"), (pear_run, "pear")):
         run, cfg, splits = SynthRun.open(root), fake_cfg(root, crop), load_splits()
-        a = evaluate(prepare(run, cfg, splits), cfg)
+        a = evaluate(ctx_of[crop], cfg)
         b = evaluate(prepare(run, cfg, splits, truth=_permute(run.truth(), np.random.default_rng(1))), cfg)
         assert _pred(a) == _pred(b)
 
 
-def test_per_frame_random_source_ids_do_not_change_predictions(apple_run, pear_run):
+def test_per_frame_random_source_ids_do_not_change_predictions(apple_run, pear_run, ctx_of):
     """Catches a runner that links tracks or landmarks by source id (consistent permutation cannot)."""
     for root, crop in ((apple_run, "apple"), (pear_run, "pear")):
-        run, cfg, splits = SynthRun.open(root), fake_cfg(root, crop), load_splits()   # non-oracle stages
-        a = evaluate(prepare(run, cfg, splits), cfg)
-        ctx, rng = prepare(run, cfg, splits), np.random.default_rng(2)
-        ctx.src = {k: rng.integers(10**6, 2 * 10**6, size=len(v)) for k, v in ctx.src.items()}
-        assert _pred(evaluate(ctx, cfg)) == _pred(a)
+        cfg, ctx = fake_cfg(root, crop), ctx_of[crop]   # non-oracle stages
+        a = evaluate(ctx, cfg)
+        assert _pred(evaluate(ctx_with(ctx, src=_random_src(ctx, np.random.default_rng(2))), cfg)) == _pred(a)
+
+
+NOISY = (*DET_NOISE, "noise.pose_trans_sigma_m=0.02", "noise.pose_rot_sigma_deg=0.5", "noise.pass_bias_m=0.02",
+         "noise.depth_rel_sigma=0.02", "noise.depth_dropout=0.05")
+
+
+def _permute_and_reorder(truth, rng):
+    """`_permute`, then each frame's records in the new id order, so record order follows the ids too."""
+    t = _permute(truth, rng)
+    recs = {k: tuple(sorted(v, key=lambda r: r.id)) for k, v in t.records.items()}
+    return SceneTruth(recs, t.fruits, t.totals, t.count1, t.summary)
+
+
+def test_noisy_predictions_ignore_truth_ids(leaf_runs, leaf_det_ctx):
+    """With detection, pose and depth noise on, relabelled truth or random source ids change no prediction."""
+    root = leaf_runs[0]
+    run, cfg, splits = SynthRun.open(root), fake_cfg(root, "apple", *NOISY), load_splits()
+    ctx = leaf_det_ctx(0)
+    a = evaluate(ctx, cfg, noise_seed=0)
+    b = evaluate(prepare(run, cfg, splits, truth=_permute_and_reorder(run.truth(), np.random.default_rng(1)),
+                         det_seed=0), cfg, noise_seed=0)
+    random_src = ctx_with(ctx, src=_random_src(ctx, np.random.default_rng(2)))
+    assert _pred(a) == _pred(b) == _pred(evaluate(random_src, cfg, noise_seed=0))
 
 
 def _prediction_files():
@@ -76,7 +101,8 @@ def test_prediction_modules_cannot_reach_truth():
 def test_eval_modules_do_not_import_torch():
     mods = ["counting.evaluation.cli", "counting.evaluation.runner", "counting.evaluation.report",
             "counting.evaluation.sweep", "counting.tracking.landmark", "counting.multiview.dedup",
-            "counting.multiview.lift", "counting.detection.oracle", "counting.data.formats.orchard_synth"]
+            "counting.multiview.lift", "counting.detection.oracle", "counting.data.formats.orchard_synth",
+            "counting.geometry.noise", "counting.evaluation.seeds"]
     code = "import importlib, sys\n" + "".join(f"importlib.import_module({m!r})\n" for m in mods) + \
            "print('torch' in sys.modules)"
     out = python_c(code)

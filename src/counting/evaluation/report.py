@@ -1,6 +1,8 @@
 """Deterministic results serialization, the experiment folder writer and the markdown
 report. `render_report` and `criteria_rows` skip the Y6 sections
 of a rung whose `stop_after=y1` left `rung["y6"]` as `None`.
+A noisy rung or cell (`noisy`) is drawn from its seed means, with a noise line and a
+per-seed table; the CSVs carry one row per noise seed and a `mean` row.
 """
 
 from __future__ import annotations
@@ -16,7 +18,7 @@ import yaml
 
 from counting.config.eval_schema import EvalAppConfig
 
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 
 
 class ReproducibilityError(RuntimeError):
@@ -56,10 +58,10 @@ def results_bytes(results: dict) -> bytes:
 
 # --- experiment folder -------------------------------------------------------------------
 
-_PER_PASS_HEADER = ["run_id", "rung", "pitch", "side", "aisle", "n_frames", "n_tracks", "n_no3d",
+_PER_PASS_HEADER = ["run_id", "rung", "noise_seed", "pitch", "side", "aisle", "n_frames", "n_tracks", "n_no3d",
                     "U1", "G1", "e1", "fp_bg", "fp_off", "boundary", "dup_track", "dup_cross",
                     "miss_det", "miss_drop", "miss_merge", "impure"]
-_PER_TREE_HEADER = ["run_id", "rung", "tree", "U", "U_truth_attr", "G6", "G6_count1", "G6_any",
+_PER_TREE_HEADER = ["run_id", "rung", "noise_seed", "tree", "U", "U_truth_attr", "G6", "G6_count1", "G6_any",
                     "G6_strict", "G6_2", "e_pipe", "e_cover", "e_total", "mis_in", "mis_out"]
 _SWEEP_HEADER = [
     "run_id", "base", "point", "patch", "overridden", "noise_seed", "lift_depth", "dedup",
@@ -70,17 +72,28 @@ _SWEEP_HEADER = [
 ]
 
 
+def _seed_views(res: dict) -> list[tuple[str | int, dict]]:
+    """`[("", res)]` without noise; with noise, `(seed, per-seed item)` for each seed then `("mean", res)`.
+
+    `res` is a rung or sweep cell; a noisy one's seed views carry only `y1` and `y6`.
+    """
+    if not res.get("noisy"):
+        return [("", res)]
+    return [(p["noise_seed"], p) for p in res["per_seed"]] + [("mean", res)]
+
+
 def _per_pass_rows(results: dict) -> list[list]:
     rows = []
     for run in results["runs"]:
         run_id = run["meta"]["run_id"]
         for rung_name, rung in run["rungs"].items():
-            for p in rung["y1"]["passes"]:
-                L = p["ledger"]
-                rows.append([run_id, rung_name, p["pitch"], p["side"], p["aisle"], p["n_frames"],
-                            p["n_tracks"], p["n_no3d"], p["U1"], p["G1"], p["e1"], L["fp_bg"],
-                            L["fp_off"], L["boundary"], L["dup_track"], L["dup_cross"], L["miss_det"],
-                            L["miss_drop"], L["miss_merge"], L["impure"]])
+            for seed, view in _seed_views(rung):
+                for p in view["y1"]["passes"]:
+                    L = p["ledger"]
+                    rows.append([run_id, rung_name, seed, p["pitch"], p["side"], p["aisle"], p["n_frames"],
+                                p["n_tracks"], p["n_no3d"], p["U1"], p["G1"], p["e1"], L["fp_bg"],
+                                L["fp_off"], L["boundary"], L["dup_track"], L["dup_cross"], L["miss_det"],
+                                L["miss_drop"], L["miss_merge"], L["impure"]])
     return rows
 
 
@@ -89,12 +102,13 @@ def _per_tree_rows(results: dict) -> list[list]:
     for run in results["runs"]:
         run_id = run["meta"]["run_id"]
         for rung_name, rung in run["rungs"].items():
-            if rung["y6"] is None:   # stop_after=y1 has no tree table to write
-                continue
-            for t in rung["y6"]["trees"]:
-                rows.append([run_id, rung_name, t["tree"], t["U"], t["U_truth_attr"], t["G6"],
-                            t["G6_count1"], t["G6_any"], t["G6_strict"], t["G6_2"], t["e_pipe"],
-                            t["e_cover"], t["e_total"], t["mis_in"], t["mis_out"]])
+            for seed, view in _seed_views(rung):
+                if view["y6"] is None:   # stop_after=y1 has no tree table to write
+                    continue
+                for t in view["y6"]["trees"]:
+                    rows.append([run_id, rung_name, seed, t["tree"], t["U"], t["U_truth_attr"], t["G6"],
+                                t["G6_count1"], t["G6_any"], t["G6_strict"], t["G6_2"], t["e_pipe"],
+                                t["e_cover"], t["e_total"], t["mis_in"], t["mis_out"]])
     return rows
 
 
@@ -107,24 +121,25 @@ def _sweep_rows(results: dict) -> list[list]:
             patch = json.dumps(patch_by_point[cell["point"]], sort_keys=True, separators=(",", ":"))
             overridden = json.dumps(cell["overridden"], sort_keys=True, separators=(",", ":")) \
                 if cell["overridden"] else ""
-            summary = cell["y1"]["summary"]
-            y6 = cell["y6"]
-            row_vals = [None] * 9 if y6 is None else [
-                y6["row"]["U"], y6["row"]["G6"], y6["row"]["e_pipe"], y6["metrics"]["tree_mae_over_mean"],
-                y6["metrics"]["attribution_error"], y6["metrics"]["pos_err_p50_m"], y6["metrics"]["pos_err_p90_m"],
-                y6["metrics"]["miss_rate"], y6["metrics"]["excess_rate"],
-            ]
-            ledger_vals = [None] * 9 if y6 is None else [
-                y6["ledger"]["fp_bg"], y6["ledger"]["fp_off"], y6["ledger"]["boundary"],
-                y6["ledger"]["dup_track"], y6["ledger"]["dup_cross"], y6["ledger"]["miss_det"],
-                y6["ledger"]["miss_drop"], y6["ledger"]["miss_merge"], y6["ledger"]["impure"],
-            ]
-            rows.append([
-                run_id, cell["base"] or "", cell["point"], patch, overridden, "", cell["lift_depth"],
-                cell["stages"]["dedup"], summary["e1_median"], summary["e1_max"], summary["dup_rate"],
-                summary["miss_rate"], summary["merge_rate"], summary["fp_off_rate"],
-                *row_vals, *ledger_vals,
-            ])
+            for seed, view in _seed_views(cell):
+                summary = view["y1"]["summary"]
+                y6 = view["y6"]
+                row_vals = [None] * 9 if y6 is None else [
+                    y6["row"]["U"], y6["row"]["G6"], y6["row"]["e_pipe"], y6["metrics"]["tree_mae_over_mean"],
+                    y6["metrics"]["attribution_error"], y6["metrics"]["pos_err_p50_m"],
+                    y6["metrics"]["pos_err_p90_m"], y6["metrics"]["miss_rate"], y6["metrics"]["excess_rate"],
+                ]
+                ledger_vals = [None] * 9 if y6 is None else [
+                    y6["ledger"]["fp_bg"], y6["ledger"]["fp_off"], y6["ledger"]["boundary"],
+                    y6["ledger"]["dup_track"], y6["ledger"]["dup_cross"], y6["ledger"]["miss_det"],
+                    y6["ledger"]["miss_drop"], y6["ledger"]["miss_merge"], y6["ledger"]["impure"],
+                ]
+                rows.append([
+                    run_id, cell["base"] or "", cell["point"], patch, overridden, seed, cell["lift_depth"],
+                    cell["stages"]["dedup"], summary["e1_median"], summary["e1_max"], summary["dup_rate"],
+                    summary["miss_rate"], summary["merge_rate"], summary["fp_off_rate"],
+                    *row_vals, *ledger_vals,
+                ])
     return rows
 
 
@@ -182,6 +197,13 @@ def _m(x) -> str:
     return "-" if x is None else f"{x:.3f}"
 
 
+def _count(x) -> str:
+    """A whole count: `-` for `None`, one decimal for a seed-mean `float`, else `str(x)`."""
+    if x is None:
+        return "-"
+    return f"{x:.1f}" if isinstance(x, float) else str(x)
+
+
 def _table(headers: list[str], rows: list[list[str]]) -> list[str]:
     lines = ["| " + " | ".join(headers) + " |", "|" + "|".join(["---"] * len(headers)) + "|"]
     lines += ["| " + " | ".join(row) + " |" for row in rows]
@@ -202,6 +224,7 @@ _CONTRIB_LABELS = {
     ("L2b", "L2c"): "L2b→L2c (상자 깊이)",
     ("L2c", "L3"): "L2c→L3 (줄 거르기·귀속)",
     ("L3_dd", "L3"): "L3_dd→L3 (상자 깊이)",
+    ("L3", "L4_base"): "L3→L4_base (자세·깊이 잡음(기준 조합))",
 }
 _OP_SYMBOL = {"le": "≤", "ge": "≥"}
 # Criteria metrics that are ratios, shown in percent like everywhere else in the report.
@@ -217,18 +240,41 @@ def _y1_rows(passes: list[dict]) -> list[list[str]]:
         L = p["ledger"]
         dup = L["dup_track"] + L["dup_cross"]
         miss = L["miss_det"] + L["miss_drop"] + L["miss_merge"]
-        rows.append([_g(p["pitch"]), p["side"], str(p["aisle"]), str(p["n_frames"]), str(p["U1"]),
-                    str(p["G1"]), _pct(p["e1"]), str(dup), str(miss), str(L["fp_off"]), str(p["n_no3d"])])
+        rows.append([_g(p["pitch"]), p["side"], str(p["aisle"]), str(p["n_frames"]), _count(p["U1"]),
+                    _count(p["G1"]), _pct(p["e1"]), _count(dup), _count(miss), _count(L["fp_off"]),
+                    _count(p["n_no3d"])])
     return rows
 
 
-def _pitch_rows(passes: list[dict]) -> list[list[str]]:
-    rows = []
+def _pitch_stats(passes: list[dict]) -> dict[float, tuple[int, float | None, float | None]]:
+    """`{pitch: (n passes, median |e1|, max |e1|)}`, in pitch order."""
+    out = {}
     for pitch in sorted({p["pitch"] for p in passes}):
         group = [p for p in passes if p["pitch"] == pitch]
         e1s = [abs(p["e1"]) for p in group if p["e1"] is not None]
         median = float(np.median(e1s)) if e1s else None
-        rows.append([_g(pitch), str(len(group)), _pct(median), _pct(max(e1s) if e1s else None)])
+        out[pitch] = (len(group), median, max(e1s) if e1s else None)
+    return out
+
+
+def _pitch_rows(passes: list[dict]) -> list[list[str]]:
+    return [[_g(pitch), str(n), _pct(median), _pct(mx)] for pitch, (n, median, mx) in _pitch_stats(passes).items()]
+
+
+def _seed_mean(values: list) -> float | None:
+    """`None` if any value is `None`, else `math.fsum(values) / len(values)`."""
+    return None if any(v is None for v in values) else math.fsum(values) / len(values)
+
+
+def _seed_pitch_rows(rung: dict) -> list[list[str]]:
+    """`_pitch_rows` of a noisy rung: each seed's |e1| median and max, meaned over the seeds like the summary line."""
+    per_seed_stats = [_pitch_stats(p["y1"]["passes"]) for p in rung["per_seed"]]
+    rows = []
+    for pitch in per_seed_stats[0]:
+        n = per_seed_stats[0][pitch][0]
+        median = _seed_mean([stats[pitch][1] for stats in per_seed_stats])
+        mx = _seed_mean([stats[pitch][2] for stats in per_seed_stats])
+        rows.append([_g(pitch), str(n), _pct(median), _pct(mx)])
     return rows
 
 
@@ -236,11 +282,11 @@ def _y1_summary_line(summary: dict) -> str:
     return (f"- Y1 요약: e1 중앙값 {_pct(summary['e1_median'])}, e1 최대 {_pct(summary['e1_max'])}, "
            f"Dup율 {_pct(summary['dup_rate'])}, Miss율 {_pct(summary['miss_rate'])}, "
            f"Merge율 {_pct(summary['merge_rate'])}, FP_off율 {_pct(summary['fp_off_rate'])}, "
-           f"naive U {summary['naive_U']}")
+           f"naive U {_count(summary['naive_U'])}")
 
 
 def _depth_err_line(s: dict) -> str:
-    return (f"- 깊이 오차(상자 깊이 - 검출 깊이): n {s['n']}, 절댓값 p50 {s['p50_m']:.3f} m, "
+    return (f"- 깊이 오차(상자 깊이 - 검출 깊이): n {_count(s['n'])}, 절댓값 p50 {s['p50_m']:.3f} m, "
            f"p90 {s['p90_m']:.3f} m, p95 {s['p95_m']:.3f} m, 10 cm 넘게 가까움 {s['near_10cm']:+.1%}, "
            f"멂 {s['far_10cm']:+.1%}")
 
@@ -248,9 +294,10 @@ def _depth_err_line(s: dict) -> str:
 def _y6_tree_rows(trees: list[dict]) -> list[list[str]]:
     rows = []
     for t in trees:
-        rows.append([str(t["tree"]), str(t["U"]), str(t["U_truth_attr"]), str(t["G6"]), str(t["G6_count1"]),
-                    str(t["G6_any"]), str(t["G6_strict"]), str(t["G6_2"]), _pct(t["e_pipe"]),
-                    _pct(t["e_cover"]), _pct(t["e_total"]), str(t["mis_in"]), str(t["mis_out"])])
+        rows.append([str(t["tree"]), _count(t["U"]), _count(t["U_truth_attr"]), _count(t["G6"]),
+                    _count(t["G6_count1"]), _count(t["G6_any"]), _count(t["G6_strict"]), _count(t["G6_2"]),
+                    _pct(t["e_pipe"]), _pct(t["e_cover"]), _pct(t["e_total"]), _count(t["mis_in"]),
+                    _count(t["mis_out"])])
     return rows
 
 
@@ -259,15 +306,15 @@ def _mult(x) -> str:
 
 
 def _row_sum_line(row: dict) -> str:
-    return (f"- 줄 합: U {row['U']}, G6 {row['G6']}, G6② {row['G6_2']}, e_pipe {_pct(row['e_pipe'])}, "
-           f"e_cover {_pct(row['e_cover'])}, e_total {_pct(row['e_total'])}, "
-           f"naive {row['naive_U']} ({_mult(row['naive_ratio'])})")
+    return (f"- 줄 합: U {_count(row['U'])}, G6 {_count(row['G6'])}, G6② {_count(row['G6_2'])}, "
+           f"e_pipe {_pct(row['e_pipe'])}, e_cover {_pct(row['e_cover'])}, e_total {_pct(row['e_total'])}, "
+           f"naive {_count(row['naive_U'])} ({_mult(row['naive_ratio'])})")
 
 
 def _ledger_table(ledger_g1: dict, ledger_any: dict) -> list[str]:
     headers = ["판", *_LEDGER_FIELDS]
-    rows = [["G①", *[str(ledger_g1[f]) for f in _LEDGER_FIELDS]],
-            ["any", *[str(ledger_any[f]) for f in _LEDGER_FIELDS]]]
+    rows = [["G①", *[_count(ledger_g1[f]) for f in _LEDGER_FIELDS]],
+            ["any", *[_count(ledger_any[f]) for f in _LEDGER_FIELDS]]]
     return _table(headers, rows)
 
 
@@ -279,8 +326,86 @@ def _metrics_line(metrics: dict) -> str:
            f"miss_rate {_pct(metrics['miss_rate'])}, excess_rate {_pct(metrics['excess_rate'])}")
 
 
-def _count(x) -> str:
-    return "-" if x is None else str(x)
+def _pose_triple(item: dict) -> tuple[float, float, float]:
+    """`(σ_t, σ_r, b)` of a noisy rung or cell's pose noise; all zero without noise."""
+    if not item.get("noisy"):
+        return (0.0, 0.0, 0.0)
+    n = item["noise"]
+    return (n["pose_trans_sigma_m"], n["pose_rot_sigma_deg"], n["pass_bias_m"])
+
+
+def _pose_values_text(triple: tuple[float, float, float]) -> str:
+    t, r, b = triple
+    return f"자세 잡음 σ_t {_g(t * 100)} cm, σ_r {_g(r)}°, b {_g(b * 100)} cm"
+
+
+def _pose_text(results: dict) -> str:
+    """The report head's second line, before the `kind` branch so it reads `runs[*].rungs` or `runs[*].cells`.
+
+    `"정답 자세"` with no pose noise anywhere; the exact σ_t/σ_r/b when every rung or cell shares the
+    same pose noise (one noisy item, or several sharing a base rung's noise); otherwise `"있음"`
+    (ladder/run: per rung). A sweep whose cells vary only by `cell["base"]` (the base rung carries the
+    noise, as in `dedup_modes.yaml`'s `L4_base`, with no noise key in any point's patch) gets a neutral
+    base-aware phrase instead of the per-point one, since `sweep.csv`'s patch column holds no noise key
+    to point readers at; the per-point phrase is kept only when a base's own points still differ.
+    """
+    if results["kind"] == "sweep":
+        cells = [cell for run in results["runs"] for cell in run["cells"]]
+        triples = {_pose_triple(cell) for cell in cells}
+        if len(triples) > 1:
+            by_base: dict[str | None, set[tuple[float, float, float]]] = {}
+            for cell in cells:
+                by_base.setdefault(cell["base"], set()).add(_pose_triple(cell))
+            if all(len(ts) == 1 for ts in by_base.values()):
+                return "자세 잡음 칸 있음(sweep.csv의 base·patch 열)"
+            return "자세 잡음 점 있음(점마다 다름, sweep.csv의 patch 열)"
+    else:
+        triples = {_pose_triple(rung) for run in results["runs"] for rung in run["rungs"].values()}
+        if len(triples) > 1:
+            return "자세 잡음 칸 있음(칸마다 적음)"
+    (triple,) = triples
+    return "정답 자세" if triple == (0.0, 0.0, 0.0) else _pose_values_text(triple)
+
+
+def _noise_pct(x: float) -> str:
+    return format(x * 100, "g") + "%"
+
+
+def _det_noise_text(det: dict | None) -> str:
+    if det is None:
+        return "검출 없음"
+    score = "fixed" if det["score"] == "fixed" else f"uniform [{_g(det['score_min'])}, 1]"
+    return (f"검출 놓침 {_noise_pct(det['miss_p'])}, 오검출 λ {_g(det['fp_lambda'])}, "
+           f"흔들림 {_noise_pct(det['jitter_frac'])}, 쪼개기 {_noise_pct(det['split_p'])}"
+           f"(visib < {_g(det['split_visib_max'])}), 점수 {score}")
+
+
+def _noise_line(res: dict) -> str:
+    n = res["noise"]
+    seeds = ", ".join(str(s) for s in res["seeds"])
+    return (f"- 잡음(시드 {seeds}의 평균): σ_t {_g(n['pose_trans_sigma_m'] * 100)} cm, "
+           f"σ_r {_g(n['pose_rot_sigma_deg'])}°, b {_g(n['pass_bias_m'] * 100)} cm, "
+           f"σ_rel {_noise_pct(n['depth_rel_sigma'])}, 결측 {_noise_pct(n['depth_dropout'])}, "
+           f"{_det_noise_text(n['detector'])}")
+
+
+_NOISE_SEED_HEADERS = ["시드", "e1 중앙값", "e1 최대", "U", "G6", "e_pipe", "e_pipe 절댓값", "그루 MAE÷평균"]
+
+
+def _noise_seed_row(seed, summary: dict, y6: dict | None) -> list[str]:
+    cells = [str(seed), _pct(summary["e1_median"]), _pct(summary["e1_max"])]
+    if y6 is None:
+        return cells + ["-"] * 5
+    row, m = y6["row"], y6["metrics"]
+    return cells + [_count(row["U"]), _count(row["G6"]), _pct(row["e_pipe"]), _pct(m["row_abs_e_pipe"]),
+                    _pct(m["tree_mae_over_mean"])]
+
+
+def _noise_seed_rows(res: dict) -> list[list[str]]:
+    """One row per `res["per_seed"]` entry, then a `평균` row of `res`'s own (seed-mean) `y1`/`y6`."""
+    rows = [_noise_seed_row(p["noise_seed"], p["y1"]["summary"], p["y6"]) for p in res["per_seed"]]
+    rows.append(_noise_seed_row("평균", res["y1"]["summary"], res["y6"]))
+    return rows
 
 
 def _subset_rows(subsets: list[dict]) -> list[list[str]]:
@@ -468,7 +593,10 @@ def _sweep_body(results: dict, criteria: Mapping | None) -> list[str]:
     """The sweep head line, per-run point table and collapse section (after the bundle-info table)."""
     sweep, crop = results["sweep"], results["crop"]
     points, bases = sweep["points"], sweep["bases"]
-    lines = [f"**sweep** — {sweep['grid']}: 점 {len(points)}개 × 칸 {max(1, len(bases))}개", ""]
+    head = f"**sweep** — {sweep['grid']}: 점 {len(points)}개 × 칸 {max(1, len(bases))}개"
+    if any(cell.get("noisy") for run in results["runs"] for cell in run["cells"]):
+        head += " · 잡음 칸은 시드 평균, 시드별 값은 sweep.csv"
+    lines = [head, ""]
     multi = len(results["runs"]) > 1
     for run in results["runs"]:
         if multi:
@@ -491,7 +619,7 @@ def render_report(results: dict, *, criteria: Mapping | None) -> str:
     collapse section, after the same head and bundle-info table.
     """
     lines = [f"# Y1·Y6 합성 채점 — {results['run_name']} ({results['experiment_id']})",
-             "> 합성 렌더 · 정답 자세 · 보정 전(U). 실제 정확도가 아니다."]
+             f"> 합성 렌더 · {_pose_text(results)} · 보정 전(U). 실제 정확도가 아니다."]
     if results["split"] == "dev":
         lines.append("> dev 묶음: 개발용 수치다. 판정에 쓰지 않는다.")
     lines.append("")
@@ -513,6 +641,10 @@ def render_report(results: dict, *, criteria: Mapping | None) -> str:
         for rung_name, rung in run["rungs"].items():
             lines.append(f"### {rung_name}" if not multi else f"#### {rung_name}")
             lines.append("")
+            noisy = rung.get("noisy")
+            if noisy:
+                lines.append(_noise_line(rung))
+                lines.append("")
             lines.append("**Y1**")
             lines += _table(_Y1_HEADERS, _y1_rows(rung["y1"]["passes"]))
             lines.append(_y1_summary_line(rung["y1"]["summary"]))
@@ -520,7 +652,7 @@ def render_report(results: dict, *, criteria: Mapping | None) -> str:
                 lines.append(_depth_err_line(rung["y1"]["summary"]["depth_err"]))
             lines.append("")
             lines.append("**기울기별 Y1**")
-            lines += _table(_PITCH_HEADERS, _pitch_rows(rung["y1"]["passes"]))
+            lines += _table(_PITCH_HEADERS, _seed_pitch_rows(rung) if noisy else _pitch_rows(rung["y1"]["passes"]))
             lines.append("")
             y6 = rung["y6"]
             if y6 is not None:
@@ -529,6 +661,10 @@ def render_report(results: dict, *, criteria: Mapping | None) -> str:
                 lines.append(_row_sum_line(y6["row"]))
                 lines += _ledger_table(y6["ledger"], y6["ledger_any"])
                 lines.append(_metrics_line(y6["metrics"]))
+                lines.append("")
+            if noisy:
+                lines.append(f"**잡음 시드별 ({rung_name})**")
+                lines += _table(_NOISE_SEED_HEADERS, _noise_seed_rows(rung))
                 lines.append("")
             if rung.get("subsets"):
                 lines.append(f"**패스 묶음 ({rung_name})**")

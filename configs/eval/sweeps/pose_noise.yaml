@@ -1,0 +1,13 @@
+# Pose and depth noise, one factor at a time, on L3 (the chosen box depth) and on L3_dd (detection
+# depth, report-only: it separates pose accuracy from box depth). The combos repeat the L4 rungs.
+bases: [L3, L3_dd]
+factors:
+  noise.pose_trans_sigma_m: [0.01, 0.02, 0.05]
+  noise.pose_rot_sigma_deg: [0.5, 1.0]
+  noise.pass_bias_m: [0.02, 0.05, 0.10]
+  noise.depth_rel_sigma: [0.01, 0.02, 0.04]
+  noise.depth_dropout: [0.05, 0.20]
+combos:
+  weak: {noise: {pose_trans_sigma_m: 0.01, pose_rot_sigma_deg: 0.25, pass_bias_m: 0.01, depth_rel_sigma: 0.01, depth_dropout: 0.0}}
+  base: {noise: {pose_trans_sigma_m: 0.02, pose_rot_sigma_deg: 0.5, pass_bias_m: 0.02, depth_rel_sigma: 0.02, depth_dropout: 0.05}}
+  strong: {noise: {pose_trans_sigma_m: 0.05, pose_rot_sigma_deg: 1.0, pass_bias_m: 0.10, depth_rel_sigma: 0.04, depth_dropout: 0.20}}

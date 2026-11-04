@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from typing import Literal
 
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, NonNegativeInt, field_validator, model_validator
 
 Crop = Literal["pear", "apple"]
 Variant = Literal["count1", "any", "strict"]
@@ -31,11 +31,27 @@ class StagesConfig(BaseModel):
     assign: Literal["truth", "grid"] = "grid"
 
 
+class DetNoise(BaseModel):
+    """Detection noise of the noisy oracle; every factor at 0 with score fixed gives the oracle's detections.
+
+    Factors must be finite (an infinite false-positive rate would never finish drawing).
+    """
+
+    model_config = ConfigDict(extra="forbid", allow_inf_nan=False)
+    miss_p: float = Field(default=0.0, ge=0, le=1)
+    fp_lambda: float = Field(default=0.0, ge=0)
+    jitter_frac: float = Field(default=0.0, ge=0)
+    split_p: float = Field(default=0.0, ge=0, le=1)
+    split_visib_max: float = Field(default=0.6, gt=0, le=1)
+    score: Literal["fixed", "uniform"] = "fixed"
+    score_min: float = Field(default=0.3, ge=0, le=1)
+
+
 class DetectorConfig(BaseModel):
     model_config = ConfigDict(extra="forbid")
     positives: Variant = "count1"
     cache: str | None = None
-    noise: dict | None = None
+    noise: DetNoise | None = None
 
 
 class LiftConfig(BaseModel):
@@ -58,13 +74,22 @@ class LiftConfig(BaseModel):
 
 
 class NoiseConfig(BaseModel):
-    model_config = ConfigDict(extra="forbid")
+    """Pose and depth noise, and the noise seeds; factors must be finite."""
+
+    model_config = ConfigDict(extra="forbid", allow_inf_nan=False)
     pose_trans_sigma_m: float = Field(default=0.0, ge=0)
     pose_rot_sigma_deg: float = Field(default=0.0, ge=0)
     pass_bias_m: float = Field(default=0.0, ge=0)
     depth_rel_sigma: float = Field(default=0.0, ge=0)
     depth_dropout: float = Field(default=0.0, ge=0, le=1)
-    seeds: list[int] = Field(default_factory=lambda: [0])
+    seeds: list[NonNegativeInt] = Field(default_factory=lambda: [0], min_length=1)
+
+    @field_validator("seeds")
+    @classmethod
+    def _check_seeds_distinct(cls, v: list[int]) -> list[int]:
+        if len(set(v)) != len(v):
+            raise ValueError(f"noise.seeds repeats a seed: {v}")
+        return v
 
     def is_zero(self) -> bool:
         return (
@@ -124,6 +149,10 @@ class EvalAppConfig(BaseModel):
 
     @model_validator(mode="after")
     def _check_stage_combinations(self) -> EvalAppConfig:
+        if self.stages.det == "oracle_noisy" and self.detector.noise is None:
+            raise ValueError("stages.det=oracle_noisy needs a detector.noise section")
+        if self.detector.noise is not None and self.stages.det != "oracle_noisy":
+            raise ValueError(f"detector.noise needs stages.det=oracle_noisy, got stages.det={self.stages.det}")
         if self.stages.det == "cached" and self.stages.track == "oracle":
             raise ValueError("cached detector cannot use track=oracle")
         if self.stages.det == "cached" and self.lift.depth == "det_depth":
@@ -132,6 +161,10 @@ class EvalAppConfig(BaseModel):
         if self.split == "test" and self.tuning:
             raise ValueError("split=test requires tuning=false")
         return self
+
+    def is_noisy(self) -> bool:
+        """True when the config adds detection, pose or depth noise; noise.seeds alone is not noise."""
+        return self.stages.det == "oracle_noisy" or not self.noise.is_zero()
 
 
 class SplitsConfig(BaseModel):

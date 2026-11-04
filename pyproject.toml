@@ -39,7 +39,7 @@ where = ["src"]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 markers = [
-  "slow: integration tests that load models or touch disk",
+  "slow: model-loading integration tests and end-to-end determinism runs (kept in the full run)",
   "synth: reads real orchard_synth renders (excluded by default)",
 ]
 addopts = "-q -m 'not synth'"

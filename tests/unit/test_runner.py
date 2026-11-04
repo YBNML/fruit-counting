@@ -4,6 +4,7 @@ from pathlib import Path
 
 import numpy as np
 import pytest
+import yaml
 from PIL import Image
 
 import counting.evaluation.runner as runner_module
@@ -11,15 +12,16 @@ from counting.config.eval_schema import LiftConfig
 from counting.data.formats.orchard_synth import PassKey, SynthRun
 from counting.evaluation.ledger import Ledger
 from counting.evaluation.oracle_stages import oracle_dedup
-from counting.evaluation.report import SCHEMA_VERSION, render_report
+from counting.evaluation.report import SCHEMA_VERSION, criteria_rows, render_report
 from counting.evaluation.runner import (
-    depth_error_stats, describe_run, evaluate, load_ladder, prepare, rung_config, run_ladder,
+    depth_error_stats, describe_run, evaluate, evaluate_seeds, load_ladder, prepare, rung_config, run_ladder,
 )
 from counting.tracking.landmark import PassTracks
-from tests.unit.synthfake import fake_cfg, load_splits, write_run
+from tests.unit.synthfake import ctx_with, fake_cfg, load_splits, write_run
 
 ROOT = Path(__file__).resolve().parents[2]
 LADDER = load_ladder(ROOT / "configs" / "eval" / "sweeps" / "ladder.yaml")
+CRIT = yaml.safe_load((ROOT / "configs" / "eval" / "criteria.yaml").read_text(encoding="utf-8"))
 # Every Ledger error term: all fields except the two counts, so a new term cannot be left unchecked.
 ZERO = tuple(f.name for f in dataclasses.fields(Ledger) if f.name not in ("n_pred", "n_truth"))
 EXACT = ("lift.center_offset_m.fruit=0.0", "lift.center_offset_m.bag=0.0", "lift.depth=det_depth")
@@ -66,9 +68,9 @@ def test_exact_check_covers_every_ledger_field():
         assert_exact(res)
 
 
-def test_L0_is_exact(apple_run, pear_run):
+def test_L0_is_exact(apple_run, pear_run, ctx_of):
     for root, crop in ((apple_run, "apple"), (pear_run, "pear")):
-        ctx, cfg = _ctx(root, crop)
+        ctx, cfg = ctx_of[crop], fake_cfg(root, crop)
         assert_exact(evaluate(ctx, rung_config(cfg, LADDER, "L0")))
 
 
@@ -80,10 +82,9 @@ def test_clean_fake_full_chain_is_exact(apple_run, pear_run):
         assert res["y6"]["mode"] == mode and res["y6"]["metrics"]["attribution_error"] == 0.0
 
 
-def test_ledger_identity_every_rung_and_2x2(apple_run):
-    ctx, cfg = _ctx(apple_run, "apple")
-    out = run_ladder(ctx, cfg, LADDER, list(LADDER["rungs"]) + list(LADDER["baselines"]), with_2x2=True)
-    assert out["chain"] == ["L0", "L1", "L2a", "L2b", "L2c", "L3"]
+def test_ledger_identity_every_rung_and_2x2(apple_ladder):
+    out = apple_ladder
+    assert out["chain"] == ["L0", "L1", "L2a", "L2b", "L2c", "L3", "L4_base"]
     for name, res in out["rungs"].items():
         ledgers = [p["ledger"] for p in res["y1"]["passes"]] + [res["y6"]["ledger"]]
         ledgers += [t["ledger"] for t in res["y6"]["trees"]]
@@ -94,18 +95,24 @@ def test_ledger_identity_every_rung_and_2x2(apple_run):
     cells = {(c["track"], c["dedup"]): c for c in out["interaction_2x2"]["cells"]}
     assert set(cells) == {("oracle", "oracle"), ("oracle", "merge"), ("landmark", "oracle"), ("landmark", "merge")}
     assert cells[("oracle", "oracle")]["e_pipe"] == 0.0
+    for name in ("L4_base", "L4_weak", "L4_strong"):        # dev seeds [0]: the mean is that seed's result
+        res = out["rungs"][name]
+        assert res["noisy"] and res["seeds"] == [0] and [p["noise_seed"] for p in res["per_seed"]] == [0]
+        assert {k: res[k] for k in ("y1", "y6")} == {k: res["per_seed"][0][k] for k in ("y1", "y6")}
+    assert "noisy" not in out["rungs"]["L3"]
 
 
-def test_oracle_dedup_leaves_no_cross_pass_dup(apple_run, pear_run):
+def test_oracle_dedup_leaves_no_cross_pass_dup(apple_run, pear_run, ctx_of, apple_ladder):
     """dedup=oracle fuses each id across passes, so every duplicate left is a split inside one pass."""
     dups = 0
     for root, crop in ((apple_run, "apple"), (pear_run, "pear")):
-        ctx, cfg = _ctx(root, crop)
+        ctx, cfg = ctx_of[crop], fake_cfg(root, crop)
         names = [n for n in (*LADDER["rungs"], *LADDER["baselines"])
                  if rung_config(cfg, LADDER, n).stages.dedup == "oracle"]
         assert names == ["L0", "L1", "last_box"]
-        for name in names:
-            y6 = evaluate(ctx, rung_config(cfg, LADDER, name))["y6"]
+        for name in names:   # apple: the session ladder evaluated these rungs on ctx_of["apple"]
+            res = apple_ladder["rungs"][name] if crop == "apple" else evaluate(ctx, rung_config(cfg, LADDER, name))
+            y6 = res["y6"]
             for L in [y6["ledger"], y6["ledger_any"]] + [t["ledger"] for t in y6["trees"]]:
                 assert L["dup_cross"] == 0, (crop, name, L)
             dups += y6["ledger"]["dup_track"]
@@ -124,38 +131,72 @@ def test_ladder_box_rungs_inherit_base_depth(apple_run):
         "det": "oracle", "track": "landmark", "center": "measured", "dedup": "merge", "assign": "grid"}
 
 
+def test_L4_rungs_add_the_noise_combos_to_L3(apple_run):
+    cfg = fake_cfg(apple_run, "apple", "lift.depth=box_far", "noise.seeds=[0,1,2]")
+    l3 = rung_config(cfg, LADDER, "L3")
+    combos = {"L4_base": (0.02, 0.5, 0.02, 0.02, 0.05), "L4_weak": (0.01, 0.25, 0.01, 0.01, 0.0),
+              "L4_strong": (0.05, 1.0, 0.10, 0.04, 0.20)}
+    for name, values in combos.items():
+        c = rung_config(cfg, LADDER, name)
+        assert c.model_dump(exclude={"noise"}) == l3.model_dump(exclude={"noise"}), name   # det, depth from the base
+        n = c.noise
+        assert (n.pose_trans_sigma_m, n.pose_rot_sigma_deg, n.pass_bias_m, n.depth_rel_sigma, n.depth_dropout) == values
+        assert n.seeds == [0, 1, 2] and c.is_noisy()
+    assert list(LADDER["rungs"])[-2:] == ["L3", "L4_base"]
+    assert list(LADDER["baselines"]) == ["L3_dd", "last_box", "L4_weak", "L4_strong"]
+
+
+def test_ladder_noise_rung_runs_once_per_seed(leaf_ctx, leaf_runs):
+    cfg = fake_cfg(leaf_runs[0], "apple", "noise.seeds=[0,1]")
+    out = run_ladder(leaf_ctx[0], cfg, LADDER, ["L3", "L4_base"])
+    l4, c = out["rungs"]["L4_base"], rung_config(cfg, LADDER, "L4_base")
+    assert out["chain"] == ["L3", "L4_base"] and l4["seeds"] == [0, 1]
+    for p, s in zip(l4["per_seed"], (0, 1)):
+        alone = evaluate(leaf_ctx[0], c, noise_seed=s)
+        assert (p["noise_seed"], p["y1"], p["y6"]) == (s, alone["y1"], alone["y6"])
+    e = [p["y6"]["row"]["e_pipe"] for p in l4["per_seed"]]
+    assert l4["y6"]["row"]["e_pipe"] == pytest.approx(sum(e) / 2)
+    assert l4["y6"]["metrics"]["row_abs_e_pipe"] == pytest.approx(sum(abs(x) for x in e) / 2)
+    assert l4["spread"]["y6"]["row"]["e_pipe"] == [min(e), max(e)]
+    crit = {r["metric"]: r for r in criteria_rows(l4, CRIT, "L4_base", "apple")}
+    assert crit["y6.row_abs_e_pipe"]["value"] == l4["y6"]["metrics"]["row_abs_e_pipe"]
+    assert crit["y6.row_abs_e_pipe"]["limit"] == 0.10
+    with pytest.raises(ValueError, match="--subsets needs a stage setting without noise"):
+        evaluate_seeds(leaf_ctx[0], c, subsets=True)
+
+
 def test_ladder_refuses_bad_base(leaf_ctx, leaf_runs):
-    for s in ("lift.depth=det_depth", "stages.det=oracle_noisy"):
-        with pytest.raises(ValueError, match=f"ladder base config has {re.escape(s)}"):
-            run_ladder(leaf_ctx[0], fake_cfg(leaf_runs[0], "apple", s), LADDER, ["L3"])
+    for sets, phrase in ((["lift.depth=det_depth"], "lift.depth=det_depth"),
+                         (["stages.det=oracle_noisy", "detector.noise.miss_p=0.1"], "stages.det=oracle_noisy"),
+                         (["noise.depth_dropout=0.05"], "noise set")):
+        with pytest.raises(ValueError, match=f"ladder base config has {re.escape(phrase)}"):
+            run_ladder(leaf_ctx[0], fake_cfg(leaf_runs[0], "apple", *sets), LADDER, ["L3"])
 
 
-def test_stop_after_y1_and_naive(apple_run):
-    ctx, cfg = _ctx(apple_run, "apple", "stop_after=y1")
+def test_stop_after_y1_and_naive(apple_run, ctx_of):
+    ctx, cfg = ctx_of["apple"], fake_cfg(apple_run, "apple", "stop_after=y1")
     res = evaluate(ctx, cfg)
     assert res["y6"] is None
     assert res["y1"]["summary"]["naive_U"] == sum(p["U1"] for p in res["y1"]["passes"])
 
 
 def test_unsupported_options_refused(apple_run):
-    for s in ("stages.det=oracle_noisy", "detector.cache=x", "noise.pose_trans_sigma_m=0.01"):
+    for sets in (("stages.det=cached",), ("detector.cache=x",)):
         with pytest.raises(NotImplementedError, match="is not supported in this version"):
-            _ctx(apple_run, "apple", s)
+            _ctx(apple_run, "apple", *sets)
 
 
-def test_patched_ladder_is_checked_against_prepare(apple_run, monkeypatch):
+def test_patched_ladder_is_checked_against_prepare(apple_run, ctx_of, monkeypatch):
     """A hand-edited rung may not use unsupported settings or change what prepare fixed (frames, detections)."""
-    ctx, cfg = _ctx(apple_run, "apple")
-    refused = {"stages.det=oracle_noisy": {"stages": {"det": "oracle_noisy"}},
-               "detector.cache": {"detector": {"cache": "x"}},
-               "detector.noise": {"detector": {"noise": {"p": 0.1}}},
-               "noise": {"noise": {"pose_trans_sigma_m": 0.01}}}
-    differs = {"detector.positives": {"detector": {"positives": "any"}},
+    ctx, cfg = ctx_of["apple"], fake_cfg(apple_run, "apple")
+    refused = {"detector.cache": {"detector": {"cache": "x"}}, "stages.det=cached": {"stages": {"det": "cached"}}}
+    differs = {"stages.det": {"stages": {"det": "oracle_noisy"}, "detector": {"noise": {"miss_p": 0.1}}},
+               "detector.positives": {"detector": {"positives": "any"}},
                "passes": {"passes": {"pitches": [30.0]}},
                "crop": {"crop": "pear"},
                "split": {"split": "val"}}
     calls = []
-    monkeypatch.setattr(runner_module, "evaluate", lambda c, k: calls.append(k) or evaluate(c, k))
+    monkeypatch.setattr(runner_module, "evaluate", lambda *a, **k: calls.append(a[1]) or evaluate(*a, **k))
     cases = [(NotImplementedError, f"{k} is not supported in this version", p) for k, p in refused.items()]
     cases += [(ValueError, f"{k}=.* differs from the prepared {k}=", p) for k, p in differs.items()]
     for exc, phrase, patch in cases:
@@ -231,12 +272,6 @@ def test_dim_fruit_is_ignored_and_counted_as_boundary(tmp_path):
     assert_exact(evaluate(ctx, rung_config(cfg, LADDER, "L0")))
     ctx2, cfg2 = _ctx(root, "apple", "detector.positives=any")
     assert evaluate(ctx2, rung_config(cfg2, LADDER, "L0"))["y6"]["ledger"]["boundary"] == 1
-
-
-@pytest.fixture(scope="module")
-def leaf_ctx(leaf_runs):
-    """Prepared contexts of the (clean, occluded) leaf bundles. Shared: evaluate them, never edit them."""
-    return [prepare(SynthRun.open(root), fake_cfg(root, "apple"), load_splits()) for root in leaf_runs]
 
 
 def _leaf(leaf_ctx, leaf_runs, *sets):
@@ -375,9 +410,9 @@ def test_hybrid_dedup_runs_and_meets_its_band_limits(leaf_ctx, leaf_runs):
     assert _without_mode(y6["band_inf"]) == _without_mode(y6["merge"])
 
 
-def test_subsets_exact_at_L0(apple_run, pear_run):
+def test_subsets_exact_at_L0(apple_run, pear_run, ctx_of):
     for root, crop, pitches in ((apple_run, "apple", (10, 30)), (pear_run, "pear", (45, 70))):
-        ctx, cfg = _ctx(root, crop)
+        ctx, cfg = ctx_of[crop], fake_cfg(root, crop)
         res = evaluate(ctx, rung_config(cfg, LADDER, "L0"), subsets=True)
         assert [r["S"] for r in res["subsets"]] == ["all", "A", "B", *(f"{w} {p}" for p in pitches for w in ("only", "drop"))]
         for r in res["subsets"]:
@@ -430,9 +465,9 @@ def test_ladder_subsets_on_L3_only_and_in_report(leaf_ctx, leaf_runs):
     assert "| drop 30 | 0 | - | - | - | - | - | - | - | - | - |" in lines
 
 
-def test_depth_err_null_without_detector_depth(leaf_runs):
-    ctx, cfg = _ctx(leaf_runs[0], "apple", "stop_after=y1")
-    ctx.dets = {k: dataclasses.replace(d, depth_m=None) for k, d in ctx.dets.items()}
+def test_depth_err_null_without_detector_depth(leaf_ctx, leaf_runs):
+    cfg, shared = fake_cfg(leaf_runs[0], "apple", "stop_after=y1"), leaf_ctx[0]
+    ctx = ctx_with(shared, dets={k: dataclasses.replace(d, depth_m=None) for k, d in shared.dets.items()})
     res = evaluate(ctx, cfg)
     assert res["y1"]["summary"]["depth_err"] is None and all(p["depth_err"] is None for p in res["y1"]["passes"])
 

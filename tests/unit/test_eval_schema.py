@@ -1,10 +1,13 @@
+import re
 from pathlib import Path
 
 import pytest
 import yaml
 from pydantic import ValidationError
 
-from counting.config.eval_schema import EvalAppConfig, LiftConfig, SplitsConfig, TrackerConfig
+from counting.config.eval_schema import (
+    DetNoise, EvalAppConfig, LiftConfig, NoiseConfig, SplitsConfig, TrackerConfig,
+)
 from counting.config.hashing import config_hash
 from counting.config.loader import load_yaml_model
 
@@ -169,3 +172,64 @@ def test_config_hash_generic_and_ignores_runtime_keys():
     c = EvalAppConfig.model_validate(_raw(seed=1))
     assert len(config_hash(a)) == 16
     assert config_hash(a) == config_hash(b) != config_hash(c)
+
+
+COMMITTED_HASHES = {"apple_dev": "38b74b45e42d9213", "pear_dev": "b85d292df18d8261", "apple_val": "825ebc81a20769d6",
+                    "apple_exp": "087d17775917d1b9", "pear_val": "8d8d2c1d3f6b4fe4", "pear_exp": "236093486cebe266"}
+
+
+def test_committed_config_hashes_unchanged():
+    for name, h in COMMITTED_HASHES.items():
+        assert config_hash(load_yaml_model(EVAL / f"{name}.yaml", EvalAppConfig)) == h, name
+
+
+def test_det_noise_defaults_and_bounds():
+    assert DetNoise().model_dump() == {"miss_p": 0.0, "fp_lambda": 0.0, "jitter_frac": 0.0, "split_p": 0.0,
+                                       "split_visib_max": 0.6, "score": "fixed", "score_min": 0.3}
+    for bad in ({"miss_p": 1.5}, {"miss_p": -0.1}, {"fp_lambda": -1}, {"fp_lambda": float("inf")},
+                {"fp_lambda": "inf"}, {"jitter_frac": -0.1}, {"jitter_frac": float("nan")}, {"split_p": 2},
+                {"split_visib_max": 0}, {"score": "beta"}, {"score_min": 1.5}, {"sigma": 0.1}):
+        with pytest.raises(ValidationError):
+            DetNoise(**bad)
+
+
+def test_noise_factors_must_be_finite():
+    for key in ("pose_trans_sigma_m", "pose_rot_sigma_deg", "pass_bias_m", "depth_rel_sigma"):
+        for bad in (float("inf"), float("nan")):
+            with pytest.raises(ValidationError):
+                NoiseConfig(**{key: bad})
+    with pytest.raises(ValidationError):
+        load_yaml_model(EVAL / "apple_dev.yaml", EvalAppConfig,
+                        overrides=["stages.det=oracle_noisy", "detector.noise.fp_lambda=inf"])
+
+
+def test_det_noise_and_oracle_noisy_need_each_other():
+    raw = _raw()
+    raw["stages"]["det"] = "oracle_noisy"
+    with pytest.raises(ValidationError, match="stages.det=oracle_noisy needs a detector.noise section"):
+        EvalAppConfig.model_validate(raw)
+    raw = _raw()
+    raw["detector"]["noise"] = {"miss_p": 0.1}
+    with pytest.raises(ValidationError, match="detector.noise needs stages.det=oracle_noisy, got stages.det=oracle"):
+        EvalAppConfig.model_validate(raw)
+    raw["stages"]["det"] = "oracle_noisy"
+    assert EvalAppConfig.model_validate(raw).detector.noise == DetNoise(miss_p=0.1)
+    zero = load_yaml_model(EVAL / "apple_dev.yaml", EvalAppConfig,
+                           overrides=["stages.det=oracle_noisy", "detector.noise={}"])
+    assert zero.detector.noise == DetNoise()
+
+
+def test_noise_seeds_need_distinct_non_negative_values():
+    for seeds, phrase in (([], "at least 1"), ([0, 0], "noise.seeds repeats a seed"),
+                          ([-1], "greater than or equal to 0")):
+        raw = _raw()
+        raw["noise"]["seeds"] = seeds
+        with pytest.raises(ValidationError, match=re.escape(phrase)):
+            EvalAppConfig.model_validate(raw)
+
+
+def test_is_noisy():
+    base = load_yaml_model(EVAL / "apple_val.yaml", EvalAppConfig)
+    assert not base.is_noisy() and base.noise.seeds == [0, 1, 2]          # seeds alone are not noise
+    for sets in (["noise.depth_dropout=0.05"], ["stages.det=oracle_noisy", "detector.noise={}"]):
+        assert load_yaml_model(EVAL / "apple_val.yaml", EvalAppConfig, overrides=sets).is_noisy(), sets

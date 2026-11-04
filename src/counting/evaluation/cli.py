@@ -178,35 +178,38 @@ def _load_criteria(path: str):
     return yaml.safe_load(p.read_text(encoding="utf-8")) if p.is_file() else None
 
 
+def _row_text(label: str, res: dict) -> str:
+    """`"{label}: row U=... G6=... e_pipe=..."` (`-` under stop_after=y1); a noisy `res` names its seed mean."""
+    from counting.evaluation.report import _count
+
+    y6 = res["y6"]
+    if y6 is None:
+        text = f"{label}: row U=- G6=- e_pipe=-"
+    else:
+        row = y6["row"]
+        e_pipe = "-" if row["e_pipe"] is None else f"{row['e_pipe']:+.1%}"
+        text = f"{label}: row U={_count(row['U'])} G6={_count(row['G6'])} e_pipe={e_pipe}"
+    if res.get("noisy"):
+        text += f" (mean over noise seeds {','.join(map(str, res['seeds']))})"
+    return text
+
+
 def _echo_rung_lines(run_entries: list[dict]) -> None:
-    """One line per (bundle, rung): `<rung>: row U=... G6=... e_pipe=...` (`-` under stop_after=y1)."""
+    """One line per (bundle, rung), from `_row_text` (`-` under stop_after=y1)."""
     multi = len(run_entries) > 1
     for entry in run_entries:
         prefix = f"{entry['meta']['run_id']}: " if multi else ""
         for name, rung in entry["rungs"].items():
-            y6 = rung["y6"]
-            if y6 is None:
-                typer.echo(f"{prefix}{name}: row U=- G6=- e_pipe=-")
-                continue
-            row = y6["row"]
-            e_pipe = "-" if row["e_pipe"] is None else f"{row['e_pipe']:+.1%}"
-            typer.echo(f"{prefix}{name}: row U={row['U']} G6={row['G6']} e_pipe={e_pipe}")
+            typer.echo(_row_text(f"{prefix}{name}", rung))
 
 
 def _echo_sweep_lines(run_entries: list[dict]) -> None:
-    """One line per (bundle, cell): `[{run_id}: ]{point} @ {base or -}: row U=... G6=... e_pipe=...`."""
+    """One line per (bundle, cell), from `_row_text` (label `[{run_id}: ]{point} @ {base or -}`)."""
     multi = len(run_entries) > 1
     for entry in run_entries:
         prefix = f"{entry['meta']['run_id']}: " if multi else ""
         for cell in entry["cells"]:
-            base = cell["base"] or "-"
-            y6 = cell["y6"]
-            if y6 is None:
-                typer.echo(f"{prefix}{cell['point']} @ {base}: row U=- G6=- e_pipe=-")
-                continue
-            row = y6["row"]
-            e_pipe = "-" if row["e_pipe"] is None else f"{row['e_pipe']:+.1%}"
-            typer.echo(f"{prefix}{cell['point']} @ {base}: row U={row['U']} G6={row['G6']} e_pipe={e_pipe}")
+            typer.echo(_row_text(f"{prefix}{cell['point']} @ {cell['base'] or '-'}", cell))
 
 
 def _run_eval(
@@ -221,6 +224,7 @@ def _run_eval(
     input error. `CheckFailed` is a `ValueError`, so it is caught before the input-error branch.
     A sweep checks its config, grid and (with grid bases) ladder, then opens every
     bundle in `cfg.runs` and checks its frame selection, before `run_sweep` scores any of them.
+    Under `stages.det=oracle_noisy`, `eval run` prepares the bundle once per noise seed.
     """
     import hashlib
     import time
@@ -234,7 +238,7 @@ def _run_eval(
     from counting.evaluation.record import build_record, experiment_id, git_state
     from counting.evaluation.report import SCHEMA_VERSION, ReproducibilityError, write_experiment
     from counting.evaluation.runner import (
-        CheckFailed, check_ladder_request, describe_run, evaluate, load_ladder, prepare, run_ladder,
+        CheckFailed, check_ladder_request, describe_run, load_ladder, prepare, run_config, run_ladder,
     )
     from counting.evaluation.sweep import (
         check_frame_selection, check_set_overlap, grid_points, load_grid, run_sweep, sweep_cells,
@@ -274,28 +278,34 @@ def _run_eval(
         t_prepare = t_score = 0.0
         if kind == "sweep":
             runs = [SynthRun.open(run_path) for run_path in cfg.runs]
-            for run in runs:
-                check_frame_selection(run, cells)
+            for bundle in runs:
+                check_frame_selection(bundle, cells)
             run_entries = []
-            for run in runs:
-                entry, timings = run_sweep(run, cells, splits_cfg)
+            for bundle in runs:
+                entry, timings = run_sweep(bundle, cells, splits_cfg)
                 run_entries.append(entry)
                 t_prepare += timings["prepare"]
                 t_score += timings["evaluate"]
         else:
             contexts, run_entries = [], []
             for run_path in cfg.runs:
-                t0 = time.perf_counter()
-                ctx = prepare(SynthRun.open(run_path), cfg, splits_cfg)
-                t_prepare += time.perf_counter() - t0
-                contexts.append(ctx)
-
-                t0 = time.perf_counter()
                 if kind == "run":
-                    out = {"chain": [], "rungs": {"run": evaluate(ctx, cfg)}, "interaction_2x2": None}
+                    t0 = time.perf_counter()
+                    run = SynthRun.open(run_path)
+                    t_open = time.perf_counter() - t0
+                    ctx, res, timings = run_config(run, cfg, splits_cfg)
+                    t_prepare += t_open + timings["prepare"]
+                    t_score += timings["evaluate"]
+                    out = {"chain": [], "rungs": {"run": res}, "interaction_2x2": None}
                 else:
+                    t0 = time.perf_counter()
+                    ctx = prepare(SynthRun.open(run_path), cfg, splits_cfg)
+                    t_prepare += time.perf_counter() - t0
+
+                    t0 = time.perf_counter()
                     out = run_ladder(ctx, cfg, ladder, rungs, with_2x2=with_2x2, subsets=subsets)
-                t_score += time.perf_counter() - t0
+                    t_score += time.perf_counter() - t0
+                contexts.append(ctx)
                 run_entries.append({"meta": describe_run(ctx), **out})
         finished = datetime.now(timezone.utc).isoformat()
 
@@ -354,7 +364,8 @@ def _run_eval(
             results["sweep"] = {"grid": grid.path.name, "bases": list(grid.bases),
                                 "points": [{"name": p.name, "patch": p.patch, "factor": p.factor, "value": p.value}
                                           for p in points]}
-            record_extra = {"grid_sha256": grid_sha256, "ladder_sha256": ladder_sha256}
+            record_extra = {"grid_sha256": grid_sha256, "ladder_sha256": ladder_sha256,
+                            "detectors": sorted({cell.cfg.stages.det for cell in cells})}
         record = build_record(cfg=cfg, runs=data, code=code,
                               timings={"prepare": round(t_prepare, 3), "evaluate": round(t_score, 3)},
                               started=started, finished=finished, extra=record_extra)

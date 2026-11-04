@@ -1,8 +1,10 @@
+import csv
 import json
 import re
 from pathlib import Path
 
 import numpy as np
+import pytest
 import yaml
 from PIL import Image
 from typer.testing import CliRunner
@@ -37,7 +39,7 @@ def test_truth_geometry_without_ground(leaf_runs, tmp_path):
 
 
 def test_truth_geometry_fails_when_ground_has_no_depth(tmp_path):
-    root = write_run(tmp_path, crop="apple")                    # 10 deg passes see the ground
+    root = write_run(tmp_path, crop="apple", pitches=(10.0,))   # 10 deg passes see the ground
     for p in root.glob("*_depth16.png"):
         Image.fromarray(np.zeros_like(np.array(Image.open(p), dtype=np.uint16))).save(p)
     res = runner.invoke(eval_app, ["truth", str(root), "--check-geometry"])
@@ -89,8 +91,8 @@ def _cfg_file(tmp_path, run, crop):
     return str(p)
 
 
-def test_eval_run_writes_experiment_and_is_reproducible(apple_run, tmp_path):
-    args = ["run", "--config", _cfg_file(tmp_path, apple_run, "apple"), "--splits", SPLITS, "--criteria", CRIT]
+def test_eval_run_writes_experiment_and_is_reproducible(leaf_runs, tmp_path):
+    args = ["run", "--config", _cfg_file(tmp_path, leaf_runs[0], "apple"), "--splits", SPLITS, "--criteria", CRIT]
     r1 = runner.invoke(eval_app, args)
     assert r1.exit_code == 0, r1.output
     dirs = list((tmp_path / "out" / "apple_dev").iterdir())
@@ -102,8 +104,8 @@ def test_eval_run_writes_experiment_and_is_reproducible(apple_run, tmp_path):
     assert (dirs[0] / "results.json").read_bytes() == b1
 
 
-def test_eval_run_set_overrides(apple_run, tmp_path):
-    args = ["run", "--config", _cfg_file(tmp_path, apple_run, "apple"), "--splits", SPLITS,
+def test_eval_run_set_overrides(leaf_runs, tmp_path):
+    args = ["run", "--config", _cfg_file(tmp_path, leaf_runs[0], "apple"), "--splits", SPLITS,
             "--set", "stages.track=last_box", "--set", "stop_after=y1"]
     assert runner.invoke(eval_app, args).exit_code == 0
     (d,) = (tmp_path / "out" / "apple_dev").iterdir()
@@ -120,7 +122,7 @@ def test_eval_run_set_list_and_null_sections(apple_run, tmp_path):
     res = json.loads((d / "results.json").read_text(encoding="utf-8"))
     assert {p["pitch"] for p in res["runs"][0]["rungs"]["run"]["y1"]["passes"]} == {30.0}
     r = runner.invoke(eval_app, base + ["--set", "detector.noise.miss_p=0.1"])
-    assert r.exit_code == 2 and "detector.noise is not supported in this version" in r.output, r.output
+    assert r.exit_code == 2 and "detector.noise needs stages.det=oracle_noisy" in r.output, r.output
     r = runner.invoke(eval_app, base + ["--set", "lift.depth.x=1"])
     assert r.exit_code == 2 and "error: --set: " in r.output and "not a dict" in r.output, r.output
 
@@ -136,6 +138,28 @@ def test_box_far_run_records_depth_fingerprint(leaf_runs, tmp_path):
     assert res["runs"][0]["rungs"]["run"]["lift_depth"] == "box_far" and rec["data"][0]["depth_fingerprint"]
 
 
+def test_eval_run_with_noise_writes_seed_rows(leaf_runs, tmp_path):
+    args = ["run", "--config", _cfg_file(tmp_path, leaf_runs[0], "apple"), "--splits", SPLITS,
+            "--set", "stages.det=oracle_noisy", "--set", "detector.noise.miss_p=0.1",
+            "--set", "noise.depth_dropout=0.05", "--set", "noise.seeds=[0,1]"]
+    r = runner.invoke(eval_app, args)
+    assert r.exit_code == 0, r.output
+    (d,) = (tmp_path / "out" / "apple_dev").iterdir()
+    res = json.loads((d / "results.json").read_text(encoding="utf-8"))
+    rung = res["runs"][0]["rungs"]["run"]
+    assert res["schema_version"] == 4 and rung["noisy"] and rung["seeds"] == [0, 1]
+    assert rung["noise"]["detector"]["miss_p"] == 0.1 and rung["noise"]["depth_dropout"] == 0.05
+    line = next(line for line in r.output.splitlines() if line.startswith("run: row U="))
+    assert line.endswith(" (mean over noise seeds 0,1)")
+    rec = json.loads((d / "record.json").read_text(encoding="utf-8"))
+    assert rec["detector"]["name"] == "oracle_noisy" and rec["detector"]["noise"]["miss_p"] == 0.1
+    assert rec["seeds"]["noise_seeds"] == [0, 1]
+    rows = list(csv.reader((d / "per_pass.csv").read_text(encoding="utf-8").splitlines()))
+    assert [row[2] for row in rows[1:]] == ["0", "0", "1", "1", "mean", "mean"]      # two passes per seed, then the mean
+    assert (d / "report.md").read_text(encoding="utf-8").splitlines()[1] == \
+        "> 합성 렌더 · 정답 자세 · 보정 전(U). 실제 정확도가 아니다."               # detection and depth noise only
+
+
 def test_box_far_ladder_records_depth_fingerprint(leaf_runs, tmp_path):
     args = ["ladder", "--config", _cfg_file(tmp_path, leaf_runs[0], "apple"), "--rungs", "L3", "--splits", SPLITS,
             "--set", "lift.depth=box_far", "--set", "stop_after=y1"]
@@ -145,10 +169,12 @@ def test_box_far_ladder_records_depth_fingerprint(leaf_runs, tmp_path):
     rec = json.loads((d / "record.json").read_text(encoding="utf-8"))
     res = json.loads((d / "results.json").read_text(encoding="utf-8"))
     assert res["runs"][0]["rungs"]["L3"]["lift_depth"] == "box_far" and rec["data"][0]["depth_fingerprint"]
+    assert rec["detector"] == {"name": "oracle", "noise": None, "weights_sha256": None, "cache_sha256": None,
+                               "pretrained": None}
 
 
-def test_eval_ladder_rungs_and_2x2(apple_run, tmp_path):
-    args = ["ladder", "--config", _cfg_file(tmp_path, apple_run, "apple"), "--rungs", "L0,L1,last_box",
+def test_eval_ladder_rungs_and_2x2(leaf_runs, tmp_path):
+    args = ["ladder", "--config", _cfg_file(tmp_path, leaf_runs[0], "apple"), "--rungs", "L0,L1,last_box",
             "--with-2x2", "--ladder", LADDER, "--splits", SPLITS, "--criteria", CRIT]
     r = runner.invoke(eval_app, args)
     assert r.exit_code == 0, r.output
@@ -160,10 +186,11 @@ def test_eval_ladder_rungs_and_2x2(apple_run, tmp_path):
     assert "L0→L1 (추적)" in (d / "report.md").read_text(encoding="utf-8")
 
 
-def test_eval_run_reordered_runs_stay_reproducible(apple_run, tmp_path):
+@pytest.mark.slow
+def test_eval_run_reordered_runs_stay_reproducible(apple_run, leaf_runs, tmp_path):
     """A rerun with the same bundles in a different `--run` order reports as reproduced
     (results.json's `runs` list is sorted by bundle identity, not by cfg.runs/--run order)."""
-    run_b = write_run(tmp_path / "run_b", crop="apple", pitches=(30.0,))
+    run_b = leaf_runs[0]   # 30 deg passes only, so its fingerprint differs from apple_run's
     cfg = _cfg_file(tmp_path, apple_run, "apple")
     forward = ["run", "--config", cfg, "--splits", SPLITS, "--run", str(apple_run), "--run", str(run_b)]
     backward = ["run", "--config", cfg, "--splits", SPLITS, "--run", str(run_b), "--run", str(apple_run)]
@@ -222,6 +249,7 @@ def test_eval_ladder_refuses_bad_request_before_reading_bundles(tmp_path):
     no_2x2 = tmp_path / "no_2x2.yaml"
     no_2x2.write_text("rungs: {L3: {}}\n", encoding="utf-8")
     for extra, phrase in ((["--set", "lift.depth=det_depth"], "ladder base config has lift.depth=det_depth"),
+                          (["--set", "noise.depth_dropout=0.05"], "ladder base config has noise set"),
                           (["--rungs", "L3,L9"], "unknown rung 'L9'"),
                           (["--ladder", str(no_2x2), "--with-2x2"], "with_2x2 needs an 'interaction_2x2' mapping"),
                           (["--rungs", "L1", "--subsets"], "--subsets needs rung L3"),

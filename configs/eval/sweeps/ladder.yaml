@@ -1,6 +1,7 @@
 # Oracle ladder. Rungs inherit stages.det and, without stages.dedup, the crop default dedup mode
-# from the base config. L2c and L3 have no lift section, so they use the base config's box depth
-# method and parameters. L3_dd is report-only.
+# from the base config. L2c, L3 and the L4 rungs have no lift section, so they use the base config's
+# box depth method and parameters. The L4 rungs add pose and depth noise to L3 and run once per
+# noise.seeds entry of the base config. L3_dd, L4_weak and L4_strong are report-only.
 rungs:
   L0:  {stages: {track: oracle,   center: truth,    dedup: oracle, assign: truth}, lift: {depth: det_depth}}
   L1:  {stages: {track: landmark, center: truth,    dedup: oracle, assign: truth}, lift: {depth: det_depth}}
@@ -8,10 +9,16 @@ rungs:
   L2b: {stages: {track: landmark, center: measured, assign: truth}, lift: {depth: det_depth}}
   L2c: {stages: {track: landmark, center: measured, assign: truth}}
   L3:  {stages: {track: landmark, center: measured, assign: grid}}
+  L4_base: {stages: {track: landmark, center: measured, assign: grid},
+            noise: {pose_trans_sigma_m: 0.02, pose_rot_sigma_deg: 0.5, pass_bias_m: 0.02, depth_rel_sigma: 0.02, depth_dropout: 0.05}}
 baselines:
   L3_dd: {stages: {track: landmark, center: measured, assign: grid}, lift: {depth: det_depth}}
   last_box: {stages: {track: last_box, center: truth, dedup: oracle, assign: truth},
              lift: {depth: det_depth}, tracker: {repair_m: 0}}
+  L4_weak: {stages: {track: landmark, center: measured, assign: grid},
+            noise: {pose_trans_sigma_m: 0.01, pose_rot_sigma_deg: 0.25, pass_bias_m: 0.01, depth_rel_sigma: 0.01, depth_dropout: 0.0}}
+  L4_strong: {stages: {track: landmark, center: measured, assign: grid},
+              noise: {pose_trans_sigma_m: 0.05, pose_rot_sigma_deg: 1.0, pass_bias_m: 0.10, depth_rel_sigma: 0.04, depth_dropout: 0.20}}
 interaction_2x2:
   base: L2a
   track: [oracle, landmark]

@@ -1,5 +1,6 @@
-# Dedup mode and band on L3. Run once per radius with --set dedup.radius_m=<value>.
-bases: [L3]
+# Dedup mode and band on L3 and on L4_base (the reference pose and depth noise); pick the mode on
+# L4_base. Run once per radius with --set dedup.radius_m=<value>.
+bases: [L3, L4_base]
 combos:
   self_side: {stages: {dedup: self_side}}
   merge: {stages: {dedup: merge}}

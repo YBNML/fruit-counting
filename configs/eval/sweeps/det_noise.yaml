@@ -1,0 +1,19 @@
+# Detection noise on L3, one factor at a time. Every point but the baseline runs the noisy oracle
+# (common); the baseline is the plain oracle, which equals the noisy one with every factor at 0.
+# The combos are report-only: false positives with min_obs 2, and box jitter with box_median depth.
+bases: [L3]
+common: {stages: {det: oracle_noisy}, detector: {noise: {}}}
+factors:
+  detector.noise.miss_p: [0.1, 0.2, 0.3]
+  detector.noise.fp_lambda: [1.0, 2.0, 5.0]
+  detector.noise.jitter_frac: [0.05, 0.10]
+  detector.noise.split_p: [0.05, 0.10]
+  detector.noise.score: [uniform]
+combos:
+  fp_0_min_obs_2: {tracker: {min_obs: 2}}
+  fp_1_min_obs_2: {detector: {noise: {fp_lambda: 1.0}}, tracker: {min_obs: 2}}
+  fp_2_min_obs_2: {detector: {noise: {fp_lambda: 2.0}}, tracker: {min_obs: 2}}
+  fp_5_min_obs_2: {detector: {noise: {fp_lambda: 5.0}}, tracker: {min_obs: 2}}
+  jitter_0_box_median: {lift: {depth: box_median}}
+  jitter_0.05_box_median: {detector: {noise: {jitter_frac: 0.05}}, lift: {depth: box_median}}
+  jitter_0.10_box_median: {detector: {noise: {jitter_frac: 0.10}}, lift: {depth: box_median}}

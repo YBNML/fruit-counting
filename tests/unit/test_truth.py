@@ -112,7 +112,7 @@ def test_check_geometry_catches_depth_offset(tmp_path):
 
 def test_check_geometry_fails_when_ground_has_no_depth(tmp_path):
     """Ground in view but every depth16 pixel 0 (no return): the ground check applies and fails, it is not n/a."""
-    root = write_run(tmp_path, crop="apple")                    # 10 and 30 deg; 10 deg sees the ground
+    root = write_run(tmp_path, crop="apple", pitches=(10.0,))   # 10 deg only; it sees the ground
     for p in root.glob("*_depth16.png"):
         Image.fromarray(np.zeros_like(np.array(Image.open(p), dtype=np.uint16))).save(p)
     run = SynthRun.open(root)

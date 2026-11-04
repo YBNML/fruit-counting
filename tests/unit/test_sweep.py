@@ -30,7 +30,9 @@ runner = CliRunner()
 SWEEPS = ROOT / "configs" / "eval" / "sweeps"
 # grid file: (bases, points including the baseline, crops it is written for)
 GRIDS = {
-    "dedup_modes.yaml": (("L3",), 6, ("apple", "pear")),
+    "dedup_modes.yaml": (("L3", "L4_base"), 6, ("apple", "pear")),
+    "det_noise.yaml": (("L3",), 19, ("apple", "pear")),
+    "pose_noise.yaml": (("L3", "L3_dd"), 17, ("apple", "pear")),
     "spacing.yaml": (("L1", "L3", "last_box"), 5, ("apple", "pear")),
     "val/depth.yaml": (("L1", "L3"), 5, ("apple", "pear")),
     "val/depth_far.yaml": (("L1", "L3"), 8, ("apple", "pear")),
@@ -59,15 +61,42 @@ def test_committed_grids_build_for_every_config():
                 assert len(sweep_cells(_crop_cfg(crop, split), grid, LADDER)) == n_points * len(bases), (name, crop)
 
 
+def _leaves(patch, prefix=()):
+    for k, v in patch.items():
+        if isinstance(v, dict) and v:
+            yield from _leaves(v, (*prefix, k))
+        else:
+            yield (*prefix, k), v
+
+
 def test_committed_grid_values_survive_validation():
     for name, (_, _, crops) in GRIDS.items():
-        points = [p for p in grid_points(load_grid(SWEEPS / name)) if p.factor is not None]
-        for crop in crops:
-            for p in points:
-                node = _patched(_crop_cfg(crop, "val"), p.patch).model_dump()
-                for part in p.factor.split("."):
-                    node = node[part]
-                assert node == p.value, (name, p.name)          # a YAML "1e-3" would stay a string here
+        for p in grid_points(load_grid(SWEEPS / name))[1:]:
+            for crop in crops:
+                dumped = _patched(_crop_cfg(crop, "val"), p.patch).model_dump()
+                for path, value in _leaves(p.patch):
+                    node = dumped
+                    for part in path:
+                        node = node[part]
+                    # a YAML "1e-3" would stay a string here; an empty mapping is filled with defaults
+                    assert isinstance(node, dict) if value == {} else node == value, (name, p.name, path)
+
+
+def test_noise_grids_follow_the_noise_tables():
+    det = load_grid(SWEEPS / "det_noise.yaml")
+    assert det.common == {"stages": {"det": "oracle_noisy"}, "detector": {"noise": {}}}
+    assert det.factors == {"detector.noise.miss_p": [0.1, 0.2, 0.3], "detector.noise.fp_lambda": [1.0, 2.0, 5.0],
+                           "detector.noise.jitter_frac": [0.05, 0.10], "detector.noise.split_p": [0.05, 0.10],
+                           "detector.noise.score": ["uniform"]}
+    assert list(det.combos) == ["fp_0_min_obs_2", "fp_1_min_obs_2", "fp_2_min_obs_2", "fp_5_min_obs_2",
+                                "jitter_0_box_median", "jitter_0.05_box_median", "jitter_0.10_box_median"]
+    pose = load_grid(SWEEPS / "pose_noise.yaml")
+    assert pose.factors == {"noise.pose_trans_sigma_m": [0.01, 0.02, 0.05], "noise.pose_rot_sigma_deg": [0.5, 1.0],
+                            "noise.pass_bias_m": [0.02, 0.05, 0.10], "noise.depth_rel_sigma": [0.01, 0.02, 0.04],
+                            "noise.depth_dropout": [0.05, 0.20]}
+    rungs = {"weak": LADDER["baselines"]["L4_weak"], "base": LADDER["rungs"]["L4_base"],
+             "strong": LADDER["baselines"]["L4_strong"]}
+    assert pose.combos == {name: {"noise": patch["noise"]} for name, patch in rungs.items()}   # the L4 rung values
 
 
 def _grid(tmp_path, text, name="g.yaml"):
@@ -113,6 +142,14 @@ BAD_GRIDS = [
     ("combos: {baseline: {dedup: {radius_m: 0.05}}}\n", "duplicate point name 'baseline'"),
     ("factors: [lift.depth]\n", "factors needs a mapping"),
     ("factors: {tracker.repair_m: [0.06]\n", "not valid YAML"),
+    ("bases: L3\nfactors: {tracker.repair_m: [0.06]}\n", "bases needs a list of rung names"),
+    ("product: [lift.depth]\n", "product needs a mapping"),
+    ("combos: [x]\n", "combos needs a mapping"),
+    ("", "a grid file needs a mapping"),
+    ("common: [x]\nfactors: {tracker.repair_m: [0.06]}\n", "common needs a mapping"),
+    ("common: {stages: {det: oracle_noisy}}\n", "a grid needs factors, product or combos"),
+    ("common: {lift.depth: box_far}\nfactors: {tracker.repair_m: [0.06]}\n", "common key 'lift.depth' must be one of"),
+    ("combos: {c: {lift.depth: box_far}}\n", "combo 'c' key 'lift.depth' must be one of"),
 ]
 
 
@@ -152,12 +189,14 @@ def test_sweep_cells_merge_order_and_overridden(tmp_path):
 
 def test_sweep_cells_overridden_includes_prefix_paths(tmp_path):
     """A point leaf under a rung leaf, or above one, is overridden; a sibling key is not."""
-    ladder = {"rungs": {"R": {"detector": {"noise": None}, "lift": {"center_offset_m": {"fruit": 0.0}}}}}
-    g = load_grid(_grid(tmp_path, "bases: [R]\ncombos:\n  under: {detector: {noise: {sigma: 0.1}}}\n"
+    ladder = {"rungs": {"R": {"stages": {"det": "oracle"}, "detector": {"noise": None},
+                              "lift": {"center_offset_m": {"fruit": 0.0}}}}}
+    g = load_grid(_grid(tmp_path, "bases: [R]\ncombos:\n"
+                                  "  under: {stages: {det: oracle_noisy}, detector: {noise: {miss_p: 0.1}}}\n"
                                   "  above: {lift: {center_offset_m: {}, depth: box_far}}\n"))
     cells = sweep_cells(fake_cfg(BUNDLE, "apple"), g, ladder)
     assert [(c.point.name, c.overridden) for c in cells] == [
-        ("baseline", ()), ("under", ("detector.noise.sigma",)), ("above", ("lift.center_offset_m",))]
+        ("baseline", ()), ("under", ("detector.noise.miss_p", "stages.det")), ("above", ("lift.center_offset_m",))]
     assert cells[1].cfg.detector.noise is None and cells[2].cfg.lift.depth == "box_far"   # the rung wins
 
 
@@ -175,12 +214,24 @@ def test_sweep_collapse_names_the_first_value_over_10_percent():
     assert _sweep_collapse_lines(points, ["L3"], cells)[1:] == [f"- L3 · {factor}: 0.1"]
 
 
+def test_sweep_collapse_none_and_dash():
+    points = [{"name": "baseline", "factor": None}, {"name": "tracker.gate_m=0.1", "factor": "tracker.gate_m"}]
+    under = [{"point": n, "base": "L3", "y6": {"metrics": {"row_abs_e_pipe": 0.05, "tree_mae_over_mean": 0.1}}}
+             for n in ("baseline", "tracker.gate_m=0.1")]
+    assert _sweep_collapse_lines(points, ["L3"], under)[1:] == ["- L3 · tracker.gate_m: 없음"]
+    assert _sweep_collapse_lines(points, ["L3"], [{**c, "y6": None} for c in under])[1:] == ["- L3 · tracker.gate_m: -"]
+
+
 def test_sweep_cells_refuse_unsupported_and_invalid_points(tmp_path):
     cfg = fake_cfg(BUNDLE, "apple")
     g = _grid(tmp_path, "factors: {stages.det: [oracle_noisy]}\n")
-    with pytest.raises(NotImplementedError, match=re.escape(
-            f"{g}: point 'stages.det=oracle_noisy': stages.det=oracle_noisy is not supported in this version")):
+    with pytest.raises(ValueError, match=re.escape(f"{g}: point 'stages.det=oracle_noisy': ")) as e:
         sweep_cells(cfg, load_grid(g), None)
+    assert "stages.det=oracle_noisy needs a detector.noise section" in str(e.value)
+    c = _grid(tmp_path, "factors: {detector.cache: [x]}\n", "c.yaml")
+    with pytest.raises(NotImplementedError, match=re.escape(
+            f"{c}: point 'detector.cache=x': detector.cache is not supported in this version")):
+        sweep_cells(cfg, load_grid(c), None)
     v = _grid(tmp_path, "factors: {lift.far_min_frac: [1.5]}\n", "v.yaml")
     with pytest.raises(ValueError, match=re.escape(f"{v}: point 'lift.far_min_frac=1.5'")):
         sweep_cells(cfg, load_grid(v), None)
@@ -205,9 +256,10 @@ def test_run_sweep_prepares_once_per_group_and_matches_separate_runs(leaf_runs, 
     g = load_grid(_grid(tmp_path, "factors:\n  tracker.repair_m: [0.06, 0.08]\n  passes.step_m: [0.3]\n"))
     cells = sweep_cells(fake_cfg(root, "apple"), g, None)
     calls, real = [], sweep_module.prepare
-    monkeypatch.setattr(sweep_module, "prepare", lambda run, c, splits: calls.append(c.passes.step_m) or real(run, c, splits))
+    monkeypatch.setattr(sweep_module, "prepare", lambda run, c, splits, **k: calls.append(
+        (c.passes.step_m, k.get("det_seed"))) or real(run, c, splits, **k))
     entry, timings = run_sweep(SynthRun.open(root), cells, load_splits())
-    assert calls == [None, 0.3] and set(timings) == {"prepare", "evaluate"}
+    assert calls == [(None, None), (0.3, None)] and set(timings) == {"prepare", "evaluate"}
     assert [c["point"] for c in entry["cells"]] == ["baseline", "tracker.repair_m=0.06", "tracker.repair_m=0.08",
                                                     "passes.step_m=0.3"]
     assert entry["meta"]["n_frames"] == 62
@@ -219,6 +271,80 @@ def test_run_sweep_prepares_once_per_group_and_matches_separate_runs(leaf_runs, 
     assert all(step["y6"][k] == alone["y6"][k] for k in Y6_KEYS)
     assert [p["n_frames"] for p in step["y1"]["passes"]] == [16, 16]
     assert "trees" in entry["cells"][0]["y6"] and "trees" not in step["y6"]
+
+
+def test_common_patch_goes_under_every_point_but_the_baseline(tmp_path):
+    g = load_grid(_grid(tmp_path, "bases: [L3]\ncommon: {stages: {det: oracle_noisy}, detector: {noise: {}}}\n"
+                                  "factors: {detector.noise.miss_p: [0.1]}\ncombos:\n  med: {lift: {depth: box_median}}\n"))
+    assert [(p.name, p.patch) for p in grid_points(g)] == [
+        ("baseline", {}),
+        ("detector.noise.miss_p=0.1", {"stages": {"det": "oracle_noisy"}, "detector": {"noise": {"miss_p": 0.1}}}),
+        ("med", {"stages": {"det": "oracle_noisy"}, "detector": {"noise": {}}, "lift": {"depth": "box_median"}})]
+    cells = sweep_cells(fake_cfg(BUNDLE, "apple"), g, LADDER)
+    assert [c.cfg.stages.det for c in cells] == ["oracle", "oracle_noisy", "oracle_noisy"]   # L3 keeps the point's det
+    assert [c.overridden for c in cells] == [(), (), ()]
+    with pytest.raises(ValueError, match=re.escape("--set stages.det overlaps the grid key stages.det")):
+        check_set_overlap(["stages.det"], grid_points(g))
+    with pytest.raises(ValueError, match="bases need a ladder"):
+        sweep_cells(fake_cfg(BUNDLE, "apple"), g, None)
+
+
+def test_run_sweep_prepares_once_per_detection_seed(leaf_runs, tmp_path, monkeypatch):
+    root = leaf_runs[0]
+    g = load_grid(_grid(tmp_path, "factors: {noise.depth_dropout: [0.05]}\n"
+                                  "combos:\n  det: {stages: {det: oracle_noisy}, detector: {noise: {miss_p: 0.2}}}\n"))
+    cells = sweep_cells(fake_cfg(root, "apple", "noise.seeds=[0,1]"), g, None)
+    calls, real = [], sweep_module.prepare
+    monkeypatch.setattr(sweep_module, "prepare", lambda run, c, splits, **k: calls.append(k.get("det_seed"))
+                        or real(run, c, splits, **k))
+    entry, _ = run_sweep(SynthRun.open(root), cells, load_splits())
+    assert calls == [None, 0, 1]                  # the pose and depth cell shares the oracle context
+    base, drop, det = entry["cells"]
+    assert "noisy" not in base and drop["seeds"] == det["seeds"] == [0, 1] and "trees" in base["y6"]
+    alone = evaluate(real(SynthRun.open(root), cells[2].cfg, load_splits(), det_seed=1), cells[2].cfg, noise_seed=1)
+    p0, p1 = det["per_seed"]
+    assert p1["noise_seed"] == 1 and p1["y1"]["summary"] == alone["y1"]["summary"]
+    assert all(p1["y6"][k] == alone["y6"][k] for k in Y6_KEYS) and p0["y1"]["summary"] != p1["y1"]["summary"]
+
+
+def test_eval_sweep_detection_noise_on_L3_writes_seed_rows(leaf_runs, tmp_path):
+    cfg = _cfg_file(tmp_path, leaf_runs[0], "apple")
+    g = _grid(tmp_path, "bases: [L3]\ncommon: {stages: {det: oracle_noisy}, detector: {noise: {}}}\n"
+                        "factors: {detector.noise.miss_p: [0.2]}\n")
+    r = runner.invoke(eval_app, ["sweep", "--config", cfg, "--grid", str(g), "--splits", SPLITS,
+                                 "--set", "noise.seeds=[0,1]"])
+    assert r.exit_code == 0, r.output
+    (d,) = (tmp_path / "out" / "apple_dev").iterdir()
+    base, miss = json.loads((d / "results.json").read_text(encoding="utf-8"))["runs"][0]["cells"]
+    assert base["stages"]["det"] == "oracle" and "noisy" not in base
+    assert (miss["stages"]["det"], miss["base"], miss["overridden"], miss["seeds"]) == ("oracle_noisy", "L3", [], [0, 1])
+    rows = list(csv.reader((d / "sweep.csv").read_text(encoding="utf-8").splitlines()))
+    assert [(row[2], row[5]) for row in rows[1:]] == [
+        ("baseline", ""), ("detector.noise.miss_p=0.2", "0"), ("detector.noise.miss_p=0.2", "1"),
+        ("detector.noise.miss_p=0.2", "mean")]
+    line = next(line for line in r.output.splitlines() if line.startswith("detector.noise.miss_p=0.2 @ L3: row U="))
+    assert line.endswith(" (mean over noise seeds 0,1)")
+    report = (d / "report.md").read_text(encoding="utf-8").splitlines()
+    assert "**sweep** — g.yaml: 점 2개 × 칸 1개 · 잡음 칸은 시드 평균, 시드별 값은 sweep.csv" in report
+    assert report[1] == "> 합성 렌더 · 정답 자세 · 보정 전(U). 실제 정확도가 아니다."            # detection noise only
+    rec = json.loads((d / "record.json").read_text(encoding="utf-8"))
+    assert rec["detector"]["name"] == "oracle" and rec["extra"]["detectors"] == ["oracle", "oracle_noisy"]
+
+
+@pytest.mark.slow
+def test_noisy_sweep_bytes_stable_across_hash_seeds(leaf_runs, tmp_path, monkeypatch):
+    cfg = _cfg_file(tmp_path, leaf_runs[0], "apple")
+    g = _grid(tmp_path, "bases: [L3]\nfactors: {noise.pose_trans_sigma_m: [0.02]}\n"
+                        "combos:\n  det: {stages: {det: oracle_noisy}, detector: {noise: {miss_p: 0.1, fp_lambda: 1.0}}}\n")
+    args = ["sweep", "--config", cfg, "--grid", str(g), "--splits", SPLITS, "--set", "noise.seeds=[0,1]"]
+    r = runner.invoke(eval_app, args)
+    assert r.exit_code == 0, r.output
+    (d,) = (tmp_path / "out" / "apple_dev").iterdir()
+    first = {n: (d / n).read_bytes() for n in ("results.json", "sweep.csv")}
+    monkeypatch.setenv("PYTHONHASHSEED", "1")                # a fresh interpreter with another hash seed
+    out2 = tmp_path / "out2"
+    python_c(f"from counting.evaluation.cli import eval_app; eval_app({[*args, '--set', f'output_dir={out2}']!r})")
+    assert {n: (out2 / "apple_dev" / d.name / n).read_bytes() for n in first} == first
 
 
 def test_run_sweep_checks_frame_selection_before_any_prepare(leaf_runs, tmp_path, monkeypatch):
@@ -251,7 +377,7 @@ def test_eval_sweep_matches_eval_run_and_writes_the_folder(leaf_runs, tmp_path):
     assert sorted(runs) == [0.04, 0.06]
     assert sorted(p.name for p in sweep_dir.iterdir()) == ["config.yaml", "record.json", "report.md", "results.json",
                                                          "sweep.csv"]
-    assert sweep["schema_version"] == 3 and sweep["sweep"] == {"grid": "g.yaml", "bases": [], "points": [
+    assert sweep["schema_version"] == 4 and sweep["sweep"] == {"grid": "g.yaml", "bases": [], "points": [
         {"name": "baseline", "patch": {}, "factor": None, "value": None},
         {"name": "tracker.repair_m=0.06", "patch": {"tracker": {"repair_m": 0.06}}, "factor": "tracker.repair_m",
          "value": 0.06}]}
@@ -269,12 +395,13 @@ def test_eval_sweep_matches_eval_run_and_writes_the_folder(leaf_runs, tmp_path):
         [run_id, "", "tracker.repair_m=0.06", '{"tracker":{"repair_m":0.06}}', "", ""]]
     rec = json.loads((sweep_dir / "record.json").read_text(encoding="utf-8"))
     g_sha = hashlib.sha256(g.read_bytes()).hexdigest()
-    assert rec["extra"] == {"grid_sha256": g_sha, "ladder_sha256": None}
+    assert rec["extra"] == {"grid_sha256": g_sha, "ladder_sha256": None, "detectors": ["oracle"]}
     fps = [d["fingerprint"] for d in rec["data"]] + [d["depth_fingerprint"] for d in rec["data"]]
     assert sweep["experiment_id"] == experiment_id(config_hash=rec["config_hash"], fingerprints=fps, code=rec["code"],
                                                    seed=rec["seeds"]["seed"], extra=f"sweep:g.yaml:{g_sha[:16]}:-")
 
 
+@pytest.mark.slow
 def test_eval_sweep_marks_overridden_keys_and_is_byte_stable(leaf_runs, tmp_path, monkeypatch):
     cfg = _cfg_file(tmp_path, leaf_runs[0], "apple")
     g = _grid(tmp_path, "bases: [L1, L3]\nfactors: {lift.depth: [box_far]}\n"
@@ -303,7 +430,7 @@ def test_eval_sweep_marks_overridden_keys_and_is_byte_stable(leaf_runs, tmp_path
     rec = json.loads((d / "record.json").read_text(encoding="utf-8"))
     g_sha = hashlib.sha256(g.read_bytes()).hexdigest()
     l_sha = hashlib.sha256((ROOT / "configs" / "eval" / "sweeps" / "ladder.yaml").read_bytes()).hexdigest()
-    assert rec["extra"] == {"grid_sha256": g_sha, "ladder_sha256": l_sha}
+    assert rec["extra"] == {"grid_sha256": g_sha, "ladder_sha256": l_sha, "detectors": ["oracle"]}
     fps = [x["fingerprint"] for x in rec["data"]] + [x["depth_fingerprint"] for x in rec["data"]]
     exp_id = json.loads(first["results.json"])["experiment_id"]
     assert exp_id == experiment_id(config_hash=rec["config_hash"], fingerprints=fps, code=rec["code"],
@@ -342,10 +469,12 @@ BAD_SWEEPS = [
      "factors and product cannot be used together"),
     ("factors: {tracker.repair_m: [0.06]}\n", ["--set", "tracker.repair_m=0.05"],
      "--set tracker.repair_m overlaps the grid key tracker.repair_m"),
-    ("factors: {stages.det: [oracle_noisy]}\n", [], "stages.det=oracle_noisy is not supported in this version"),
+    ("factors: {stages.det: [oracle_noisy]}\n", [], "stages.det=oracle_noisy needs a detector.noise section"),
     ("bases: [L9]\nfactors: {tracker.repair_m: [0.06]}\n", [], "unknown rung 'L9'"),
     ("bases: [L3]\nfactors: {tracker.repair_m: [0.06]}\n", ["--set", "lift.depth=det_depth"],
      "ladder base config has lift.depth=det_depth"),
+    ("bases: [L3]\nfactors: {tracker.repair_m: [0.06]}\n", ["--set", "noise.depth_dropout=0.05"],
+     "ladder base config has noise set"),
     ("factors: {tracker.repair_m: [0.06]}\n", ["--set", "lift.depth.x=1"], "error: --set: "),
     ("combos: {0.05: {stages: {dedup: hybrid}, dedup: {band_m: 0.05}}}\n", [], "combo names must be strings"),
 ]

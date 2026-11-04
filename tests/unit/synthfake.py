@@ -3,12 +3,13 @@
 This module never imports `counting.geometry` (or any eval/detection code): it
 builds raw numbers that the modules under test then consume. `write_run` writes
 a small render bundle; `fake_cfg` and `load_splits` read the repo's eval
-configs; `python_c` runs a snippet in a fresh interpreter, for checks on import
-side effects.
+configs; `ctx_with` varies a shared prepared context; `python_c` runs a snippet
+in a fresh interpreter, for checks on import side effects.
 """
 
 from __future__ import annotations
 
+import copy
 import json
 import os
 import subprocess
@@ -26,6 +27,9 @@ from counting.config.loader import load_yaml_model
 
 ROOT = Path(__file__).resolve().parents[2]
 EVAL_CONFIGS = ROOT / "configs" / "eval"
+# `fake_cfg` settings with every detection noise factor on.
+DET_NOISE = ("stages.det=oracle_noisy", "detector.noise.miss_p=0.1", "detector.noise.fp_lambda=1.0",
+             "detector.noise.jitter_frac=0.05", "detector.noise.split_p=0.1", "detector.noise.score=uniform")
 
 
 def look_matrix(eye, forward, up=(0, 0, 1)) -> list[list[float]]:
@@ -78,6 +82,20 @@ def fake_cfg(run_dir: Path, crop: str, *sets: str) -> EvalAppConfig:
     """`configs/eval/{crop}_dev.yaml` with the `key.path=value` overrides `sets`, scoring only `run_dir`."""
     cfg = load_yaml_model(EVAL_CONFIGS / f"{crop}_dev.yaml", EvalAppConfig, overrides=sets)
     return cfg.model_copy(update={"runs": [str(run_dir)]})
+
+
+def ctx_with(ctx, **changes):
+    """A shallow copy of the prepared context `ctx` with the fields `changes` replaced; `ctx` is not edited.
+
+    The copy shares `ctx`'s read-only box depth cache, which is keyed by frame, so the
+    detection boxes must stay the same (checked when `dets` changes).
+    """
+    if "dets" in changes:
+        assert all(np.array_equal(changes["dets"][i].boxes, d.boxes) for i, d in ctx.dets.items())
+    out = copy.copy(ctx)
+    for name, value in changes.items():
+        setattr(out, name, value)
+    return out
 
 
 def load_splits() -> SplitsConfig:

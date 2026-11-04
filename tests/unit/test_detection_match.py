@@ -4,6 +4,7 @@ from pathlib import Path
 import numpy as np
 import pytest
 
+from counting.config.eval_schema import DetNoise
 from counting.data.formats.orchard_synth import FrameInput, FruitGt, GtRecord, PassKey, SceneTruth
 from counting.detection.base import Detections
 from counting.detection.oracle import OracleDetector
@@ -50,9 +51,9 @@ def test_detections_validate_shapes():
         Detections(np.zeros((2, 3), np.float32), np.ones(2, np.float32), np.zeros(2, np.int8))
 
 
-def test_oracle_noise_not_supported():
-    with pytest.raises(NotImplementedError, match="detection noise is not supported yet"):
-        OracleDetector(TRUTH, noise={"miss": 0.1})
+def test_oracle_noise_needs_a_key():
+    with pytest.raises(ValueError, match="detection noise needs an rng_key"):
+        OracleDetector(TRUTH, noise=DetNoise(miss_p=0.1))
 
 
 def test_match_oracle_gets_source_ids():

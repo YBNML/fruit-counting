@@ -3,6 +3,7 @@
 A grid file is a YAML mapping with only these keys:
 
     bases: [L1, L3]          # ladder rung or baseline names; leave out to use the config as it is
+    common: {stages: {det: oracle_noisy}, detector: {noise: {}}}   # under every point but the baseline
     factors:                 # one factor at a time: each value is one point
       lift.far_min_frac: [0.2, 0.25, 0.3]
     product:                 # a small full product; not together with factors
@@ -13,7 +14,8 @@ A grid file is a YAML mapping with only these keys:
 
 A `factors`/`product` key is a dot path whose first part is a stage setting
 section (truth, passes, stages, detector, lift, noise, tracker, dedup); a
-combo is checked by the top-level keys of its mapping.
+`common` or `combo` key is checked by the top-level keys of its mapping, which
+must equal one of those sections exactly (a nested mapping, never a dot path).
 
 Points, in order: `baseline` (no patch; the name is reserved); `factors` in
 file order and value order, named `key=<value>`; `product` by
@@ -22,7 +24,9 @@ file order and value order, named `key=<value>`; `product` by
 `<value>` is written as it is, any other value as compact sorted JSON (`0.2`,
 `null`, `true`, `{"fruit":0.015}`). A point's patch is a nested dict
 (`lift.far_min_frac` = 0.2 gives `{"lift": {"far_min_frac": 0.2}}`) built
-straight from the YAML values, never through `--set` strings.
+straight from the YAML values, never through `--set` strings. Every point but
+`baseline` carries `common` under it too (`grid.common` deep-merged with the
+point's own patch, the point's values winning).
 
 Cells: points are the outer loop and `bases` the inner one (without `bases`,
 one cell per point with base None). A cell's config is the point patch merged
@@ -38,12 +42,16 @@ not a mapping, an empty mapping included) that equal a leaf path of the
 rung's patch, are a prefix of one, or have one as a prefix, even when both
 give the same value. They are dot-joined and sorted.
 
-`run_sweep` groups cells by `_prepared_settings` (the settings `prepare`
-checks or fixes in the context, such as `passes`), in order of first
-appearance. It runs `prepare` once per group and evaluates all of the group's
-cells before the next group, so it holds one context at a time. Each cell
-keeps the Y1 summary, each pass's counts and ledger, and the Y6 mode, row,
-ledger and metrics; only the baseline point keeps the per-tree Y6 table.
+`run_sweep` groups cells, and a cell's detection noise seeds, by
+`_prepared_settings` (the settings `prepare` checks or fixes in the context,
+such as `passes` and, under `stages.det=oracle_noisy`, the detection noise
+seed), in order of first appearance. It runs `prepare` once per group and
+evaluates all of the group's cells before the next group, so it holds one
+context at a time; a pose or depth noise seed needs no separate `prepare` and
+runs on its cell's own group. Each cell keeps the Y1 summary, each pass's
+counts and ledger, and the Y6 mode, row, ledger and metrics; only the
+baseline point keeps the per-tree Y6 table. A noisy cell also keeps `noisy`,
+`seeds`, `noise`, `spread` and `per_seed`, same as a noisy ladder rung.
 """
 
 from __future__ import annotations
@@ -62,10 +70,11 @@ from counting.config.eval_schema import EvalAppConfig, SplitsConfig
 from counting.data.formats.orchard_synth import SynthRun, select_frames
 from counting.evaluation.runner import (
     _merge, _patched, _prepared_settings, _unsupported_setting, check_ladder_request, describe_run, evaluate,
-    prepare, rung_config,
+    evaluate_seeds, prepare, rung_config,
 )
+from counting.evaluation.seeds import combine_seeds
 
-_GRID_KEYS = ("bases", "factors", "product", "combos")
+_GRID_KEYS = ("bases", "common", "factors", "product", "combos")
 _STAGE_SECTIONS = ("truth", "passes", "stages", "detector", "lift", "noise", "tracker", "dedup")
 _PASS_KEYS = ("pitch", "side", "aisle", "n_frames", "U1", "G1", "e1", "ledger")
 _Y6_KEYS = ("mode", "n_landmarks", "row", "ledger", "metrics")
@@ -80,6 +89,7 @@ class Grid:
     factors: dict[str, list]
     product: dict[str, list]
     combos: dict[str, dict]
+    common: dict
 
 
 @dataclass(frozen=True)
@@ -102,6 +112,14 @@ class SweepCell:
     overridden: tuple[str, ...]
 
 
+def _check_section_keys(p: Path, label: str, patch: Mapping) -> None:
+    """Refuse a `common`/`combo` key that is not exactly one of `_STAGE_SECTIONS` (no dot paths)."""
+    for key in patch:
+        if key not in _STAGE_SECTIONS:
+            raise ValueError(f"{p}: {label} key {key!r} must be one of {', '.join(_STAGE_SECTIONS)}; "
+                             "write nested mappings, not dot paths")
+
+
 def load_grid(path: str | Path) -> Grid:
     """Read and check a grid file.
 
@@ -120,6 +138,11 @@ def load_grid(path: str | Path) -> Grid:
             raise ValueError(f"{p}: unknown grid key {key!r}; allowed: {', '.join(_GRID_KEYS)}")
     if raw.get("factors") is not None and raw.get("product") is not None:
         raise ValueError(f"{p}: factors and product cannot be used together")
+    common = raw.get("common")
+    if common is not None and not isinstance(common, dict):
+        raise ValueError(f"{p}: common needs a mapping")
+    common = common or {}
+    _check_section_keys(p, "common", common)
     sections: dict[str, dict] = {}
     for name in ("factors", "product", "combos"):
         value = raw.get(name)
@@ -144,13 +167,14 @@ def load_grid(path: str | Path) -> Grid:
             raise ValueError(f"{p}: combo names must be strings; quote the name {name!r}")
         if not isinstance(patch, dict):
             raise ValueError(f"{p}: combo {name!r} needs a mapping")
-    keys = [*sections["factors"], *sections["product"], *(k for c in sections["combos"].values() for k in c)]
+        _check_section_keys(p, f"combo {name!r}", patch)
+    keys = [*sections["factors"], *sections["product"]]
     for key in keys:
         if not isinstance(key, str) or key.split(".")[0] not in _STAGE_SECTIONS:
             raise ValueError(f"{p}: {key} is not a stage setting; grid keys start with one of "
                              f"{', '.join(_STAGE_SECTIONS)}")
     return Grid(path=p, bases=tuple(bases), factors=sections["factors"], product=sections["product"],
-                combos=sections["combos"])
+                combos=sections["combos"], common=common)
 
 
 def _value_text(value: object) -> str:
@@ -166,11 +190,16 @@ def _nested(key: str, value: object) -> dict:
 
 
 def grid_points(grid: Grid) -> list[SweepPoint]:
-    """The grid's points in order: `baseline`, then `factors` or `product`, then `combos`."""
+    """The grid's points in order: `baseline`, then `factors` or `product`, then `combos`.
+
+    `baseline`'s patch is `{}`; every other point's patch is `grid.common` deep-merged
+    with its own patch (the point's values win).
+    """
     points = [SweepPoint("baseline", {}, None, None)]
     for key, values in grid.factors.items():
         for v in values:
-            points.append(SweepPoint(f"{key}={_value_text(v)}", _nested(key, v), key, copy.deepcopy(v)))
+            points.append(SweepPoint(f"{key}={_value_text(v)}", _merge(grid.common, _nested(key, v)), key,
+                                     copy.deepcopy(v)))
     if grid.product:
         keys = list(grid.product)
         for combo in itertools.product(*grid.product.values()):
@@ -178,9 +207,9 @@ def grid_points(grid: Grid) -> list[SweepPoint]:
             for k, v in zip(keys, combo):
                 patch = _merge(patch, _nested(k, v))
             name = ",".join(f"{k}={_value_text(v)}" for k, v in zip(keys, combo))
-            points.append(SweepPoint(name, patch, None, None))
+            points.append(SweepPoint(name, _merge(grid.common, patch), None, None))
     for name, patch in grid.combos.items():
-        points.append(SweepPoint(name, copy.deepcopy(patch), None, None))
+        points.append(SweepPoint(name, _merge(grid.common, patch), None, None))
     seen: set[str] = set()
     for point in points:
         if point.name in seen:
@@ -213,12 +242,15 @@ def _rung_patch(ladder: Mapping, name: str) -> Mapping:
 def sweep_cells(cfg: EvalAppConfig, grid: Grid, ladder: Mapping | None) -> list[SweepCell]:
     """Every (point, base) cell of `grid` on `cfg`, points outer and bases inner; no bundle is opened.
 
-    With `bases`, the ladder request is checked first (`check_ladder_request`,
-    its errors as they are). A cell's config is `cfg` with the point patch and
-    then the rung patch merged in. A config error (`ValueError`, pydantic's
-    included) or an unsupported setting (`NotImplementedError`) names the grid
-    file, the point and the base.
+    With `bases`, `ladder` must be given (`ValueError` naming the grid file),
+    and the ladder request is checked next (`check_ladder_request`, its errors
+    as they are). A cell's config is `cfg` with the point patch and then the
+    rung patch merged in. A config error (`ValueError`, pydantic's included) or
+    an unsupported setting (`NotImplementedError`) names the grid file, the
+    point and the base.
     """
+    if grid.bases and ladder is None:
+        raise ValueError(f"{grid.path}: bases need a ladder")
     if grid.bases:
         check_ladder_request(cfg, ladder, grid.bases)
     cells: list[SweepCell] = []
@@ -270,42 +302,65 @@ def check_frame_selection(run: SynthRun, cells: Sequence[SweepCell]) -> None:
                       step_m=passes.step_m)
 
 
-def _kept(cell: SweepCell, res: dict) -> dict:
-    """The part of `evaluate`'s result a sweep keeps for `cell`."""
-    y1, y6 = res["y1"], res["y6"]
+def _kept_view(cell: SweepCell, y1: dict, y6: dict | None) -> dict:
+    """The `y1`/`y6` part of one evaluate result (or one of its seed views) a sweep keeps for `cell`."""
     kept_y6 = None
     if y6 is not None:
         kept_y6 = {k: y6[k] for k in _Y6_KEYS}
         if cell.point.name == "baseline":
             kept_y6["trees"] = y6["trees"]
-    return {"point": cell.point.name, "base": cell.base, "overridden": list(cell.overridden),
-            "stages": res["stages"], "lift_depth": res["lift_depth"],
-            "y1": {"summary": y1["summary"], "passes": [{k: p[k] for k in _PASS_KEYS} for p in y1["passes"]]},
+    return {"y1": {"summary": y1["summary"], "passes": [{k: p[k] for k in _PASS_KEYS} for p in y1["passes"]]},
             "y6": kept_y6}
+
+
+def _kept(cell: SweepCell, res: dict) -> dict:
+    """The part of `evaluate`'s or `evaluate_seeds`'s result a sweep keeps for `cell`.
+
+    A noisy `res` also keeps `noisy`, `seeds`, `noise`, `spread` and a `per_seed` trimmed the same way.
+    """
+    out = {"point": cell.point.name, "base": cell.base, "overridden": list(cell.overridden),
+           "stages": res["stages"], "lift_depth": res["lift_depth"], **_kept_view(cell, res["y1"], res["y6"])}
+    if res.get("noisy"):
+        out.update(noisy=True, seeds=res["seeds"], noise=res["noise"], spread=res["spread"],
+                   per_seed=[{"noise_seed": p["noise_seed"], **_kept_view(cell, p["y1"], p["y6"])}
+                             for p in res["per_seed"]])
+    return out
 
 
 def run_sweep(run: SynthRun, cells: Sequence[SweepCell], splits: SplitsConfig) -> tuple[dict, dict]:
     """Evaluate `cells` on `run`, with one `prepare` per group of cells that share `_prepared_settings`.
 
+    A cell under `stages.det=oracle_noisy` belongs to one group per noise seed;
+    pose and depth noise cells run all their seeds on their group's context.
     Returns `{"meta": describe_run(first group's context), "cells": [kept result per cell, in input order]}`
     and the seconds spent, `{"prepare": ..., "evaluate": ...}`.
     """
     check_frame_selection(run, cells)
-    groups: dict[str, list[int]] = {}
+    groups: dict[str, list[tuple[int, int | None]]] = {}
     for i, cell in enumerate(cells):
-        groups.setdefault(json.dumps(_prepared_settings(cell.cfg), sort_keys=True), []).append(i)
+        seeds = cell.cfg.noise.seeds if cell.cfg.stages.det == "oracle_noisy" else [None]
+        for s in seeds:
+            groups.setdefault(json.dumps(_prepared_settings(cell.cfg, s), sort_keys=True), []).append((i, s))
     out: list[dict | None] = [None] * len(cells)
+    det_seed_results: dict[int, dict[int, dict]] = {}
     meta = None
     t_prepare = t_evaluate = 0.0
-    for idx in groups.values():
+    for members in groups.values():
+        i0, s0 = members[0]
         t0 = time.perf_counter()
-        ctx = prepare(run, cells[idx[0]].cfg, splits)
+        ctx = prepare(run, cells[i0].cfg, splits, det_seed=s0)
         t1 = time.perf_counter()
         t_prepare += t1 - t0
         if meta is None:
             meta = describe_run(ctx)
-        for i in idx:
-            out[i] = _kept(cells[i], evaluate(ctx, cells[i].cfg))
+        for i, s in members:
+            if s is None:
+                out[i] = _kept(cells[i], evaluate_seeds(ctx, cells[i].cfg))
+            else:
+                det_seed_results.setdefault(i, {})[s] = evaluate(ctx, cells[i].cfg, noise_seed=s)
         t_evaluate += time.perf_counter() - t1
         del ctx   # one context at a time
+    for i, per_seed in det_seed_results.items():
+        cfg = cells[i].cfg
+        out[i] = _kept(cells[i], combine_seeds(cfg, [(s, per_seed[s]) for s in cfg.noise.seeds]))
     return {"meta": meta, "cells": out}, {"prepare": t_prepare, "evaluate": t_evaluate}
