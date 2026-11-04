@@ -42,6 +42,16 @@ def test_pear_dev_config_values():
     assert (cfg.tracker.gate_m, cfg.tracker.repair_m, cfg.dedup.radius_m) == (0.10, 0.09, 0.09)
 
 
+
+# Values chosen on the val bundle; val and exp configs carry them, dev configs keep the defaults.
+TUNED_ON_VAL = {
+    "apple": {"lift": {"depth": "box_far"},
+              "tracker": {"depth_gate": "soft", "repair_m": 0.08},
+              "dedup": {"radius_m": 0.08}},
+    "pear": {},
+}
+
+
 @pytest.mark.parametrize("crop", ["apple", "pear"])
 def test_val_and_exp_configs_follow_dev(crop):
     dev = load_yaml_model(EVAL / f"{crop}_dev.yaml", EvalAppConfig)
@@ -50,8 +60,11 @@ def test_val_and_exp_configs_follow_dev(crop):
         cfg = load_yaml_model(EVAL / f"{crop}_{split}.yaml", EvalAppConfig)
         (seed,) = getattr(splits, split)
         assert cfg.runs == [f"~/datasets/orchard_synth/{crop}/{split}_s{seed}"]
-        assert cfg.model_dump() == {**dev.model_dump(), "run_name": f"{crop}_{split}", "split": split, "runs": cfg.runs,
-                                    "noise": {**dev.noise.model_dump(), "seeds": [0, 1, 2]}}
+        want = {**dev.model_dump(), "run_name": f"{crop}_{split}", "split": split, "runs": cfg.runs,
+                "noise": {**dev.noise.model_dump(), "seeds": [0, 1, 2]}}
+        for section, values in TUNED_ON_VAL[crop].items():
+            want[section] = {**want[section], **values}
+        assert cfg.model_dump() == want
 
 
 def test_unknown_key_rejected():
