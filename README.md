@@ -127,3 +127,7 @@ tensorboard --logdir runs/pseco_head_v1/tensorboard
 - `datasets/fsc147/` — FSC-147 이미지 + 주석 JSON
 
 `python -c "from counting.data.download import print_sam_vit_h_instructions; print_sam_vit_h_instructions('models/PseCo/sam_vit_h.pth')"` 로 SAM 다운로드 명령을 확인할 수 있습니다.
+
+## 라이선스
+
+이 저장소의 코드는 Apache License 2.0을 따릅니다(`LICENSE`). `external/PseCo` 서브모듈과 따로 내려받는 모델 가중치(SAM, PseCo, COCO 사전 학습 가중치 등)는 각자의 라이선스와 이용 조건을 따릅니다.
