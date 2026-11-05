@@ -71,6 +71,16 @@ def test_val_and_exp_configs_follow_dev(crop):
         assert cfg.model_dump() == want
 
 
+@pytest.mark.parametrize("crop", ["apple"])
+def test_frozen_test_config_follows_val(crop):
+    val = load_yaml_model(EVAL / f"{crop}_val.yaml", EvalAppConfig)
+    splits = load_yaml_model(EVAL / "splits.yaml", SplitsConfig)
+    cfg = load_yaml_model(EVAL / "frozen" / f"{crop}_test_oracle.yaml", EvalAppConfig)
+    assert cfg.runs == [f"~/datasets/orchard_synth/{crop}/test_s{seed}" for seed in splits.test]
+    assert cfg.model_dump() == {**val.model_dump(), "run_name": f"{crop}_test_oracle", "split": "test",
+                                "tuning": False, "runs": cfg.runs}
+
+
 def test_unknown_key_rejected():
     raw = _raw()
     raw["stages"]["bogus"] = 1
@@ -176,7 +186,8 @@ def test_config_hash_generic_and_ignores_runtime_keys():
 
 
 COMMITTED_HASHES = {"apple_dev": "38b74b45e42d9213", "pear_dev": "b85d292df18d8261", "apple_val": "b26494b8830a44fa",
-                    "apple_exp": "7f6be6772929d5ed", "pear_val": "8d8d2c1d3f6b4fe4", "pear_exp": "236093486cebe266"}
+                    "apple_exp": "7f6be6772929d5ed", "pear_val": "8d8d2c1d3f6b4fe4", "pear_exp": "236093486cebe266",
+                    "frozen/apple_test_oracle": "a5d60d44aaf799f2"}
 
 
 def test_committed_config_hashes_unchanged():
