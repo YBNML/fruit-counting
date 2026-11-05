@@ -15,6 +15,13 @@ rows with the same (config hash, experiment id extra), the key a rerun warning i
 `check_test_log` refuses a log whose header is not `LOG_HEADER` (`ValueError`); the CLI runs it
 before any bundle is opened, so a log with other columns stops the run before scoring.
 
+`counting detect` on a test bundle runs `check_test_detect` before it reads any image: the
+config file sits under `configs/detect/frozen/` in the counting repository, there is no `--set`,
+the work tree is clean and committed, the config and every file option are tracked, and the
+config's `weights_sha256` equals the sha256 of `--weights`. It then runs `check_test_bundles`
+and `check_test_log`, and adds one `detect_log_row` per test bundle right after that bundle's
+cache is written (its rerun key is the config hash and `weights:<sha16>`).
+
 `eval truth` is not protected: it prints ground-truth tables only and never calls `prepare`.
 """
 
@@ -33,13 +40,15 @@ from counting.evaluation.runner import ProtectionError
 from counting.evaluation.sweep import Grid, _leaf_paths, grid_points
 
 FROZEN_DIR = ("configs", "eval", "frozen")
+DETECT_FROZEN_DIR = ("configs", "detect", "frozen")
 LOG_HEADER = ("date", "experiment_id", "kind", "config", "config_hash", "extra", "fingerprints", "commit",
               "criteria_sha256", "verdict")
 
 
 @dataclass(frozen=True)
 class ProtectedRequest:
-    """A split=test request that passed `check_test_request`.
+    """A split=test request that passed `check_test_request`, or a test-bundle detect request that
+    passed `check_test_detect`.
 
     `config_rel` is the config file's path relative to the repository (POSIX), and
     `code` the git state (`commit`, `dirty`, `diff_sha256`) the request was checked against.
@@ -132,6 +141,43 @@ def check_test_request(
     return ProtectedRequest(config_rel=config_rel, code=code)
 
 
+# The first four rules repeat those of `check_test_request` (for configs/detect/frozen/); change them together.
+def check_test_detect(
+    *, config_path: str | Path, sets: Sequence[str], files: Mapping[str, str | Path], weights_sha256: str,
+    pinned_sha256: str | None, repo: Path, code: Mapping | None = None,
+) -> ProtectedRequest:
+    """Check a `counting detect` request on a test bundle before any image is read.
+
+    Checks, in order: `config_path` sits under `configs/detect/frozen/` in `repo`; no
+    `--set` (`sets`); `code` (default: `git_state(repo)`) has a commit and is not dirty;
+    `config_path` and each `files` value (keyed by its option, such as `--splits`) is a
+    file git tracks in `repo`; and the config's `pinned_sha256` equals `weights_sha256`,
+    the sha256 of `--weights`.
+    """
+    config_rel = repo_relative(config_path, repo)
+    parts = PurePosixPath(config_rel).parts if config_rel is not None else ()
+    if len(parts) < 4 or parts[:3] != DETECT_FROZEN_DIR:
+        raise ProtectionError("counting detect on a test bundle needs a config file under configs/detect/frozen/ "
+                              f"in the counting repository, got {config_path}")
+    if sets:
+        raise ProtectionError("counting detect on a test bundle takes no --set; write every setting into the "
+                              "frozen config file")
+    code = dict(code) if code is not None else git_state(repo)
+    if code["commit"] is None or code["dirty"]:
+        raise ProtectionError("counting detect on a test bundle needs a clean, committed counting work tree; "
+                              "commit or remove local changes first")
+    tracked = tracked_files(repo)
+    for option, path in [("--config", config_path), *files.items()]:
+        if repo_relative(path, repo) not in tracked:
+            raise ProtectionError(f"counting detect on a test bundle needs {option} to be a file tracked in the "
+                                  f"counting repository, got {path}")
+    if pinned_sha256 != weights_sha256:
+        pinned = pinned_sha256[:16] if pinned_sha256 else "none"
+        raise ProtectionError("counting detect on a test bundle needs weights_sha256 in the frozen config to equal "
+                              f"the sha256 of --weights; got {pinned} and {weights_sha256[:16]}")
+    return ProtectedRequest(config_rel=config_rel, code=code)
+
+
 def check_test_bundles(bundles: Sequence[SynthRun], splits: SplitsConfig) -> None:
     """Check opened split=test bundles before `prepare`.
 
@@ -193,3 +239,18 @@ def append_log_row(path: Path, row: Mapping[str, str]) -> None:
         if new:
             w.writerow(LOG_HEADER)
         w.writerow([row[k] for k in LOG_HEADER])
+
+
+def detect_log_row(
+    *, date: str, config_rel: str, config_hash: str, weights_sha256: str, fingerprints: Sequence[str],
+    digests: Sequence[str], commit: str,
+) -> dict:
+    """A `test_log.csv` row (`LOG_HEADER` keys) for `counting detect` caches written on test bundles.
+
+    The experiment id lists each cache digest's first 16 characters, `extra` is
+    `weights:<sha16>` (the rerun key with `config_hash`), and the fingerprints are sorted;
+    a detect row has no criteria or verdict.
+    """
+    return {"date": date, "experiment_id": ";".join(d[:16] for d in digests), "kind": "detect",
+            "config": config_rel, "config_hash": config_hash, "extra": f"weights:{weights_sha256[:16]}",
+            "fingerprints": ";".join(sorted(fingerprints)), "commit": commit, "criteria_sha256": "", "verdict": ""}

@@ -116,6 +116,9 @@ _LEAF_FRAC = 0.6
 _LEAF_DZ_M = 0.30
 _SEM = {"background": 0, "leaf": 1, "branch": 2, "fruit": 3, "bag": 4, "structure": 5, "net": 6,
         "ground": 7, "drip": 8}
+# Flat colour per semantic class for fake RGB frames (write_run(images=True)).
+RGB_PALETTE = np.array([(150, 180, 215), (60, 120, 50), (100, 80, 60), (190, 40, 40), (225, 215, 180),
+                        (128, 128, 128), (200, 200, 200), (120, 100, 70), (40, 40, 40)], np.uint8)
 
 
 @dataclass(frozen=True)
@@ -268,6 +271,7 @@ def write_run(
     dim: Mapping[int, float] | None = None,
     step_param: bool = True,
     occlude: Mapping[int, Iterable[int]] | None = None,
+    images: bool = False,
 ) -> Path:
     """Write a small orchard_synth-shaped render bundle under `root` (created if needed) and return it.
 
@@ -276,7 +280,7 @@ def write_run(
     diameter or the bag width. `full_px` is the
     on-screen area of that square and `dim[id]` scales `vis_px` to fake
     occlusion. depth16/semantic hold the ground plane and the squares painted far
-    to near; RGB and instance images are not written.
+    to near; RGB and instance images (same squares, object ids) only with `images`.
 
     `occlude` paints a nearer patch into depth16 only, so geometry checks that read depth at
     fruit centres fail on such a bundle.
@@ -311,9 +315,11 @@ def write_run(
         if (side, pitch) not in grounds:              # R and camera height are fixed within a pass
             grounds[(side, pitch)] = _ground(matrix, width, height, fx)
         depth, sem = (a.copy() for a in grounds[(side, pitch)])
-        for d, _, (bx0, by0, bx1, by1), is_bag in sorted(paints, key=lambda p: (-p[0], p[1])):
+        inst = np.zeros((height, width), dtype=np.uint16)
+        for d, oid, (bx0, by0, bx1, by1), is_bag in sorted(paints, key=lambda p: (-p[0], p[1])):
             depth[by0:by1, bx0:bx1] = round(d * 1000.0)
             sem[by0:by1, bx0:bx1] = _SEM["bag"] if is_bag else _SEM["fruit"]
+            inst[by0:by1, bx0:bx1] = oid
         for r in records:
             if r["bbox"] is None or idx not in occlude.get(r["id"], ()):
                 continue
@@ -327,6 +333,9 @@ def write_run(
             region[(region == 0) | (region > leaf)] = leaf
         Image.fromarray(depth).save(root / f"{idx:06d}_depth16.png", compress_level=1)
         Image.fromarray(sem).save(root / f"{idx:06d}_semantic.png", compress_level=1)
+        if images:
+            Image.fromarray(RGB_PALETTE[sem]).save(root / f"{idx:06d}_rgb.png", compress_level=1)
+            Image.fromarray(inst).save(root / f"{idx:06d}_instances.png", compress_level=1)
         pose = {"name": f"{sc.preset}_{pitch:g}", "matrix_world": matrix, "width": width, "height": height,
                 "hfov_deg": HFOV_DEG, "side": side, "frame": frame_no}
         _write_json(root / f"{idx:06d}_frame.json",

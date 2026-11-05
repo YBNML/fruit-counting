@@ -5,6 +5,8 @@ folder; `eval sweep` scores a grid of stage-setting points (optionally crossed w
 ladder bases) and writes the same kind of experiment folder with a `sweep.csv`. A split=test
 request to these three must pass the test protection checks (`counting.evaluation.protect`)
 before any bundle is scored, and each one that writes its folder is logged in `test_log.csv`.
+`eval detmetrics` scores the detection caches of a config's bundles (AP50, precision, recall
+and the false-positive kinds) and writes a `detmetrics.json` folder; it refuses split=test.
 
 Module-level imports are `typer` and `rich` only, so importing `counting.cli` (which
 imports this module to register the `eval` sub-app) never loads torch. Everything else
@@ -494,3 +496,138 @@ def sweep(
     bundles and write the experiment folder (`sweep.csv` instead of `per_pass.csv`/`per_tree.csv`)."""
     _run_eval(config=config, run_=run_, set_=set_, splits_path=splits_path, criteria_path=criteria_path,
              kind="sweep", grid_path=grid_path, ladder_path=ladder_path)
+
+
+def _echo_detmetrics_lines(result: dict) -> None:
+    """One line per (bundle, group) at the operating threshold, then `verdict <OK>/<rows>` when judged."""
+    def num(x) -> str:
+        return "-" if x is None else f"{x:.3f}"
+
+    t_hi = result["thresholds"]["operating"]
+    for entry in result["runs"]:
+        for name, g in entry["groups"].items():
+            op = g["at"]["operating"]
+            typer.echo(f"{entry['meta']['run_id']} {name}: AP50 {num(g['ap50'])} | at {t_hi:g}: "
+                       f"P {num(op['precision'])} R {num(op['recall'])} F1 {num(op['f1'])} "
+                       f"FP/frame {num(op['fp_per_frame'])} (dup {op['fp_dup']}, merge {op['fp_merge']}, "
+                       f"part {op['fp_part']}, ign {op['fp_ign']}, bg {op['fp_bg']}) split {num(op['split_rate'])}")
+    verdicts = result["verdicts"]
+    if verdicts:
+        typer.echo(f"verdict {sum(1 for v in verdicts if v['ok'])}/{len(verdicts)}")
+
+
+@eval_app.command("detmetrics")
+def detmetrics_cmd(
+    config: str = typer.Option(..., "--config", help="Eval config YAML (crop, split, passes, lift, tracker)"),
+    cache_dir: str = typer.Option(..., "--cache", help="Folder of detection caches, one <run_id>.npz per bundle"),
+    run_: list[str] = typer.Option(None, "--run", help="Override cfg.runs with these bundle paths"),
+    set_: list[str] = typer.Option(None, "--set", help="Dot-path override: key.path=value", show_default=False),
+    splits_path: str = typer.Option(
+        "configs/eval/splits.yaml", "--splits", help="Splits YAML (each bundle's seed must be in the config split)"
+    ),
+    criteria_path: str = typer.Option(
+        "configs/eval/criteria.yaml", "--criteria", help="Criteria YAML for the val verdicts; ignored if missing"
+    ),
+    nms_iou: float = typer.Option(0.5, "--nms-iou", help="Class-agnostic NMS IoU applied to the cached boxes"),
+    edge_snap_px: float = typer.Option(2.0, "--edge-snap-px", help="Snap box sides this close to the border onto it"),
+    out: str = typer.Option("runs/detmetrics", "--out", help="Output root; writes <out>/<run_name>/<experiment_id>/"),
+) -> None:
+    """Score the detection caches of the config's bundles and write the detmetrics folder.
+
+    Exit code 0 is success (including a reproduced rerun), 1 is a check failure (split=test,
+    a bundle seed outside the config split, failed reproducibility), 2 is an input error
+    (crop mismatch, a missing or mismatched cache, a bad `--set`). split=test is refused
+    before any bundle is opened; the bundles are scored in (fingerprint, run_id) order.
+    """
+    import time
+    from datetime import datetime, timezone
+    from pathlib import Path
+
+    from counting.config.eval_schema import EvalAppConfig, SplitsConfig
+    from counting.config.hashing import config_hash
+    from counting.config.loader import load_yaml_model
+    from counting.data.formats.orchard_synth import SynthRun
+    from counting.detection.cached import CachedDetector, cache_path, file_sha256
+    from counting.evaluation.detmetrics import (
+        DETMETRICS_SCHEMA, detection_verdicts, score_runs, write_detmetrics,
+    )
+    from counting.evaluation.record import build_record, experiment_id, git_state
+    from counting.evaluation.report import ReproducibilityError
+    from counting.evaluation.runner import CheckFailed, ProtectionError
+
+    try:
+        try:
+            cfg = load_yaml_model(config, EvalAppConfig, overrides=set_)
+        except KeyError as e:  # a --set path that cannot be descended
+            raise ValueError(f"--set: {e.args[0]}") from e
+        if run_:
+            cfg = cfg.model_copy(update={"runs": list(run_)})
+        if cfg.split == "test":
+            raise ProtectionError("detection metrics are not computed on split=test; "
+                                  "detection quality is judged on val")
+        splits_cfg = load_yaml_model(splits_path, SplitsConfig)
+        criteria, criteria_sha256 = _load_criteria(criteria_path)
+
+        started = datetime.now(timezone.utc).isoformat()
+        t0 = time.perf_counter()
+        caches_root = Path(cache_dir).expanduser()
+        bundles = [SynthRun.open(run_path) for run_path in cfg.runs]
+        for bundle in bundles:
+            meta, root = bundle.meta, bundle.root
+            if meta.crop != cfg.crop:
+                raise ValueError(f"{root}: crop mismatch: run is {meta.crop}, config is {cfg.crop}")
+            actual = splits_cfg.split_of(meta.seed) or "none"
+            if actual != cfg.split:
+                raise CheckFailed(f"{root}: seed {meta.seed} belongs to split {actual}, config split is {cfg.split}")
+            path = cache_path(caches_root, meta.run_id)
+            if not path.is_file():
+                raise FileNotFoundError(f"{path}: no detection cache for this bundle")
+        bundles.sort(key=lambda b: (b.meta.fingerprint, b.meta.run_id))
+        caches = [CachedDetector(cache_path(caches_root, b.meta.run_id), fingerprint=b.meta.fingerprint,
+                                 nms_iou=nms_iou, edge_snap_px=edge_snap_px) for b in bundles]
+        t1 = time.perf_counter()
+        scored = score_runs(bundles, caches, cfg)
+        t2 = time.perf_counter()
+        finished = datetime.now(timezone.utc).isoformat()
+        verdicts = detection_verdicts(scored["pooled"]["groups"], criteria, cfg.crop, cfg.split)
+
+        code = git_state()
+        fingerprints = [b.meta.fingerprint for b in bundles]
+        fingerprints += [entry["meta"]["depth_fingerprint"] for entry in scored["runs"]]
+        fingerprints += [c.digest for c in caches]
+        criteria_part = criteria_sha256[:16] if criteria_sha256 else "-"
+        exp_id = experiment_id(config_hash=config_hash(cfg), fingerprints=fingerprints, code=code, seed=cfg.seed,
+                               extra=f"detmetrics:nms{nms_iou:g}:snap{edge_snap_px:g}:criteria:{criteria_part}")
+        result = {"schema_version": DETMETRICS_SCHEMA, "kind": "detmetrics", "experiment_id": exp_id,
+                  "run_name": cfg.run_name, "crop": cfg.crop, "split": cfg.split,
+                  "thresholds": {"operating": cfg.tracker.score_hi, "low": cfg.tracker.score_lo},
+                  "postprocess": {"nms_iou": nms_iou, "edge_snap_px": edge_snap_px},
+                  "runs": scored["runs"], "pooled": scored["pooled"], "verdicts": verdicts}
+
+        weights = [c.meta.get("weights_sha256") for c in caches]
+        cache_rows = [{"run_id": b.meta.run_id, "file": c.path.name, "digest": c.digest,
+                       "weights_sha256": c.meta.get("weights_sha256")} for b, c in zip(bundles, caches)]
+        record = build_record(cfg=cfg, runs=[entry["meta"] for entry in scored["runs"]], code=code,
+                              timings={"prepare": round(t1 - t0, 3), "evaluate": round(t2 - t1, 3)},
+                              started=started, finished=finished,
+                              extra={"caches": cache_rows, "nms_iou": nms_iou, "edge_snap_px": edge_snap_px,
+                                     "criteria_sha256": criteria_sha256,
+                                     "splits_sha256": file_sha256(Path(splits_path).expanduser())})
+        record["detector"] = {"name": "cached", "noise": None,
+                              "weights_sha256": weights[0] if all(w == weights[0] for w in weights) else None,
+                              "cache_sha256": caches[0].digest if len(caches) == 1 else None, "pretrained": None}
+        folder, reproduced = write_detmetrics(Path(out).expanduser(), cfg=cfg, result=result, record=record)
+    except ReproducibilityError as e:
+        typer.echo(f"reproducibility FAILED {e}")
+        raise typer.Exit(code=1)
+    except CheckFailed as e:
+        typer.echo(f"error: {e}")
+        raise typer.Exit(code=1)
+    except (ValueError, FileNotFoundError) as e:
+        typer.echo(f"error: {e}")
+        raise typer.Exit(code=2)
+
+    typer.echo(str(folder))
+    if reproduced:
+        typer.echo("reproduced (same detmetrics.json)")
+    _echo_detmetrics_lines(result)

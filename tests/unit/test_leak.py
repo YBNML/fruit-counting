@@ -109,7 +109,8 @@ def test_eval_modules_do_not_import_torch():
             "counting.evaluation.sweep", "counting.tracking.landmark", "counting.multiview.dedup",
             "counting.multiview.lift", "counting.detection.oracle", "counting.data.formats.orchard_synth",
             "counting.geometry.noise", "counting.evaluation.seeds", "counting.evaluation.protect",
-            "counting.evaluation.verdict"]
+            "counting.evaluation.verdict", "counting.config.det_schema", "counting.training.detector",
+            "counting.detection.cached", "counting.evaluation.detmetrics", "counting.detection.frcnn"]
     code = "import importlib, sys\n" + "".join(f"importlib.import_module({m!r})\n" for m in mods) + \
            "print('torch' in sys.modules)"
     out = python_c(code)

@@ -1,0 +1,20 @@
+# Inference settings of the trained detector; scores >= model.score_min are cached raw, before class-agnostic NMS.
+device: cuda
+output_dir: runs/detect
+weights_sha256: null
+model:
+  arch: fasterrcnn_resnet50_fpn_v2
+  anchor_sizes: [16, 32, 64, 128, 256]
+  aspect_ratios: [0.5, 1.0, 2.0]
+  train_size: 1024
+  infer_min_size: 1080
+  infer_max_size: 1920
+  max_dets: 1000
+  score_min: 0.05
+  rpn_pre_nms_train: 2000
+  rpn_post_nms_train: 2000
+  rpn_pre_nms_test: 2000
+  rpn_post_nms_test: 2000
+  box_batch_per_image: 512
+  trainable_backbone_layers: 3
+  freeze_backbone_bn: true

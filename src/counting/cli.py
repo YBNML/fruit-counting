@@ -242,6 +242,195 @@ from counting.evaluation.cli import eval_app  # noqa: E402
 app.add_typer(eval_app, name="eval")
 
 
+@_train_app.command("detector")
+def train_detector_cli(
+    config: str = typer.Option(..., "--config", "-c", help="Detector training YAML"),
+    set_: list[str] = typer.Option(None, "--set", help="Dot-path override: key.path=value", show_default=False),
+    splits_path: str = typer.Option(
+        "configs/eval/splits.yaml", "--splits", help="Splits YAML (every training bundle must be a train seed)"
+    ),
+    max_iters: int = typer.Option(None, "--max-iters", min=1, help="Stop after this many steps"),
+    densest_first: bool = typer.Option(
+        False, "--densest-first", help="Benchmark: one epoch of the views with the most boxes (needs --max-iters)"
+    ),
+    resume: str = typer.Option(None, "--resume", help="A training folder to continue from its last epoch"),
+) -> None:
+    """Train the Faster R-CNN detector on the synthetic train bundles.
+
+    Exit code 0 is success, 1 is a check failure (a bundle outside the train split, a run
+    folder that is finished, unfinished or not resumable by this request, a non-finite loss,
+    out of GPU memory), 2 is an input error (missing bundle, bad config or `--set`, bad options).
+    """
+    from pathlib import Path
+
+    from counting.config.det_schema import DetTrainConfig
+    from counting.config.eval_schema import SplitsConfig
+    from counting.config.loader import load_yaml_model
+    from counting.detection.cached import file_sha256
+    from counting.evaluation.runner import CheckFailed
+    from counting.training.detector import train_detector
+
+    try:
+        try:
+            cfg = load_yaml_model(config, DetTrainConfig, overrides=set_)
+        except KeyError as e:  # a --set path that cannot be descended
+            raise ValueError(f"--set: {e.args[0]}") from e
+        splits = load_yaml_model(splits_path, SplitsConfig)
+        result = train_detector(cfg, splits, max_iters=max_iters, densest_first=densest_first,
+                                resume=Path(resume) if resume else None,
+                                splits_sha256=file_sha256(Path(splits_path).expanduser()), echo=typer.echo)
+    except CheckFailed as e:
+        typer.echo(f"error: {e}")
+        raise typer.Exit(code=1)
+    except (ValueError, FileNotFoundError) as e:
+        typer.echo(f"error: {e}")
+        raise typer.Exit(code=2)
+
+    def mib(x: float | None) -> str:
+        return "-" if x is None else f"{x:.0f}"
+
+    sec = "-" if result.sec_per_iter is None else f"{result.sec_per_iter:.3f}"
+    typer.echo(f"weights {result.weights_sha256}")
+    typer.echo(f"steps {result.steps}, {sec} s/iter, max memory {mib(result.max_memory_mb)} MiB, "
+               f"reserved {mib(result.max_reserved_mb)} MiB")
+
+
+@app.command()
+def detect(
+    config: str = typer.Option(..., "--config", help="Detector inference YAML"),
+    weights: str = typer.Option(..., "--weights", help="Trained weights; its training config.yaml sits next to it"),
+    run_: list[str] = typer.Option(..., "--run", help="A bundle to run the detector on (repeat for more)"),
+    set_: list[str] = typer.Option(None, "--set", help="Dot-path override: key.path=value", show_default=False),
+    splits_path: str = typer.Option(
+        "configs/eval/splits.yaml", "--splits", help="Splits YAML (every bundle's seed must be in a split)"
+    ),
+) -> None:
+    """Run the trained detector over bundles and write one detection cache per bundle.
+
+    Each cache goes to `<output_dir>/<weights sha256[:16]>/<run_id>.npz`, with a `.json` summary
+    next to it, and is written once: an existing cache stops the command before the model loads.
+    Test bundles need a frozen, committed config that pins the weights' sha256 and no `--set`;
+    each test bundle's cache adds a row to `<output_dir>/test_log.csv` as soon as it is written.
+
+    Exit code 0 is success, 1 is a check failure (a seed in no split, weights trained with other
+    model settings or not the ones the config pins, a test-bundle protection check, an existing
+    cache), 2 is an input error (missing weights, training config, bundle or RGB image, a bad
+    config or `--set`, weights that do not fit the model).
+    """
+    import json
+    from datetime import datetime, timezone
+    from pathlib import Path
+
+    from counting.config.det_schema import DetInferConfig, DetTrainConfig, model_mismatch
+    from counting.config.eval_schema import SplitsConfig
+    from counting.config.hashing import config_hash
+    from counting.config.loader import load_yaml_model
+    from counting.data.formats.orchard_synth import SynthRun
+    from counting.detection import frcnn
+    from counting.detection.cached import cache_path, detect_to_cache, file_sha256, rgb_fingerprint
+    from counting.evaluation.protect import (
+        append_log_row, check_test_bundles, check_test_detect, check_test_log, detect_log_row, earlier_log_runs,
+    )
+    from counting.evaluation.record import counting_repo, git_state
+    from counting.evaluation.runner import CheckFailed
+    from counting.training.detector import train_config_hash
+
+    try:
+        try:
+            cfg = load_yaml_model(config, DetInferConfig, overrides=set_)
+        except KeyError as e:  # a --set path that cannot be descended
+            raise ValueError(f"--set: {e.args[0]}") from e
+        splits = load_yaml_model(splits_path, SplitsConfig)
+
+        w_path = Path(weights).expanduser()
+        if not w_path.is_file():
+            raise FileNotFoundError(f"{weights}: no weights file")
+        w_sha = file_sha256(w_path)
+
+        train_dir = w_path.absolute().parent
+        train_path = train_dir / "config.yaml"
+        if not train_path.is_file():
+            raise FileNotFoundError(f"{train_path}: no training config next to the weights")
+        train_cfg = load_yaml_model(train_path, DetTrainConfig)
+        keys = model_mismatch(train_cfg.model, cfg.model)
+        if keys:
+            raise CheckFailed(f"{train_path}: the weights were trained with other model settings: {', '.join(keys)}")
+        pretrained = None
+        record_path = train_dir / "record.json"
+        if record_path.is_file():
+            try:
+                pretrained = json.loads(record_path.read_text(encoding="utf-8")).get("pretrained")
+            except (ValueError, AttributeError) as e:
+                raise ValueError(f"{record_path}: not a readable training record ({e})") from None
+
+        bundles = [SynthRun.open(path) for path in run_]
+        for bundle in bundles:
+            if splits.split_of(bundle.meta.seed) is None:
+                raise CheckFailed(f"{bundle.root}: seed {bundle.meta.seed} is in no split")
+        bundles.sort(key=lambda b: (b.meta.fingerprint, b.meta.run_id))
+
+        out_root = Path(cfg.output_dir).expanduser()
+        log = out_root / "test_log.csv"
+        chash = config_hash(cfg)
+        protected, earlier = None, 0
+        if any(splits.split_of(b.meta.seed) == "test" for b in bundles):
+            protected = check_test_detect(config_path=config, sets=set_ or [], files={"--splits": splits_path},
+                                          weights_sha256=w_sha, pinned_sha256=cfg.weights_sha256,
+                                          repo=counting_repo())
+            check_test_bundles(bundles, splits)
+            check_test_log(log)
+            earlier = earlier_log_runs(log, config_hash=chash, extra=f"weights:{w_sha[:16]}")
+        elif cfg.weights_sha256 is not None and cfg.weights_sha256 != w_sha:
+            raise CheckFailed(f"--weights {weights} has sha256 {w_sha[:16]}, but the config pins weights_sha256 "
+                              f"{cfg.weights_sha256[:16]}")
+        code = protected.code if protected is not None else git_state()
+
+        paths = [cache_path(out_root / w_sha[:16], b.meta.run_id) for b in bundles]
+        for path in paths:
+            for p in (path, path.with_suffix(".json")):
+                if p.exists():
+                    raise CheckFailed(f"{p}: cache exists; a cache is written once per weights, so remove it first "
+                                      "to make it again")
+        rgb_shas = [rgb_fingerprint(b.frames) for b in bundles]
+
+        detector = frcnn.load_detector(w_path, cfg.model, device=cfg.device)
+        import torch
+        import torchvision
+
+        common = {"weights_sha256": w_sha, "train_id": train_dir.name,
+                  "train_config_hash": train_config_hash(train_cfg), "pretrained": pretrained,
+                  "score_min": cfg.model.score_min, "max_dets": cfg.model.max_dets,
+                  "model": cfg.model.model_dump(), "torch": str(torch.__version__),
+                  "torchvision": str(torchvision.__version__), "cuda": torch.version.cuda, "device": cfg.device,
+                  "counting_commit": code["commit"], "counting_dirty": code["dirty"],
+                  "splits_sha256": file_sha256(Path(splits_path).expanduser())}
+        started = datetime.now(timezone.utc).isoformat()
+        if earlier > 0:
+            typer.echo(f"warning: test_log.csv already lists {earlier} test detect row(s) of config {chash} with "
+                       "these weights; this run adds one row per bundle")
+        for bundle, rgb_sha, path in zip(bundles, rgb_shas, paths):
+            m, cam = bundle.meta, bundle.frames[0].camera
+            meta = {"run_id": m.run_id, "fingerprint": m.fingerprint, "rgb_sha256": rgb_sha, **common,
+                    "image_size": [cam.width, cam.height]}
+            summary = detect_to_cache(bundle.frames, detector, path, meta=meta, max_dets=cfg.model.max_dets)
+            if protected is not None:
+                append_log_row(log, detect_log_row(date=started, config_rel=protected.config_rel, config_hash=chash,
+                                                   weights_sha256=w_sha, fingerprints=[m.fingerprint],
+                                                   digests=[summary["digest"]], commit=code["commit"]))
+            typer.echo(str(path))
+            typer.echo(f"{m.run_id}: frames {summary['n_frames']}, detections {summary['n_dets']}, "
+                       f"digest {summary['digest'][:16]}, {summary['seconds']:.1f} s")
+            if summary["saturated"]:
+                typer.echo(f"warning: {m.run_id}: {len(summary['saturated'])} frame(s) reached "
+                           f"max_dets={cfg.model.max_dets}; detections past the cap are not in the cache")
+    except (CheckFailed, FileExistsError) as e:
+        typer.echo(f"error: {e}")
+        raise typer.Exit(code=1)
+    except (ValueError, FileNotFoundError) as e:
+        typer.echo(f"error: {e}")
+        raise typer.Exit(code=2)
+
+
 @_train_app.command("pseco-head")
 def train_pseco_head_cli(
     config: str = typer.Option(..., "--config", "-c"),
