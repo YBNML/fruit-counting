@@ -331,20 +331,53 @@ def test_eval_sweep_detection_noise_on_L3_writes_seed_rows(leaf_runs, tmp_path):
     assert rec["detector"]["name"] == "oracle" and rec["extra"]["detectors"] == ["oracle", "oracle_noisy"]
 
 
+# The byte-stability sweeps on the clean leaf bundle: (grid text, extra eval sweep options).
+# The noisy one scores every third frame (passes.step_m=0.45); its check is byte equality only.
+HASH_SEED_SWEEPS = {
+    "marks": ("bases: [L1, L3]\nfactors: {lift.depth: [box_far]}\n"
+              "combos:\n  both: {stages: {dedup: self_side}, lift: {depth: box_far}}\n", ["--criteria", CRIT]),
+    "noisy": ("bases: [L3]\nfactors: {noise.pose_trans_sigma_m: [0.02]}\n"
+              "combos:\n  det: {stages: {det: oracle_noisy}, detector: {noise: {miss_p: 0.1, fp_lambda: 1.0}}}\n",
+              ["--set", "noise.seeds=[0,1]", "--set", "passes.step_m=0.45"]),
+}
+
+
+def _hash_seed_args(tmp_path, root, name):
+    """`eval sweep` arguments for `HASH_SEED_SWEEPS[name]` on bundle `root`, with cfg.yaml and g.yaml in `tmp_path`."""
+    grid, extra = HASH_SEED_SWEEPS[name]
+    return ["sweep", "--config", _cfg_file(tmp_path, root, "apple"), "--grid", str(_grid(tmp_path, grid)),
+            "--splits", SPLITS, *extra]
+
+
+@pytest.fixture(scope="module")
+def fresh_sweeps(leaf_runs, tmp_path_factory):
+    """{name: output folder}: every `HASH_SEED_SWEEPS` sweep, run one after another in a single fresh
+    interpreter with another hash seed (PYTHONHASHSEED=1)."""
+    root = tmp_path_factory.mktemp("fresh_sweeps")
+    cmds, outs = [], {}
+    for name in HASH_SEED_SWEEPS:
+        (root / name).mkdir()
+        outs[name] = root / name / "out2"
+        cmds.append([*_hash_seed_args(root / name, leaf_runs[0], name), "--set", f"output_dir={outs[name]}"])
+    code = ("from counting.evaluation.cli import eval_app\n"
+            f"for args in {cmds!r}:\n"
+            "    try:\n"
+            "        eval_app(args)\n"
+            "    except SystemExit as e:\n"
+            "        assert e.code in (0, None), (args, e.code)\n")
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setenv("PYTHONHASHSEED", "1")
+        python_c(code)
+    return outs
+
+
 @pytest.mark.slow
-def test_noisy_sweep_bytes_stable_across_hash_seeds(leaf_runs, tmp_path, monkeypatch):
-    cfg = _cfg_file(tmp_path, leaf_runs[0], "apple")
-    g = _grid(tmp_path, "bases: [L3]\nfactors: {noise.pose_trans_sigma_m: [0.02]}\n"
-                        "combos:\n  det: {stages: {det: oracle_noisy}, detector: {noise: {miss_p: 0.1, fp_lambda: 1.0}}}\n")
-    args = ["sweep", "--config", cfg, "--grid", str(g), "--splits", SPLITS, "--set", "noise.seeds=[0,1]"]
-    r = runner.invoke(eval_app, args)
+def test_noisy_sweep_bytes_stable_across_hash_seeds(leaf_runs, fresh_sweeps, tmp_path):
+    r = runner.invoke(eval_app, _hash_seed_args(tmp_path, leaf_runs[0], "noisy"))
     assert r.exit_code == 0, r.output
     (d,) = (tmp_path / "out" / "apple_dev").iterdir()
     first = {n: (d / n).read_bytes() for n in ("results.json", "sweep.csv")}
-    monkeypatch.setenv("PYTHONHASHSEED", "1")                # a fresh interpreter with another hash seed
-    out2 = tmp_path / "out2"
-    python_c(f"from counting.evaluation.cli import eval_app; eval_app({[*args, '--set', f'output_dir={out2}']!r})")
-    assert {n: (out2 / "apple_dev" / d.name / n).read_bytes() for n in first} == first
+    assert {n: (fresh_sweeps["noisy"] / "apple_dev" / d.name / n).read_bytes() for n in first} == first
 
 
 def test_run_sweep_checks_frame_selection_before_any_prepare(leaf_runs, tmp_path, monkeypatch):
@@ -377,7 +410,7 @@ def test_eval_sweep_matches_eval_run_and_writes_the_folder(leaf_runs, tmp_path):
     assert sorted(runs) == [0.04, 0.06]
     assert sorted(p.name for p in sweep_dir.iterdir()) == ["config.yaml", "record.json", "report.md", "results.json",
                                                          "sweep.csv"]
-    assert sweep["schema_version"] == 4 and sweep["sweep"] == {"grid": "g.yaml", "bases": [], "points": [
+    assert sweep["schema_version"] == 5 and sweep["sweep"] == {"grid": "g.yaml", "bases": [], "points": [
         {"name": "baseline", "patch": {}, "factor": None, "value": None},
         {"name": "tracker.repair_m=0.06", "patch": {"tracker": {"repair_m": 0.06}}, "factor": "tracker.repair_m",
          "value": 0.06}]}
@@ -395,18 +428,19 @@ def test_eval_sweep_matches_eval_run_and_writes_the_folder(leaf_runs, tmp_path):
         [run_id, "", "tracker.repair_m=0.06", '{"tracker":{"repair_m":0.06}}', "", ""]]
     rec = json.loads((sweep_dir / "record.json").read_text(encoding="utf-8"))
     g_sha = hashlib.sha256(g.read_bytes()).hexdigest()
-    assert rec["extra"] == {"grid_sha256": g_sha, "ladder_sha256": None, "detectors": ["oracle"]}
+    c_sha = hashlib.sha256((ROOT / "configs" / "eval" / "criteria.yaml").read_bytes()).hexdigest()
+    assert rec["extra"] == {"grid_sha256": g_sha, "ladder_sha256": None, "detectors": ["oracle"], "criteria_sha256": c_sha}
     fps = [d["fingerprint"] for d in rec["data"]] + [d["depth_fingerprint"] for d in rec["data"]]
     assert sweep["experiment_id"] == experiment_id(config_hash=rec["config_hash"], fingerprints=fps, code=rec["code"],
-                                                   seed=rec["seeds"]["seed"], extra=f"sweep:g.yaml:{g_sha[:16]}:-")
+                                                   seed=rec["seeds"]["seed"],
+                                                   extra=f"sweep:g.yaml:{g_sha[:16]}:-:criteria:{c_sha[:16]}")
+    assert sweep["pooled"] is None and sweep["verdicts"] is None
 
 
 @pytest.mark.slow
-def test_eval_sweep_marks_overridden_keys_and_is_byte_stable(leaf_runs, tmp_path, monkeypatch):
-    cfg = _cfg_file(tmp_path, leaf_runs[0], "apple")
-    g = _grid(tmp_path, "bases: [L1, L3]\nfactors: {lift.depth: [box_far]}\n"
-                        "combos:\n  both: {stages: {dedup: self_side}, lift: {depth: box_far}}\n")
-    args = ["sweep", "--config", cfg, "--grid", str(g), "--splits", SPLITS, "--criteria", CRIT]
+def test_eval_sweep_marks_overridden_keys_and_is_byte_stable(leaf_runs, fresh_sweeps, tmp_path):
+    args = _hash_seed_args(tmp_path, leaf_runs[0], "marks")
+    g = tmp_path / "g.yaml"
     r1 = runner.invoke(eval_app, args)
     assert r1.exit_code == 0, r1.output
     assert "baseline @ L3: row U=21 G6=12 e_pipe=+75.0%" in r1.output
@@ -415,11 +449,7 @@ def test_eval_sweep_marks_overridden_keys_and_is_byte_stable(leaf_runs, tmp_path
     r2 = runner.invoke(eval_app, args)
     assert r2.exit_code == 0 and "reproduced (same results.json)" in r2.output, r2.output
     assert {n: (d / n).read_bytes() for n in first} == first
-    monkeypatch.setenv("PYTHONHASHSEED", "1")              # a fresh interpreter with another hash seed
-    out2 = tmp_path / "out2"
-    cmd = [*args, "--set", f"output_dir={out2}"]
-    python_c(f"from counting.evaluation.cli import eval_app; eval_app({cmd!r})")
-    assert {n: (out2 / "apple_dev" / d.name / n).read_bytes() for n in first} == first
+    assert {n: (fresh_sweeps["marks"] / "apple_dev" / d.name / n).read_bytes() for n in first} == first
     rows = [row for row in csv.reader(first["sweep.csv"].decode("utf-8").splitlines()[1:])]
     assert [(row[1], row[2], row[4], row[6], row[7]) for row in rows] == [
         ("L1", "baseline", "", "det_depth", "oracle"), ("L3", "baseline", "", "box_median", "merge"),
@@ -430,11 +460,14 @@ def test_eval_sweep_marks_overridden_keys_and_is_byte_stable(leaf_runs, tmp_path
     rec = json.loads((d / "record.json").read_text(encoding="utf-8"))
     g_sha = hashlib.sha256(g.read_bytes()).hexdigest()
     l_sha = hashlib.sha256((ROOT / "configs" / "eval" / "sweeps" / "ladder.yaml").read_bytes()).hexdigest()
-    assert rec["extra"] == {"grid_sha256": g_sha, "ladder_sha256": l_sha, "detectors": ["oracle"]}
+    c_sha = hashlib.sha256(Path(CRIT).read_bytes()).hexdigest()
+    assert rec["extra"] == {"grid_sha256": g_sha, "ladder_sha256": l_sha, "detectors": ["oracle"],
+                            "criteria_sha256": c_sha}
     fps = [x["fingerprint"] for x in rec["data"]] + [x["depth_fingerprint"] for x in rec["data"]]
     exp_id = json.loads(first["results.json"])["experiment_id"]
     assert exp_id == experiment_id(config_hash=rec["config_hash"], fingerprints=fps, code=rec["code"],
-                                   seed=rec["seeds"]["seed"], extra=f"sweep:g.yaml:{g_sha[:16]}:{l_sha[:16]}")
+                                   seed=rec["seeds"]["seed"],
+                                   extra=f"sweep:g.yaml:{g_sha[:16]}:{l_sha[:16]}:criteria:{c_sha[:16]}")
     lines = (d / "report.md").read_text(encoding="utf-8").splitlines()
     assert "**sweep** — g.yaml: 점 3개 × 칸 2개" in lines
     assert "| 점 | 칸 | 덮인 키 | e1 중앙값 | e1 최대 | U | G6 | e_pipe | 그루 MAE÷평균 | 기준 |" in lines

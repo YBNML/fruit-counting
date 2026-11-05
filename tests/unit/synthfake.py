@@ -30,6 +30,8 @@ EVAL_CONFIGS = ROOT / "configs" / "eval"
 # `fake_cfg` settings with every detection noise factor on.
 DET_NOISE = ("stages.det=oracle_noisy", "detector.noise.miss_p=0.1", "detector.noise.fp_lambda=1.0",
              "detector.noise.jitter_frac=0.05", "detector.noise.split_p=0.1", "detector.noise.score=uniform")
+# The orchard_synth.commit sidecar of the test-seed fake bundle (heldout_run).
+SIDECAR_COMMIT = "c" * 40
 
 
 def look_matrix(eye, forward, up=(0, 0, 1)) -> list[list[float]]:

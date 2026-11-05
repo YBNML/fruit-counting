@@ -5,19 +5,21 @@ from pathlib import Path
 import numpy as np
 import pytest
 import yaml
-from PIL import Image
 
 import counting.evaluation.runner as runner_module
+import counting.evaluation.sweep as sweep_module
 from counting.config.eval_schema import LiftConfig
 from counting.data.formats.orchard_synth import PassKey, SynthRun
 from counting.evaluation.ledger import Ledger
 from counting.evaluation.oracle_stages import oracle_dedup
 from counting.evaluation.report import SCHEMA_VERSION, criteria_rows, render_report
 from counting.evaluation.runner import (
-    depth_error_stats, describe_run, evaluate, evaluate_seeds, load_ladder, prepare, rung_config, run_ladder,
+    CheckFailed, ProtectionError, depth_error_stats, describe_run, evaluate, evaluate_seeds, load_ladder, prepare,
+    rung_config, run_config, run_ladder,
 )
+from counting.evaluation.sweep import SweepCell, SweepPoint, run_sweep
 from counting.tracking.landmark import PassTracks
-from tests.unit.synthfake import ctx_with, fake_cfg, load_splits, write_run
+from tests.unit.synthfake import DET_NOISE, ctx_with, fake_cfg, load_splits, write_run
 
 ROOT = Path(__file__).resolve().parents[2]
 LADDER = load_ladder(ROOT / "configs" / "eval" / "sweeps" / "ladder.yaml")
@@ -110,7 +112,7 @@ def test_oracle_dedup_leaves_no_cross_pass_dup(apple_run, pear_run, ctx_of, appl
         names = [n for n in (*LADDER["rungs"], *LADDER["baselines"])
                  if rung_config(cfg, LADDER, n).stages.dedup == "oracle"]
         assert names == ["L0", "L1", "last_box"]
-        for name in names:   # apple: the session ladder evaluated these rungs on ctx_of["apple"]
+        for name in names:   # apple: the session ladder evaluated these rungs on apple_ladder_ctx
             res = apple_ladder["rungs"][name] if crop == "apple" else evaluate(ctx, rung_config(cfg, LADDER, name))
             y6 = res["y6"]
             for L in [y6["ledger"], y6["ledger_any"]] + [t["ledger"] for t in y6["trees"]]:
@@ -226,13 +228,43 @@ def test_wrong_crop_refused(apple_run):
         prepare(SynthRun.open(apple_run), fake_cfg(apple_run, "pear"), load_splits())
 
 
-def test_split_seed_checks(apple_run, tmp_path):
+def test_split_seed_checks(apple_run, heldout_run):
     with pytest.raises(ValueError, match="belongs to split"):
         _ctx(apple_run, "apple", "split=val")
-    with pytest.raises(ValueError, match="blocked until test protection"):
-        _ctx(apple_run, "apple", "split=test", "tuning=false")
-    with pytest.raises(ValueError, match="belongs to split"):
-        _ctx(write_run(tmp_path, crop="apple", pitches=(30.0,), seed=1000), "apple")
+    with pytest.raises(ProtectionError, match=re.escape("split=test needs prepare(..., allow_test=True)")):
+        _ctx(heldout_run, "apple", "split=test", "tuning=false")
+    with pytest.raises(CheckFailed, match="seed 1000 belongs to split test, config split is dev"):
+        _ctx(heldout_run, "apple")
+
+
+def test_library_calls_refuse_split_test_unless_allowed(apple_run, heldout_run, monkeypatch):
+    cfg = fake_cfg(heldout_run, "apple", "split=test", "tuning=false", "stop_after=y1")
+    cell = SweepCell(point=SweepPoint("baseline", {}, None, None), base=None, cfg=cfg, overridden=())
+    for call in (lambda: prepare(SynthRun.open(heldout_run), cfg, load_splits()),
+                 lambda: run_config(SynthRun.open(heldout_run), cfg, load_splits()),
+                 lambda: run_sweep(SynthRun.open(heldout_run), [cell], load_splits())):
+        with pytest.raises(ProtectionError, match=r"s1000: split=test needs prepare\(\.\.\., allow_test=True\)"):
+            call()
+    assert prepare(SynthRun.open(heldout_run), cfg, load_splits(), allow_test=True).prepared["split"] == "test"
+    with pytest.raises(CheckFailed, match="seed 5 belongs to split dev, config split is test"):
+        prepare(SynthRun.open(apple_run), fake_cfg(apple_run, "apple", "split=test", "tuning=false"), load_splits(),
+                allow_test=True)
+
+    seen = []
+
+    def gate(run, cfg, splits, *, allow_test=False, **kw):     # stops before any truth table is built
+        seen.append((cfg.stages.det, allow_test))
+        raise CheckFailed("prepare reached")
+
+    monkeypatch.setattr(runner_module, "prepare", gate)
+    monkeypatch.setattr(sweep_module, "prepare", gate)
+    noisy = fake_cfg(heldout_run, "apple", "split=test", "tuning=false", "stop_after=y1", *DET_NOISE)
+    for call in (lambda: run_config(SynthRun.open(heldout_run), cfg, load_splits(), allow_test=True),
+                 lambda: run_config(SynthRun.open(heldout_run), noisy, load_splits(), allow_test=True),
+                 lambda: run_sweep(SynthRun.open(heldout_run), [cell], load_splits(), allow_test=True)):
+        with pytest.raises(CheckFailed, match="prepare reached"):
+            call()
+    assert seen == [("oracle", True), ("oracle_noisy", True), ("oracle", True)]
 
 
 def test_non_sequence_refused(tmp_path):
@@ -247,19 +279,15 @@ def test_missing_summary_refused(tmp_path):
         _ctx(run, "apple")
 
 
-def test_empty_truth_pass_gives_null(tmp_path):
-    ctx, cfg = _ctx(write_run(tmp_path, crop="apple", pitches=(30.0, 80.0)), "apple")
-    res = evaluate(ctx, cfg)
+def test_empty_truth_pass_gives_null(pitch80_ctx):
+    res = evaluate(pitch80_ctx, fake_cfg(pitch80_ctx.run.root, "apple"))
     p80 = [p for p in res["y1"]["passes"] if p["pitch"] == 80.0]
     assert len(p80) == 2 and all(p["G1"] == 0 and p["U1"] == 0 and p["e1"] is None for p in p80)
     assert res["y1"]["summary"]["e1_median"] is not None
 
 
-def test_no_depth_tracks_counted(tmp_path):
-    run = write_run(tmp_path, crop="apple", pitches=(30.0,))
-    for p in run.glob("*_depth16.png"):
-        Image.fromarray(np.zeros((360, 640), np.uint16)).save(p)
-    ctx, cfg = _ctx(run, "apple")
+def test_no_depth_tracks_counted(no_depth_run):
+    ctx, cfg = _ctx(no_depth_run, "apple")
     res = evaluate(ctx, cfg)
     for p in res["y1"]["passes"]:
         assert p["U1"] == 0 and p["n_no3d"] == p["n_tracks"] > 0 and p["ledger"]["miss_drop"] == p["G1"]

@@ -52,6 +52,10 @@ class CheckFailed(ValueError):
     """A bundle check failed (seed in another split, summary.json missing); exit code 1."""
 
 
+class ProtectionError(CheckFailed):
+    """A split=test request broke a test protection rule; exit code 1."""
+
+
 @dataclass
 class RunContext:
     """One checked bundle and everything stage settings share. `tables` keys are `VARIANTS`.
@@ -144,23 +148,26 @@ def _check_config(ctx: RunContext, cfg: EvalAppConfig, det_seed: int | None = No
 
 def prepare(
     run: SynthRun, cfg: EvalAppConfig, splits: SplitsConfig, *, truth: SceneTruth | None = None,
-    det_seed: int | None = None,
+    det_seed: int | None = None, allow_test: bool = False,
 ) -> RunContext:
     """Check `run` against `cfg`, then build its oracle detections, source ids and truth tables.
 
     Checks, in order (each message starts with the bundle path): crop,
-    split=test, the seed's split (`CheckFailed`), sequence bundle, the
-    summary.json self-check (`SummaryMismatch`, or `CheckFailed` when the file
-    is missing), settings this version does not support (`NotImplementedError`),
-    and that `det_seed` is given exactly when `stages.det=oracle_noisy`.
+    split=test without `allow_test` (`ProtectionError`), the seed's split
+    (`CheckFailed`), sequence bundle, the summary.json self-check
+    (`SummaryMismatch`, or `CheckFailed` when the file is missing), settings
+    this version does not support (`NotImplementedError`), and that `det_seed`
+    is given exactly when `stages.det=oracle_noisy`.
+    `allow_test` lets a split=test config on to the seed check; only the protected eval commands pass it.
     `det_seed` is the detection noise seed under `stages.det=oracle_noisy`, and only there.
     `truth` replaces `run.truth()` (leak tests pass a relabelled copy).
     """
     meta, root = run.meta, run.root
     if meta.crop != cfg.crop:
         raise ValueError(f"{root}: crop mismatch: run is {meta.crop}, config is {cfg.crop}")
-    if cfg.split == "test":
-        raise ValueError(f"{root}: split=test runs are blocked until test protection is in place")
+    if cfg.split == "test" and not allow_test:
+        raise ProtectionError(f"{root}: split=test needs prepare(..., allow_test=True), "
+                              "which only the protected eval commands pass")
     actual = splits.split_of(meta.seed) or "none"
     if actual != cfg.split:
         raise CheckFailed(f"{root}: seed {meta.seed} belongs to split {actual}, config split is {cfg.split}")
@@ -474,14 +481,17 @@ def evaluate_seeds(ctx: RunContext, cfg: EvalAppConfig, *, subsets: bool = False
     return combine_seeds(cfg, [(s, evaluate(ctx, cfg, noise_seed=s)) for s in cfg.noise.seeds])
 
 
-def run_config(run: SynthRun, cfg: EvalAppConfig, splits: SplitsConfig) -> tuple[RunContext, dict, dict[str, float]]:
+def run_config(
+    run: SynthRun, cfg: EvalAppConfig, splits: SplitsConfig, *, allow_test: bool = False,
+) -> tuple[RunContext, dict, dict[str, float]]:
     """`prepare` and evaluate `run` under `cfg`, once per noise seed when `cfg` has noise.
 
     Under `stages.det=oracle_noisy` every seed `s` of `cfg.noise.seeds` gets its
     own `prepare(..., det_seed=s)` and `evaluate(..., noise_seed=s)`, one context
     at a time, and the results are combined (`combine_seeds`); otherwise one
-    `prepare` serves `evaluate_seeds`. Returns the last context, the result and
-    the seconds spent, `{"prepare": ..., "evaluate": ...}`.
+    `prepare` serves `evaluate_seeds`. Every `prepare` gets `allow_test`.
+    Returns the last context, the result and the seconds spent,
+    `{"prepare": ..., "evaluate": ...}`.
     """
     t_prepare = t_evaluate = 0.0
     if cfg.stages.det == "oracle_noisy":
@@ -489,7 +499,7 @@ def run_config(run: SynthRun, cfg: EvalAppConfig, splits: SplitsConfig) -> tuple
         for s in cfg.noise.seeds:
             ctx = None   # one context at a time: drop the previous seed's before the next prepare
             t0 = time.perf_counter()
-            ctx = prepare(run, cfg, splits, det_seed=s)
+            ctx = prepare(run, cfg, splits, det_seed=s, allow_test=allow_test)
             t1 = time.perf_counter()
             per_seed.append((s, evaluate(ctx, cfg, noise_seed=s)))
             t_prepare += t1 - t0
@@ -497,7 +507,7 @@ def run_config(run: SynthRun, cfg: EvalAppConfig, splits: SplitsConfig) -> tuple
         res = combine_seeds(cfg, per_seed)
     else:
         t0 = time.perf_counter()
-        ctx = prepare(run, cfg, splits)
+        ctx = prepare(run, cfg, splits, allow_test=allow_test)
         t1 = time.perf_counter()
         res = evaluate_seeds(ctx, cfg)
         t_prepare = t1 - t0

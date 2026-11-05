@@ -17,8 +17,9 @@ import numpy as np
 import yaml
 
 from counting.config.eval_schema import EvalAppConfig
+from counting.evaluation.verdict import verdict_counts
 
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 5
 
 
 class ReproducibilityError(RuntimeError):
@@ -522,6 +523,44 @@ def _criteria_table(entries: list[tuple[str, list[dict]]]) -> list[str]:
     return _table(headers, out)
 
 
+_VERDICT_HEADERS = ["칸", "지표", "단위", "합친 값", "장면 시드별", "기준", "판정"]
+
+
+def _verdict_per_run_cell(metric: str, p: dict) -> str:
+    cell = f"s{p['seed']} {_criteria_cell(metric, p['value'])}"
+    if p["spread"]:
+        lo, hi = p["spread"]
+        cell += f" ({_criteria_cell(metric, lo)}~{_criteria_cell(metric, hi)})"
+    return cell
+
+
+def _verdict_row(rung_name: str, row: dict) -> list[str]:
+    metric = row["metric"]
+    pooled = "-" if row["unit"] == "scene" else _criteria_cell(metric, row["value"])
+    per_run = ", ".join(_verdict_per_run_cell(metric, p) for p in row["per_run"])
+    limit = f"{_OP_SYMBOL[row['op']]}{_criteria_cell(metric, row['limit'])}"
+    verdict = "-" if row["ok"] is None else ("OK" if row["ok"] else "FAIL")
+    unit = "장면마다" if row["unit"] == "scene" else "합침"
+    return [rung_name, metric, unit, pooled, per_run, limit, verdict]
+
+
+def _verdict_lines(results: dict) -> list[str]:
+    """The test split's verdict table: head line, `_table` of every judged row, then the pass count.
+
+    Rung order follows `results["runs"][0]["rungs"]` (not `results["verdicts"]`, whose keys a
+    JSON round trip would sort); each rung's rows keep `results["verdicts"][rung]`'s order.
+    """
+    verdicts = results["verdicts"]
+    rows = [_verdict_row(rung_name, row) for rung_name in results["runs"][0]["rungs"]
+            for row in verdicts.get(rung_name, [])]
+    n_ok, n = verdict_counts(verdicts)
+    lines = [f"**판정 (test, 장면 시드 {len(results['runs'])}개)**"]
+    lines += _table(_VERDICT_HEADERS, rows)
+    lines.append(f"- 통과 {n_ok} / 항목 {n} (값이 없는 항목은 통과로 세지 않는다)")
+    lines.append("")
+    return lines
+
+
 _SWEEP_POINT_HEADERS = ["점", "칸", "덮인 키", "e1 중앙값", "e1 최대", "U", "G6", "e_pipe", "그루 MAE÷평균", "기준"]
 
 
@@ -616,7 +655,8 @@ def render_report(results: dict, *, criteria: Mapping | None) -> str:
 
     A rung with `subsets` (ladder rung L3 under `--subsets`) gets its pass-subset table after its Y6
     section. `kind == "sweep"` replaces the per-rung body with `_sweep_body`'s point table(s) and
-    collapse section, after the same head and bundle-info table.
+    collapse section, after the same head and bundle-info table. A non-sweep result whose
+    `split` is `"test"` and carries `verdicts` ends with `_verdict_lines`'s table.
     """
     lines = [f"# Y1·Y6 합성 채점 — {results['run_name']} ({results['experiment_id']})",
              f"> 합성 렌더 · {_pose_text(results)} · 보정 전(U). 실제 정확도가 아니다."]
@@ -689,5 +729,8 @@ def render_report(results: dict, *, criteria: Mapping | None) -> str:
                 lines.append("**기준과 비교(가정값, 참고)**")
                 lines += _criteria_table(entries)
                 lines.append("")
+
+    if results["split"] == "test" and results.get("verdicts"):
+        lines += _verdict_lines(results)
 
     return "\n".join(lines) + "\n"

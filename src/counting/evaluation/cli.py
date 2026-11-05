@@ -2,7 +2,9 @@
 the summary/geometry/split checks for one or more orchard_synth bundles; `eval run` and
 `eval ladder` score a stage setting (or walk the oracle ladder) and write the experiment
 folder; `eval sweep` scores a grid of stage-setting points (optionally crossed with
-ladder bases) and writes the same kind of experiment folder with a `sweep.csv`.
+ladder bases) and writes the same kind of experiment folder with a `sweep.csv`. A split=test
+request to these three must pass the test protection checks (`counting.evaluation.protect`)
+before any bundle is scored, and each one that writes its folder is logged in `test_log.csv`.
 
 Module-level imports are `typer` and `rich` only, so importing `counting.cli` (which
 imports this module to register the `eval` sub-app) never loads torch. Everything else
@@ -169,13 +171,18 @@ def truth(
         raise typer.Exit(code=1)
 
 
-def _load_criteria(path: str):
-    """YAML criteria at `path`, or `None` if the file does not exist."""
-    import yaml
+def _load_criteria(path: str) -> tuple[dict | None, str | None]:
+    """(YAML criteria at `path`, sha256 of the file's bytes), or `(None, None)` if the file does not exist."""
+    import hashlib
     from pathlib import Path
 
+    import yaml
+
     p = Path(path).expanduser()
-    return yaml.safe_load(p.read_text(encoding="utf-8")) if p.is_file() else None
+    if not p.is_file():
+        return None, None
+    data = p.read_bytes()
+    return yaml.safe_load(data.decode("utf-8")), hashlib.sha256(data).hexdigest()
 
 
 def _row_text(label: str, res: dict) -> str:
@@ -220,10 +227,26 @@ def _run_eval(
     """Shared body of `eval run` (`kind="run"`), `eval ladder` (`kind="ladder"`) and `eval sweep` (`kind="sweep"`).
 
     Exit code 0 is success (including a reproduced rerun), 1 is a check failure
-    (seed/split mismatch, summary mismatch, failed reproducibility), 2 is an
-    input error. `CheckFailed` is a `ValueError`, so it is caught before the input-error branch.
-    A sweep checks its config, grid and (with grid bases) ladder, then opens every
-    bundle in `cfg.runs` and checks its frame selection, before `run_sweep` scores any of them.
+    (seed/split mismatch, summary mismatch, a split=test protection check, failed
+    reproducibility), 2 is an input error. `CheckFailed` (and so `ProtectionError`) is a
+    `ValueError`, so it is caught before the input-error branch.
+
+    In order:
+    1. read the config (with `--set`, then `--run`), the splits and the criteria;
+    2. read the ladder (and its default rungs), or the grid and its points (and, with grid
+       bases, the ladder);
+    3. under split=test, `check_test_request` on the config and every file read so far, then
+       `check_test_log` on the output folder's `test_log.csv`;
+    4. check the ladder request, or the `--set` overlap and the sweep cells;
+    5. open every bundle in `cfg.runs` (a sweep checks each one's frame selection, split=test
+       runs `check_test_bundles`) and sort them by (fingerprint, run_id), so the results do not
+       depend on the order the bundles were listed in;
+    6. score the bundles one at a time, one context at a time; only a request that passed the
+       split=test checks lets `prepare` take a split=test config (`allow_test`);
+    7. build the experiment id, `pooled` (run and ladder) and `verdicts` (a ladder with criteria),
+       and write the experiment folder;
+    8. under split=test, add a `test_log.csv` row, and warn when the log already lists a run
+       with the same config hash and request (`extra`).
     Under `stages.det=oracle_noisy`, `eval run` prepares the bundle once per noise seed.
     """
     import hashlib
@@ -235,7 +258,10 @@ def _run_eval(
     from counting.config.hashing import config_hash
     from counting.config.loader import load_yaml_model
     from counting.data.formats.orchard_synth import SynthRun
-    from counting.evaluation.record import build_record, experiment_id, git_state
+    from counting.evaluation.protect import (
+        append_log_row, check_test_bundles, check_test_log, check_test_request, earlier_log_runs,
+    )
+    from counting.evaluation.record import build_record, counting_repo, experiment_id, git_state, request_extra
     from counting.evaluation.report import SCHEMA_VERSION, ReproducibilityError, write_experiment
     from counting.evaluation.runner import (
         CheckFailed, check_ladder_request, describe_run, load_ladder, prepare, run_config, run_ladder,
@@ -244,7 +270,12 @@ def _run_eval(
         check_frame_selection, check_set_overlap, grid_points, load_grid, run_sweep, sweep_cells,
     )
     from counting.evaluation.truth import SummaryMismatch
+    from counting.evaluation.verdict import ladder_pooled, ladder_verdicts, verdict_summary
 
+    def file_sha256(path: str) -> str:
+        return hashlib.sha256(Path(path).expanduser().read_bytes()).hexdigest()
+
+    earlier = 0
     try:
         try:
             cfg = load_yaml_model(config, EvalAppConfig, overrides=set_)
@@ -253,78 +284,71 @@ def _run_eval(
         if run_:
             cfg = cfg.model_copy(update={"runs": list(run_)})
         splits_cfg = load_yaml_model(splits_path, SplitsConfig)
-        criteria = _load_criteria(criteria_path)
+        criteria, criteria_sha256 = _load_criteria(criteria_path)
 
-        ladder, ladder_bytes = None, b""
-        if kind == "ladder":
-            ladder_bytes = Path(ladder_path).expanduser().read_bytes()
-            ladder = load_ladder(ladder_path)
-            if rungs is None:
-                rungs = [*(ladder.get("rungs") or {}), *(ladder.get("baselines") or {})]
-            check_ladder_request(cfg, ladder, rungs, with_2x2=with_2x2, subsets=subsets)
-
-        grid, points, cells = None, [], None
+        ladder = ladder_sha256 = grid = grid_sha256 = cells = None
+        points = []
         if kind == "sweep":
-            grid_bytes = Path(grid_path).expanduser().read_bytes()
+            grid_sha256 = file_sha256(grid_path)
             grid = load_grid(grid_path)
             points = grid_points(grid)
+        if kind == "ladder" or (grid is not None and grid.bases):
+            ladder_sha256 = file_sha256(ladder_path)
+            ladder = load_ladder(ladder_path)
+            if kind == "ladder" and rungs is None:
+                rungs = [*(ladder.get("rungs") or {}), *(ladder.get("baselines") or {})]
+
+        protected = None
+        if cfg.split == "test":
+            files = {"--splits": splits_path, "--criteria": criteria_path}
+            if ladder is not None:
+                files["--ladder"] = ladder_path
+            if grid is not None:
+                files["--grid"] = grid_path
+            protected = check_test_request(cfg, config_path=config, sets=set_ or [], runs=run_ or [], files=files,
+                                           grid=grid, ladder=ladder, repo=counting_repo())
+            check_test_log(Path(cfg.output_dir).expanduser() / "test_log.csv")
+
+        if kind == "ladder":
+            check_ladder_request(cfg, ladder, rungs, with_2x2=with_2x2, subsets=subsets)
+        elif kind == "sweep":
             check_set_overlap([s.split("=", 1)[0] for s in (set_ or [])], points)
-            if grid.bases:
-                ladder_bytes = Path(ladder_path).expanduser().read_bytes()
-                ladder = load_ladder(ladder_path)
             cells = sweep_cells(cfg, grid, ladder)
 
         started = datetime.now(timezone.utc).isoformat()
-        t_prepare = t_score = 0.0
+        t0 = time.perf_counter()
+        bundles = [SynthRun.open(run_path) for run_path in cfg.runs]
+        t_prepare, t_score = time.perf_counter() - t0, 0.0
         if kind == "sweep":
-            runs = [SynthRun.open(run_path) for run_path in cfg.runs]
-            for bundle in runs:
+            for bundle in bundles:
                 check_frame_selection(bundle, cells)
-            run_entries = []
-            for bundle in runs:
-                entry, timings = run_sweep(bundle, cells, splits_cfg)
-                run_entries.append(entry)
-                t_prepare += timings["prepare"]
-                t_score += timings["evaluate"]
-        else:
-            contexts, run_entries = [], []
-            for run_path in cfg.runs:
-                if kind == "run":
-                    t0 = time.perf_counter()
-                    run = SynthRun.open(run_path)
-                    t_open = time.perf_counter() - t0
-                    ctx, res, timings = run_config(run, cfg, splits_cfg)
-                    t_prepare += t_open + timings["prepare"]
-                    t_score += timings["evaluate"]
-                    out = {"chain": [], "rungs": {"run": res}, "interaction_2x2": None}
-                else:
-                    t0 = time.perf_counter()
-                    ctx = prepare(SynthRun.open(run_path), cfg, splits_cfg)
-                    t_prepare += time.perf_counter() - t0
+        if protected is not None:
+            check_test_bundles(bundles, splits_cfg)
+        bundles.sort(key=lambda b: (b.meta.fingerprint, b.meta.run_id))
 
-                    t0 = time.perf_counter()
-                    out = run_ladder(ctx, cfg, ladder, rungs, with_2x2=with_2x2, subsets=subsets)
-                    t_score += time.perf_counter() - t0
-                contexts.append(ctx)
-                run_entries.append({"meta": describe_run(ctx), **out})
+        allow_test = protected is not None
+        run_entries = []
+        for bundle in bundles:
+            ctx = None   # one context at a time: drop the previous bundle's before the next prepare
+            if kind == "sweep":
+                entry, timings = run_sweep(bundle, cells, splits_cfg, allow_test=allow_test)
+            elif kind == "run":
+                ctx, res, timings = run_config(bundle, cfg, splits_cfg, allow_test=allow_test)
+                entry = {"meta": describe_run(ctx), "chain": [], "rungs": {"run": res}, "interaction_2x2": None}
+            else:
+                t0 = time.perf_counter()
+                ctx = prepare(bundle, cfg, splits_cfg, allow_test=allow_test)
+                t1 = time.perf_counter()
+                out = run_ladder(ctx, cfg, ladder, rungs, with_2x2=with_2x2, subsets=subsets)
+                timings = {"prepare": t1 - t0, "evaluate": time.perf_counter() - t1}
+                entry = {"meta": describe_run(ctx), **out}
+            t_prepare += timings["prepare"]
+            t_score += timings["evaluate"]
+            run_entries.append(entry)
         finished = datetime.now(timezone.utc).isoformat()
-
-        # Sort bundles by identity (fingerprint, run_id), not by cfg.runs/--run order, so
-        # results.json's `runs` list is the same regardless of the order bundles were listed
-        # in (the experiment id already ignores that order via sorted fingerprints).
-        if kind == "sweep":
-            order = sorted(range(len(runs)), key=lambda i: (runs[i].meta.fingerprint, runs[i].meta.run_id))
-            runs = [runs[i] for i in order]
-        else:
-            order = sorted(
-                range(len(contexts)), key=lambda i: (contexts[i].run.meta.fingerprint, contexts[i].run.meta.run_id)
-            )
-            contexts = [contexts[i] for i in order]
-        run_entries = [run_entries[i] for i in order]
 
         if kind == "run":
             uses_box_depth = cfg.lift.depth != "det_depth"
-            extra = ""
         elif kind == "ladder":
             lift_depths = [rung["lift_depth"] for entry in run_entries for rung in entry["rungs"].values()]
             if with_2x2:
@@ -333,44 +357,55 @@ def _run_eval(
                     or (ladder.get("baselines") or {}).get(base_name) or {}
                 lift_depths.append((base_patch.get("lift") or {}).get("depth", cfg.lift.depth))
             uses_box_depth = any(d != "det_depth" for d in lift_depths)
-            extra = f"ladder:{hashlib.sha256(ladder_bytes).hexdigest()[:16]}:{','.join(rungs)}:{with_2x2}"
-            if subsets:
-                extra += ":subsets"
         else:
             uses_box_depth = any(cell.cfg.lift.depth != "det_depth" for cell in cells)
-            grid_sha256 = hashlib.sha256(grid_bytes).hexdigest()
-            ladder_sha256 = hashlib.sha256(ladder_bytes).hexdigest() if ladder_bytes else None
-            extra = f"sweep:{grid.path.name}:{grid_sha256[:16]}:{ladder_sha256[:16] if ladder_sha256 else '-'}"
+        extra = request_extra(kind, ladder_sha256=ladder_sha256, rungs=rungs or (), with_2x2=with_2x2,
+                              subsets=subsets, grid_name=grid.path.name if grid else None, grid_sha256=grid_sha256,
+                              criteria_sha256=criteria_sha256)
 
-        if kind == "sweep":
-            fingerprints = [run.meta.fingerprint for run in runs]
-            data = [entry["meta"] for entry in run_entries]
-        else:
-            fingerprints = [ctx.run.meta.fingerprint for ctx in contexts]
-            data = [describe_run(ctx) for ctx in contexts]
+        fingerprints = [bundle.meta.fingerprint for bundle in bundles]
+        data = [entry["meta"] for entry in run_entries]
         if uses_box_depth:
-            depth_fps = [run.depth_fingerprint() for run in runs] if kind == "sweep" else \
-                [ctx.run.depth_fingerprint() for ctx in contexts]
+            depth_fps = [bundle.depth_fingerprint() for bundle in bundles]
             fingerprints += depth_fps
             data = [{**d, "depth_fingerprint": fp} for d, fp in zip(data, depth_fps)]
 
-        code = git_state()
-        exp_id = experiment_id(config_hash=config_hash(cfg), fingerprints=fingerprints, code=code,
-                               seed=cfg.seed, extra=extra)
+        code = protected.code if protected is not None else git_state()
+        chash = config_hash(cfg)
+        exp_id = experiment_id(config_hash=chash, fingerprints=fingerprints, code=code, seed=cfg.seed, extra=extra)
         results = {"schema_version": SCHEMA_VERSION, "kind": kind, "run_name": cfg.run_name,
-                   "experiment_id": exp_id, "split": cfg.split, "crop": cfg.crop, "runs": run_entries}
+                   "experiment_id": exp_id, "split": cfg.split, "crop": cfg.crop, "runs": run_entries,
+                   "pooled": None, "verdicts": None}
+        if kind != "sweep":
+            results["pooled"] = ladder_pooled(run_entries)
+        # run ids carry no criteria hash (verdicts would break run reruns); sweep cells keep tree tables at the
+        # baseline point only, so only a ladder gets verdicts
+        if kind == "ladder" and criteria is not None:
+            results["verdicts"] = ladder_verdicts(run_entries, results["pooled"], criteria, cfg.crop)
         record_extra = None
         if kind == "sweep":
             results["sweep"] = {"grid": grid.path.name, "bases": list(grid.bases),
                                 "points": [{"name": p.name, "patch": p.patch, "factor": p.factor, "value": p.value}
                                           for p in points]}
             record_extra = {"grid_sha256": grid_sha256, "ladder_sha256": ladder_sha256,
-                            "detectors": sorted({cell.cfg.stages.det for cell in cells})}
+                            "detectors": sorted({cell.cfg.stages.det for cell in cells}),
+                            "criteria_sha256": criteria_sha256}
+        elif kind == "ladder":
+            record_extra = {"ladder_sha256": ladder_sha256, "criteria_sha256": criteria_sha256}
         record = build_record(cfg=cfg, runs=data, code=code,
                               timings={"prepare": round(t_prepare, 3), "evaluate": round(t_score, 3)},
                               started=started, finished=finished, extra=record_extra)
-        folder, reproduced = write_experiment(Path(cfg.output_dir).expanduser(), cfg=cfg, results=results,
-                                              record=record, criteria=criteria)
+        out_root = Path(cfg.output_dir).expanduser()
+        folder, reproduced = write_experiment(out_root, cfg=cfg, results=results, record=record, criteria=criteria)
+
+        if protected is not None:
+            log = out_root / "test_log.csv"
+            earlier = earlier_log_runs(log, config_hash=chash, extra=extra)
+            append_log_row(log, {"date": started, "experiment_id": exp_id, "kind": kind,
+                                 "config": protected.config_rel, "config_hash": chash, "extra": extra,
+                                 "fingerprints": ";".join(sorted(fingerprints)), "commit": code["commit"],
+                                 "criteria_sha256": criteria_sha256,
+                                 "verdict": verdict_summary(results["verdicts"])})
     except SummaryMismatch as e:
         typer.echo(f"error: {e}")
         raise typer.Exit(code=1)
@@ -387,6 +422,9 @@ def _run_eval(
     typer.echo(str(folder))
     if reproduced:
         typer.echo("reproduced (same results.json)")
+    if earlier > 0:
+        typer.echo(f"warning: test_log.csv already lists {earlier} test run(s) of config {chash} with this request; "
+                   "this run is logged as a new line")
     if kind == "sweep":
         _echo_sweep_lines(run_entries)
     else:
@@ -402,7 +440,8 @@ def run(
         "configs/eval/splits.yaml", "--splits", help="Splits YAML (for prepare's split check)"
     ),
     criteria_path: str = typer.Option(
-        "configs/eval/criteria.yaml", "--criteria", help="Criteria YAML; ignored if missing"
+        "configs/eval/criteria.yaml", "--criteria",
+        help="Criteria YAML; ignored if missing (a split=test run needs a tracked one)",
     ),
 ) -> None:
     """Run one stage setting (`cfg.stages`) over the config's bundles and write the experiment folder."""
@@ -424,7 +463,8 @@ def ladder(
         "configs/eval/splits.yaml", "--splits", help="Splits YAML (for prepare's split check)"
     ),
     criteria_path: str = typer.Option(
-        "configs/eval/criteria.yaml", "--criteria", help="Criteria YAML; ignored if missing"
+        "configs/eval/criteria.yaml", "--criteria",
+        help="Criteria YAML; ignored if missing (a split=test run needs a tracked one)",
     ),
 ) -> None:
     """Walk the oracle ladder (`run_ladder`) over the config's bundles and write the experiment folder."""
@@ -446,7 +486,8 @@ def sweep(
         "configs/eval/splits.yaml", "--splits", help="Splits YAML (for prepare's split check)"
     ),
     criteria_path: str = typer.Option(
-        "configs/eval/criteria.yaml", "--criteria", help="Criteria YAML; ignored if missing"
+        "configs/eval/criteria.yaml", "--criteria",
+        help="Criteria YAML; ignored if missing (a split=test run needs a tracked one)",
     ),
 ) -> None:
     """Score a grid of stage-setting points (optionally crossed with ladder bases) over the config's

@@ -5,6 +5,7 @@ import re
 from pathlib import Path
 
 import numpy as np
+import pytest
 
 from counting.config.eval_schema import EvalAppConfig
 from counting.data.formats.orchard_synth import SceneTruth, SynthRun
@@ -34,20 +35,25 @@ def _pred(res):
             [t["U"] for t in res["y6"]["trees"]], res["y6"]["n_landmarks"])
 
 
-def test_shuffled_truth_ids_do_not_change_predictions(apple_run, pear_run, ctx_of):
+@pytest.fixture(scope="module")
+def plain_pred(apple_run, pear_run, ctx_of):
+    """{crop: `_pred` of `ctx_of[crop]` under its crop's dev config}, the reference of the two tests below."""
+    return {crop: _pred(evaluate(ctx_of[crop], fake_cfg(root, crop))) for root, crop in ((apple_run, "apple"),
+                                                                                         (pear_run, "pear"))}
+
+
+def test_shuffled_truth_ids_do_not_change_predictions(apple_run, pear_run, plain_pred):
     for root, crop in ((apple_run, "apple"), (pear_run, "pear")):
         run, cfg, splits = SynthRun.open(root), fake_cfg(root, crop), load_splits()
-        a = evaluate(ctx_of[crop], cfg)
         b = evaluate(prepare(run, cfg, splits, truth=_permute(run.truth(), np.random.default_rng(1))), cfg)
-        assert _pred(a) == _pred(b)
+        assert plain_pred[crop] == _pred(b)
 
 
-def test_per_frame_random_source_ids_do_not_change_predictions(apple_run, pear_run, ctx_of):
+def test_per_frame_random_source_ids_do_not_change_predictions(apple_run, pear_run, ctx_of, plain_pred):
     """Catches a runner that links tracks or landmarks by source id (consistent permutation cannot)."""
     for root, crop in ((apple_run, "apple"), (pear_run, "pear")):
         cfg, ctx = fake_cfg(root, crop), ctx_of[crop]   # non-oracle stages
-        a = evaluate(ctx, cfg)
-        assert _pred(evaluate(ctx_with(ctx, src=_random_src(ctx, np.random.default_rng(2))), cfg)) == _pred(a)
+        assert _pred(evaluate(ctx_with(ctx, src=_random_src(ctx, np.random.default_rng(2))), cfg)) == plain_pred[crop]
 
 
 NOISY = (*DET_NOISE, "noise.pose_trans_sigma_m=0.02", "noise.pose_rot_sigma_deg=0.5", "noise.pass_bias_m=0.02",
@@ -102,7 +108,8 @@ def test_eval_modules_do_not_import_torch():
     mods = ["counting.evaluation.cli", "counting.evaluation.runner", "counting.evaluation.report",
             "counting.evaluation.sweep", "counting.tracking.landmark", "counting.multiview.dedup",
             "counting.multiview.lift", "counting.detection.oracle", "counting.data.formats.orchard_synth",
-            "counting.geometry.noise", "counting.evaluation.seeds"]
+            "counting.geometry.noise", "counting.evaluation.seeds", "counting.evaluation.protect",
+            "counting.evaluation.verdict"]
     code = "import importlib, sys\n" + "".join(f"importlib.import_module({m!r})\n" for m in mods) + \
            "print('torch' in sys.modules)"
     out = python_c(code)

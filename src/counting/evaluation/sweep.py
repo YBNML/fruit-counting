@@ -327,11 +327,14 @@ def _kept(cell: SweepCell, res: dict) -> dict:
     return out
 
 
-def run_sweep(run: SynthRun, cells: Sequence[SweepCell], splits: SplitsConfig) -> tuple[dict, dict]:
+def run_sweep(
+    run: SynthRun, cells: Sequence[SweepCell], splits: SplitsConfig, *, allow_test: bool = False,
+) -> tuple[dict, dict]:
     """Evaluate `cells` on `run`, with one `prepare` per group of cells that share `_prepared_settings`.
 
     A cell under `stages.det=oracle_noisy` belongs to one group per noise seed;
     pose and depth noise cells run all their seeds on their group's context.
+    Every `prepare` gets `allow_test`.
     Returns `{"meta": describe_run(first group's context), "cells": [kept result per cell, in input order]}`
     and the seconds spent, `{"prepare": ..., "evaluate": ...}`.
     """
@@ -348,7 +351,7 @@ def run_sweep(run: SynthRun, cells: Sequence[SweepCell], splits: SplitsConfig) -
     for members in groups.values():
         i0, s0 = members[0]
         t0 = time.perf_counter()
-        ctx = prepare(run, cells[i0].cfg, splits, det_seed=s0)
+        ctx = prepare(run, cells[i0].cfg, splits, det_seed=s0, allow_test=allow_test)
         t1 = time.perf_counter()
         t_prepare += t1 - t0
         if meta is None:

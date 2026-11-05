@@ -1,3 +1,4 @@
+import json
 import os
 from pathlib import Path
 
@@ -26,8 +27,13 @@ DEV = {
 
 
 def _open(rel):
-    if not (BASE / rel / "manifest.json").exists():
+    manifest = BASE / rel / "manifest.json"
+    if not manifest.exists():
         pytest.skip(f"dev render not present: {rel}")
+    seed = json.loads(manifest.read_text(encoding="utf-8"))["args"]["seed"]
+    split = load_splits().split_of(seed) or "none"
+    if split != "dev":
+        pytest.fail(f"{rel}: synth tests read dev bundles only; seed {seed} is {split}")
     return SynthRun.open(BASE / rel)
 
 

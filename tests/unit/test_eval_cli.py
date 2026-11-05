@@ -3,10 +3,8 @@ import json
 import re
 from pathlib import Path
 
-import numpy as np
 import pytest
 import yaml
-from PIL import Image
 from typer.testing import CliRunner
 
 from counting.evaluation.cli import eval_app
@@ -38,11 +36,8 @@ def test_truth_geometry_without_ground(leaf_runs, tmp_path):
         bad.output
 
 
-def test_truth_geometry_fails_when_ground_has_no_depth(tmp_path):
-    root = write_run(tmp_path, crop="apple", pitches=(10.0,))   # 10 deg passes see the ground
-    for p in root.glob("*_depth16.png"):
-        Image.fromarray(np.zeros_like(np.array(Image.open(p), dtype=np.uint16))).save(p)
-    res = runner.invoke(eval_app, ["truth", str(root), "--check-geometry"])
+def test_truth_geometry_fails_when_ground_has_no_depth(no_depth_run):
+    res = runner.invoke(eval_app, ["truth", str(no_depth_run), "--check-geometry"])
     line = next(line for line in res.output.splitlines() if line.startswith("geometry "))
     assert res.exit_code == 1 and "summary OK" in res.output and line.startswith("geometry FAIL (") \
         and "ground=fail," in line and line.endswith("n_ground_px=0)"), res.output
@@ -98,7 +93,9 @@ def test_eval_run_writes_experiment_and_is_reproducible(leaf_runs, tmp_path):
     dirs = list((tmp_path / "out" / "apple_dev").iterdir())
     assert len(dirs) == 1 and re.fullmatch(r"[0-9a-f]{12}", dirs[0].name)
     b1 = (dirs[0] / "results.json").read_bytes()
-    r2 = runner.invoke(eval_app, args)
+    res = json.loads(b1)
+    assert res["verdicts"] is None and list(res["pooled"]) == ["run"]
+    r2 = runner.invoke(eval_app, [*args[:-1], str(tmp_path / "none.yaml")])     # the run id has no criteria hash
     assert r2.exit_code == 0 and "reproduced (same results.json)" in r2.output
     assert list((tmp_path / "out" / "apple_dev").iterdir()) == dirs
     assert (dirs[0] / "results.json").read_bytes() == b1
@@ -147,7 +144,7 @@ def test_eval_run_with_noise_writes_seed_rows(leaf_runs, tmp_path):
     (d,) = (tmp_path / "out" / "apple_dev").iterdir()
     res = json.loads((d / "results.json").read_text(encoding="utf-8"))
     rung = res["runs"][0]["rungs"]["run"]
-    assert res["schema_version"] == 4 and rung["noisy"] and rung["seeds"] == [0, 1]
+    assert res["schema_version"] == 5 and rung["noisy"] and rung["seeds"] == [0, 1]
     assert rung["noise"]["detector"]["miss_p"] == 0.1 and rung["noise"]["depth_dropout"] == 0.05
     line = next(line for line in r.output.splitlines() if line.startswith("run: row U="))
     assert line.endswith(" (mean over noise seeds 0,1)")
@@ -183,17 +180,21 @@ def test_eval_ladder_rungs_and_2x2(leaf_runs, tmp_path):
     run0 = res["runs"][0]
     assert res["kind"] == "ladder" and set(run0["rungs"]) == {"L0", "L1", "last_box"}
     assert run0["chain"] == ["L0", "L1"] and len(run0["interaction_2x2"]["cells"]) == 4
-    assert "L0→L1 (추적)" in (d / "report.md").read_text(encoding="utf-8")
+    report = (d / "report.md").read_text(encoding="utf-8")
+    assert "L0→L1 (추적)" in report and "**판정" not in report          # a dev ladder: verdicts in results.json only
+    assert list(res["verdicts"]) == ["L1"] and [r["unit"] for r in res["verdicts"]["L1"]] == ["pooled"] * 5
+    assert list(res["pooled"]) == ["L0", "L1", "last_box"] and res["pooled"]["L1"]["n_runs"] == 1
 
 
 @pytest.mark.slow
-def test_eval_run_reordered_runs_stay_reproducible(apple_run, leaf_runs, tmp_path):
+def test_eval_run_reordered_runs_stay_reproducible(leaf_runs, tmp_path):
     """A rerun with the same bundles in a different `--run` order reports as reproduced
     (results.json's `runs` list is sorted by bundle identity, not by cfg.runs/--run order)."""
-    run_b = leaf_runs[0]   # 30 deg passes only, so its fingerprint differs from apple_run's
-    cfg = _cfg_file(tmp_path, apple_run, "apple")
-    forward = ["run", "--config", cfg, "--splits", SPLITS, "--run", str(apple_run), "--run", str(run_b)]
-    backward = ["run", "--config", cfg, "--splits", SPLITS, "--run", str(run_b), "--run", str(apple_run)]
+    run_a = leaf_runs[0]
+    run_b = write_run(tmp_path / "small", crop="apple", pitches=(30.0,), trees_per_row=2)   # another fingerprint
+    cfg = _cfg_file(tmp_path, run_a, "apple")
+    forward = ["run", "--config", cfg, "--splits", SPLITS, "--run", str(run_a), "--run", str(run_b)]
+    backward = ["run", "--config", cfg, "--splits", SPLITS, "--run", str(run_b), "--run", str(run_a)]
     r1 = runner.invoke(eval_app, forward)
     assert r1.exit_code == 0, r1.output
     (d,) = (tmp_path / "out" / "apple_dev").iterdir()
@@ -273,3 +274,13 @@ def test_eval_ladder_subsets_need_L3_and_get_their_own_id(leaf_runs, tmp_path):
     (with_s, report), (without, _) = found[True], found[False]
     assert "subsets" not in with_s["L1"] and [r["S"] for r in with_s["L3"]["subsets"]][-1] == "drop 30"
     assert "**패스 묶음 (L3)**" in report and with_s["L3"]["y6"] == without["L3"]["y6"]
+
+
+def test_eval_ladder_opens_every_bundle_before_scoring(leaf_runs, tmp_path, monkeypatch):
+    import counting.evaluation.runner as runner_module
+    calls = []
+    monkeypatch.setattr(runner_module, "prepare", lambda *a, **k: calls.append(1))
+    args = ["ladder", "--config", _cfg_file(tmp_path, leaf_runs[0], "apple"), "--rungs", "L1", "--splits", SPLITS,
+            "--run", str(leaf_runs[0]), "--run", str(tmp_path / "missing")]
+    r = runner.invoke(eval_app, args)
+    assert r.exit_code == 2 and "no manifest.json" in r.output and calls == [], r.output

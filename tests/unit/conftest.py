@@ -1,26 +1,52 @@
 """Session-wide fake orchard_synth bundles, their prepared contexts and the full fake ladder.
+`heldout_run` is the one bundle with a test seed, for the split=test checks.
 
 The bundles, contexts and ladder are shared by every test in the session, so treat them as
 read-only: evaluate them, never edit them. A test that edits files builds its own bundle in
 `tmp_path` with `write_run`; a test that edits a context prepares its own, or varies a copy
 (`ctx_with`) that keeps the detection boxes.
 
-With `COUNTING_TEST_BUDGET_S` set, a passing session that runs longer than that many
-seconds fails (`pytest_sessionfinish`).
+With `COUNTING_TEST_BUDGET_S` set to a number of seconds (finite and > 0; read once in
+`pytest_configure`; unset or empty: no check), a passing session that runs longer than that
+fails (`pytest_sessionfinish`).
 """
 
+import math
 import os
 import time
 from pathlib import Path
 
+import numpy as np
 import pytest
+from PIL import Image
 
 from counting.data.formats.orchard_synth import SynthRun
 from counting.evaluation.runner import load_ladder, prepare, run_ladder
-from tests.unit.synthfake import DET_NOISE, fake_cfg, load_splits, write_run
+from tests.unit.synthfake import DET_NOISE, SIDECAR_COMMIT, fake_cfg, load_splits, write_run
 
 _T0 = time.perf_counter()
+_BUDGET_S: float | None = None   # COUNTING_TEST_BUDGET_S, set by pytest_configure
 ROOT = Path(__file__).resolve().parents[2]
+
+
+def budget_seconds(raw: str | None) -> float | None:
+    """COUNTING_TEST_BUDGET_S as seconds: None when unset or empty, else a finite number > 0
+    (anything else: `pytest.UsageError`)."""
+    if not raw:
+        return None
+    try:
+        value = float(raw)
+    except ValueError:
+        value = math.nan
+    if not math.isfinite(value) or value <= 0:
+        raise pytest.UsageError(f"COUNTING_TEST_BUDGET_S must be a number of seconds, got {raw!r}")
+    return value
+
+
+def pytest_configure(config):
+    """Read COUNTING_TEST_BUDGET_S once into `_BUDGET_S` (`budget_seconds`): unset or empty means no time check."""
+    global _BUDGET_S
+    _BUDGET_S = budget_seconds(os.environ.get("COUNTING_TEST_BUDGET_S"))
 
 
 @pytest.fixture(scope="session")
@@ -31,6 +57,31 @@ def apple_run(tmp_path_factory):
 @pytest.fixture(scope="session")
 def pear_run(tmp_path_factory):
     return write_run(tmp_path_factory.mktemp("pear_run"), crop="pear")
+
+
+@pytest.fixture(scope="session")
+def heldout_run(tmp_path_factory):
+    """An apple bundle with the 30 deg passes only, test seed 1000 and an orchard_synth.commit sidecar."""
+    root = write_run(tmp_path_factory.mktemp("heldout") / "s1000", crop="apple", pitches=(30.0,), seed=1000)
+    (root / "orchard_synth.commit").write_text(SIDECAR_COMMIT + "\n", encoding="utf-8")
+    return root
+
+
+@pytest.fixture(scope="session")
+def no_depth_run(tmp_path_factory):
+    """An apple bundle with the 10 deg passes only (they see the ground) and every depth16 pixel 0 (no return)."""
+    root = write_run(tmp_path_factory.mktemp("no_depth"), crop="apple", pitches=(10.0,))
+    for p in root.glob("*_depth16.png"):
+        Image.fromarray(np.zeros((360, 640), np.uint16)).save(p)
+    return root
+
+
+@pytest.fixture(scope="session")
+def pitch80_ctx(tmp_path_factory):
+    """An apple bundle with 30 and 80 deg passes, prepared under the apple dev config; the 80 deg
+    passes have no truth fruit and no detection."""
+    root = write_run(tmp_path_factory.mktemp("pitch80"), crop="apple", pitches=(30.0, 80.0))
+    return prepare(SynthRun.open(root), fake_cfg(root, "apple"), load_splits())
 
 
 @pytest.fixture(scope="session")
@@ -76,23 +127,32 @@ def ctx_of(apple_run, pear_run):
             for crop, root in (("apple", apple_run), ("pear", pear_run))}
 
 
+# Every third frame of each pass: both pitches stay, so the 10 deg passes still give fp_off terms.
+LADDER_SETS = ("passes.step_m=0.45",)
+
+
 @pytest.fixture(scope="session")
-def apple_ladder(apple_run, ctx_of):
-    """`run_ladder` on `ctx_of["apple"]` over every rung and baseline of the repo ladder, with the 2 x 2 table."""
+def apple_ladder_ctx(apple_run):
+    """`apple_run` prepared under the apple dev config with `LADDER_SETS`."""
+    return prepare(SynthRun.open(apple_run), fake_cfg(apple_run, "apple", *LADDER_SETS), load_splits())
+
+
+@pytest.fixture(scope="session")
+def apple_ladder(apple_run, apple_ladder_ctx):
+    """`run_ladder` on `apple_ladder_ctx` over every rung and baseline of the repo ladder, with the 2 x 2 table."""
     ladder = load_ladder(ROOT / "configs" / "eval" / "sweeps" / "ladder.yaml")
-    return run_ladder(ctx_of["apple"], fake_cfg(apple_run, "apple"), ladder,
+    return run_ladder(apple_ladder_ctx, fake_cfg(apple_run, "apple", *LADDER_SETS), ladder,
                       [*ladder["rungs"], *ladder["baselines"]], with_2x2=True)
 
 
 def pytest_sessionfinish(session, exitstatus):
-    """Fail a passing session that took longer than COUNTING_TEST_BUDGET_S seconds (unset: no check)."""
-    budget = os.environ.get("COUNTING_TEST_BUDGET_S")
-    if not budget or exitstatus != 0:
+    """Fail a passing session that took longer than COUNTING_TEST_BUDGET_S seconds (unset or empty: no check)."""
+    if _BUDGET_S is None or exitstatus != 0:
         return
     took = time.perf_counter() - _T0
-    if took > float(budget):
+    if took > _BUDGET_S:
         session.exitstatus = pytest.ExitCode.TESTS_FAILED
         tr = session.config.pluginmanager.get_plugin("terminalreporter")
         if tr is not None:
             tr.write("\n")
-            tr.write_line(f"test time budget exceeded: {took:.2f} s > {float(budget):g} s")
+            tr.write_line(f"test time budget exceeded: {took:.2f} s > {_BUDGET_S:g} s")

@@ -23,16 +23,19 @@ def _git(repo: Path, args: list[str]) -> subprocess.CompletedProcess:
     return subprocess.run(["git", *args], cwd=repo, capture_output=True)
 
 
+def counting_repo() -> Path:
+    """The counting checkout this package is imported from (two levels above `src/counting`)."""
+    return Path(counting.__file__).resolve().parents[2]
+
+
 def git_state(repo: Path | None = None) -> dict:
-    """Commit, dirty flag and (if dirty) a diff hash of `repo` (default: the counting checkout).
+    """Commit, dirty flag and (if dirty) a diff hash of `repo` (default: `counting_repo()`).
 
     `{"commit": None, "dirty": False, "diff_sha256": None}` when `repo` is not a git repo.
     Dirty also covers untracked files; `diff_sha256` hashes `git diff HEAD` plus each
     untracked file's (path, content sha256), so it changes when their content changes.
     """
-    if repo is None:
-        repo = Path(counting.__file__).resolve().parents[2]
-    repo = Path(repo)
+    repo = Path(counting_repo() if repo is None else repo)
     rev = _git(repo, ["rev-parse", "HEAD"])
     if rev.returncode != 0:
         return {"commit": None, "dirty": False, "diff_sha256": None}
@@ -71,6 +74,31 @@ def experiment_id(*, config_hash: str, fingerprints: Sequence[str], code: Mappin
     parts = [config_hash, *sorted(fingerprints), code["commit"] or "", str(code["dirty"]),
              code["diff_sha256"] or "", str(seed), extra]
     return hashlib.sha256("\n".join(parts).encode("utf-8")).hexdigest()[:12]
+
+
+def request_extra(
+    kind: str, *, ladder_sha256: str | None = None, rungs: Sequence[str] = (), with_2x2: bool = False,
+    subsets: bool = False, grid_name: str | None = None, grid_sha256: str | None = None,
+    criteria_sha256: str | None = None,
+) -> str:
+    """The experiment id's `extra` string for one eval request `kind` (`run`, `ladder` or `sweep`).
+
+    `"run"` carries no extra. `"ladder"` and `"sweep"` extras end in `:criteria:<sha16>` (`-` with
+    no criteria file), so a different criteria table changes their experiment id. Any other `kind`
+    raises `ValueError`.
+    """
+    if kind == "run":
+        return ""
+    if kind == "ladder":
+        extra = f"ladder:{ladder_sha256[:16]}:{','.join(rungs)}:{with_2x2}"
+        if subsets:
+            extra += ":subsets"
+    elif kind == "sweep":
+        extra = f"sweep:{grid_name}:{grid_sha256[:16]}:{ladder_sha256[:16] if ladder_sha256 else '-'}"
+    else:
+        raise ValueError(f"unknown kind {kind!r}")
+    criteria_part = criteria_sha256[:16] if criteria_sha256 else "-"
+    return f"{extra}:criteria:{criteria_part}"
 
 
 def build_record(

@@ -110,12 +110,9 @@ def test_check_geometry_catches_depth_offset(tmp_path):
     assert res["ground"] == "fail" and res["passed"] is False
 
 
-def test_check_geometry_fails_when_ground_has_no_depth(tmp_path):
+def test_check_geometry_fails_when_ground_has_no_depth(no_depth_run):
     """Ground in view but every depth16 pixel 0 (no return): the ground check applies and fails, it is not n/a."""
-    root = write_run(tmp_path, crop="apple", pitches=(10.0,))   # 10 deg only; it sees the ground
-    for p in root.glob("*_depth16.png"):
-        Image.fromarray(np.zeros_like(np.array(Image.open(p), dtype=np.uint16))).save(p)
-    run = SynthRun.open(root)
+    run = SynthRun.open(no_depth_run)
     res = check_geometry(run, run.truth(), stride=10)
     assert (res["ground"], res["passed"], res["n_ground_px"], res["ground_abs_z_median_m"]) == ("fail", False, 0, None)
     assert res["center_in_bbox"] == 1.0 and res["n_unoccluded"] > 0   # the centre check never reads depth

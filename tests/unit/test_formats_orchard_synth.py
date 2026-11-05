@@ -13,6 +13,11 @@ from tests.unit.synthfake import write_run
 A10, B10, A30, B30 = PassKey(10.0, "A", 2), PassKey(10.0, "B", 1), PassKey(30.0, "A", 2), PassKey(30.0, "B", 1)
 
 
+def _small_run(tmp_path):
+    """A 4-frame apple bundle (30 deg passes, not a sequence), for checks that only open the bundle."""
+    return write_run(tmp_path, crop="apple", pitches=(30.0,), max_frames=4)
+
+
 def test_open_layout_meta_and_passes(apple_run):
     run = SynthRun.open(apple_run)
     m, L = run.meta, run.layout
@@ -34,7 +39,7 @@ def test_pos_k_follows_travel_direction(apple_run):
 
 
 def test_open_expands_home(tmp_path, monkeypatch):
-    write_run(tmp_path / "r", crop="apple", pitches=(30.0,))
+    _small_run(tmp_path / "r")
     monkeypatch.setenv("HOME", str(tmp_path))
     assert SynthRun.open("~/r").meta.seed == 5
 
@@ -71,7 +76,7 @@ def _edit_json(path, fn):
 
 
 def test_bad_fruit_tuple_raises_with_path(tmp_path):
-    run = write_run(tmp_path, crop="apple", pitches=(30.0,))
+    run = _small_run(tmp_path)
     _edit_json(run / "manifest.json", lambda m: m["spec"]["trees"][0]["fruits"][0].pop())
     with pytest.raises(ValueError, match="fruit tuple has length") as e:
         SynthRun.open(run)
@@ -79,28 +84,28 @@ def test_bad_fruit_tuple_raises_with_path(tmp_path):
 
 
 def test_bad_bag_tuple_raises(tmp_path):
-    run = write_run(tmp_path, crop="apple", pitches=(30.0,))
+    run = _small_run(tmp_path)
     _edit_json(run / "manifest.json", lambda m: m["spec"]["trees"][0]["bags"][0].append(0))
     with pytest.raises(ValueError, match="bag tuple has length"):
         SynthRun.open(run)
 
 
 def test_missing_planar_depth_convention_raises(tmp_path):
-    run = write_run(tmp_path, crop="apple", pitches=(30.0,))
+    run = _small_run(tmp_path)
     _edit_json(run / "manifest.json", lambda m: m["conventions"].update(depth16="mm"))
     with pytest.raises(ValueError, match="conventions.depth16 is not planar depth"):
         SynthRun.open(run)
 
 
 def test_missing_count1_raises(tmp_path):
-    run = write_run(tmp_path, crop="apple", pitches=(30.0,))
+    run = _small_run(tmp_path)
     _edit_json(run / "manifest.json", lambda m: m["conventions"].pop("count1"))
     with pytest.raises(ValueError, match="conventions.count1 is missing"):
         SynthRun.open(run)
 
 
 def test_record_tree_mismatch_raises(tmp_path):
-    run = write_run(tmp_path, crop="apple", pitches=(30.0,))
+    run = _small_run(tmp_path)
     _edit_json(run / "000000_frame.json", lambda f: f["records"][0].update(tree=f["records"][0]["tree"] + 1))
     with pytest.raises(ValueError, match="record tree != fruit tree"):
         SynthRun.open(run)
@@ -136,7 +141,7 @@ def test_select_frames_pitch_and_side_filters(apple_run):
 
 
 def test_fingerprint_stable_ignores_rgb_and_detects_edits(tmp_path):
-    run = write_run(tmp_path, crop="apple", pitches=(30.0,))
+    run = _small_run(tmp_path)
     f0 = SynthRun.open(run).meta.fingerprint
     (run / "000000_rgb.png").write_bytes(b"x")
     assert SynthRun.open(run).meta.fingerprint == f0
@@ -146,7 +151,7 @@ def test_fingerprint_stable_ignores_rgb_and_detects_edits(tmp_path):
 
 
 def test_sidecar_commit(tmp_path):
-    run = write_run(tmp_path, crop="apple", pitches=(30.0,))
+    run = _small_run(tmp_path)
     (run / "orchard_synth.commit").write_text("abc123\n", encoding="utf-8")
     assert SynthRun.open(run).meta.synth_commit == "abc123"
 
@@ -176,10 +181,6 @@ def test_fake_scene_follows_real_record_rule(apple_run, pear_run):
 
 
 # --- malformed bundles: ValueError naming the file, with a phrase per error class ----------------
-
-
-def _small_run(tmp_path):
-    return write_run(tmp_path, crop="apple", pitches=(30.0,), max_frames=4)
 
 
 def test_invalid_summary_json_raises_with_path(tmp_path):
