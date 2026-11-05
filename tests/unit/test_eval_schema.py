@@ -52,7 +52,9 @@ TUNED_ON_VAL = {
               "lift": {"depth": "box_far"},
               "tracker": {"depth_gate": "soft", "repair_m": 0.08},
               "dedup": {"radius_m": 0.09, "band_m": 0.05}},
-    "pear": {},
+    "pear": {"lift": {"depth": "box_far"},
+             "tracker": {"depth_gate": "soft", "repair_m": 0.18},
+             "dedup": {"radius_m": 0.135}},
 }
 
 
@@ -186,7 +188,7 @@ def test_config_hash_generic_and_ignores_runtime_keys():
 
 
 COMMITTED_HASHES = {"apple_dev": "38b74b45e42d9213", "pear_dev": "b85d292df18d8261", "apple_val": "b26494b8830a44fa",
-                    "apple_exp": "7f6be6772929d5ed", "pear_val": "8d8d2c1d3f6b4fe4", "pear_exp": "236093486cebe266",
+                    "apple_exp": "7f6be6772929d5ed", "pear_val": "a16d22fe031ee666", "pear_exp": "8c67f0e894d833c7",
                     "frozen/apple_test_oracle": "a5d60d44aaf799f2"}
 
 
