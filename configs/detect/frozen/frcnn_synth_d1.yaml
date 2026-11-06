@@ -1,0 +1,20 @@
+# Detection settings fixed before the test caches; weights_sha256 pins the trained weights.
+device: cuda
+output_dir: runs/detect
+weights_sha256: 88e8c93628216703e46d23a4ce9f2ef19e84b95b9bf830a2bfc33ab8ae383f3d
+model:
+  arch: fasterrcnn_resnet50_fpn_v2
+  anchor_sizes: [16, 32, 64, 128, 256]
+  aspect_ratios: [0.5, 1.0, 2.0]
+  train_size: 1024
+  infer_min_size: 1080
+  infer_max_size: 1920
+  max_dets: 1000
+  score_min: 0.05
+  rpn_pre_nms_train: 2000
+  rpn_post_nms_train: 2000
+  rpn_pre_nms_test: 2000
+  rpn_post_nms_test: 2000
+  box_batch_per_image: 512
+  trainable_backbone_layers: 3
+  freeze_backbone_bn: true

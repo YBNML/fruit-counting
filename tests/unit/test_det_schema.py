@@ -69,3 +69,13 @@ def test_detector_configs_refuse_unknown_keys_and_bad_values():
 def test_cuda_environment_pins_torch_and_torchvision():
     text = (ROOT / "environment-cuda.yml").read_text(encoding="utf-8")
     assert "- torch==2.15.0" in text and "- torchvision==0.29.2" in text and "--extra-index-url" not in text
+
+
+def test_frozen_detection_config_pins_only_the_weights():
+    rel = "configs/detect/frozen/frcnn_synth_d1.yaml"
+    raw = yaml.safe_load((ROOT / rel).read_text(encoding="utf-8"))
+    assert set(raw) == set(DetInferConfig.model_fields) and set(raw["model"]) == set(FrcnnConfig.model_fields)
+    frozen = load_yaml_model(ROOT / rel, DetInferConfig)
+    base = load_yaml_model(ROOT / "configs/detect/frcnn_synth.yaml", DetInferConfig)
+    assert len(frozen.weights_sha256) == 64 and int(frozen.weights_sha256, 16) >= 0
+    assert frozen.model_dump(exclude={"weights_sha256"}) == base.model_dump(exclude={"weights_sha256"})
