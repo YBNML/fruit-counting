@@ -10,6 +10,7 @@ import pytest
 from counting.config.eval_schema import EvalAppConfig
 from counting.data.formats.orchard_synth import SceneTruth, SynthRun
 from counting.evaluation.runner import evaluate, prepare
+from tests.unit.cachefake import write_truth_cache
 from tests.unit.synthfake import DET_NOISE, ctx_with, fake_cfg, load_splits, python_c
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -79,6 +80,19 @@ def test_noisy_predictions_ignore_truth_ids(leaf_runs, leaf_det_ctx):
     assert _pred(a) == _pred(b) == _pred(evaluate(random_src, cfg, noise_seed=0))
 
 
+def test_cached_predictions_ignore_truth_ids(leaf_runs, tmp_path):
+    root = leaf_runs[0]
+    write_truth_cache(root, tmp_path, shift=-0.2, low_score=0.07)
+    cfg = fake_cfg(root, "apple", "passes.step_m=0.45", f"detector.cache={tmp_path}", "stages.det=cached",
+                   "tracker.score_lo=0.05")
+    run, splits = SynthRun.open(root), load_splits()
+    ctx = prepare(run, cfg, splits)
+    a = evaluate(ctx, cfg)
+    b = evaluate(prepare(run, cfg, splits, truth=_permute_and_reorder(run.truth(), np.random.default_rng(1))), cfg)
+    c = evaluate(ctx_with(ctx, src=_random_src(ctx, np.random.default_rng(2))), cfg)
+    assert _pred(a) == _pred(b) == _pred(c)
+
+
 def _prediction_files():
     for d in ("tracking", "multiview", "geometry"):
         yield from (SRC / d).glob("*.py")
@@ -110,7 +124,8 @@ def test_eval_modules_do_not_import_torch():
             "counting.multiview.lift", "counting.detection.oracle", "counting.data.formats.orchard_synth",
             "counting.geometry.noise", "counting.evaluation.seeds", "counting.evaluation.protect",
             "counting.evaluation.verdict", "counting.config.det_schema", "counting.training.detector",
-            "counting.detection.cached", "counting.evaluation.detmetrics", "counting.detection.frcnn"]
+            "counting.detection.cached", "counting.evaluation.detmetrics", "counting.detection.frcnn",
+            "counting.evaluation.budget"]
     code = "import importlib, sys\n" + "".join(f"importlib.import_module({m!r})\n" for m in mods) + \
            "print('torch' in sys.modules)"
     out = python_c(code)

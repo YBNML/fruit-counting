@@ -22,6 +22,8 @@ from tests.unit.test_eval_cli import CRIT, SPLITS, _cfg_file
 
 ROOT = Path(__file__).resolve().parents[2]
 LADDER = load_ladder(ROOT / "configs" / "eval" / "sweeps" / "ladder.yaml")
+L5LADDER = load_ladder(ROOT / "configs" / "eval" / "sweeps" / "ladder_l5.yaml")
+LADDER_FILES = ("ladder.yaml", "ladder_l5.yaml")
 PASS_KEYS = ("pitch", "side", "aisle", "n_frames", "U1", "G1", "e1", "ledger")
 Y6_KEYS = ("mode", "n_landmarks", "row", "ledger", "metrics")
 BUNDLE = Path("bundle")        # sweep_cells never opens it
@@ -44,6 +46,12 @@ GRIDS = {
     "val/radius_pear.yaml": (("L1", "L3"), 6, ("pear",)),
     "val/repair_apple.yaml": (("L1", "L3"), 6, ("apple",)),
     "val/repair_pear.yaml": (("L1", "L3"), 6, ("pear",)),
+    "val/l5_score.yaml": (("L5",), 19, ("apple", "pear")),
+    "val/l5_score_lo.yaml": (("L5",), 4, ("apple", "pear")),
+    "val/l5_short.yaml": (("L5",), 4, ("apple", "pear")),
+    "val/l5_depth.yaml": (("L3", "L5"), 2, ("apple", "pear")),
+    "val/l5_minobs_oracle.yaml": (("L3",), 3, ("apple", "pear")),
+    "val/l5_spacing.yaml": (("L5",), 4, ("apple", "pear")),
 }
 
 
@@ -52,13 +60,15 @@ def _crop_cfg(crop, split):
 
 
 def test_committed_grids_build_for_every_config():
-    assert sorted(str(p.relative_to(SWEEPS)) for p in SWEEPS.rglob("*.yaml") if p.name != "ladder.yaml") == sorted(GRIDS)
+    assert sorted(str(p.relative_to(SWEEPS)) for p in SWEEPS.rglob("*.yaml")
+                  if p.name not in LADDER_FILES) == sorted(GRIDS)
     for name, (bases, n_points, crops) in GRIDS.items():
         grid = load_grid(SWEEPS / name)
         assert grid.bases == bases and len(grid_points(grid)) == n_points, name
         for crop in crops:
             for split in ("dev", "val", "exp"):
-                assert len(sweep_cells(_crop_cfg(crop, split), grid, LADDER)) == n_points * len(bases), (name, crop)
+                cfg = _patched(_crop_cfg(crop, split), {"detector": {"cache": "runs/detect/x"}})  # for rung L5
+                assert len(sweep_cells(cfg, grid, L5LADDER)) == n_points * len(bases), (name, crop)
 
 
 def _leaves(patch, prefix=()):
@@ -228,10 +238,10 @@ def test_sweep_cells_refuse_unsupported_and_invalid_points(tmp_path):
     with pytest.raises(ValueError, match=re.escape(f"{g}: point 'stages.det=oracle_noisy': ")) as e:
         sweep_cells(cfg, load_grid(g), None)
     assert "stages.det=oracle_noisy needs a detector.noise section" in str(e.value)
-    c = _grid(tmp_path, "factors: {detector.cache: [x]}\n", "c.yaml")
-    with pytest.raises(NotImplementedError, match=re.escape(
-            f"{c}: point 'detector.cache=x': detector.cache is not supported in this version")):
+    c = _grid(tmp_path, "factors: {stages.det: [cached]}\n", "c.yaml")
+    with pytest.raises(ValueError, match=re.escape(f"{c}: point 'stages.det=cached': ")) as e:
         sweep_cells(cfg, load_grid(c), None)
+    assert "stages.det=cached needs detector.cache" in str(e.value)
     v = _grid(tmp_path, "factors: {lift.far_min_frac: [1.5]}\n", "v.yaml")
     with pytest.raises(ValueError, match=re.escape(f"{v}: point 'lift.far_min_frac=1.5'")):
         sweep_cells(cfg, load_grid(v), None)
@@ -410,7 +420,7 @@ def test_eval_sweep_matches_eval_run_and_writes_the_folder(leaf_runs, tmp_path):
     assert sorted(runs) == [0.04, 0.06]
     assert sorted(p.name for p in sweep_dir.iterdir()) == ["config.yaml", "record.json", "report.md", "results.json",
                                                          "sweep.csv"]
-    assert sweep["schema_version"] == 5 and sweep["sweep"] == {"grid": "g.yaml", "bases": [], "points": [
+    assert sweep["schema_version"] == 6 and sweep["sweep"] == {"grid": "g.yaml", "bases": [], "points": [
         {"name": "baseline", "patch": {}, "factor": None, "value": None},
         {"name": "tracker.repair_m=0.06", "patch": {"tracker": {"repair_m": 0.06}}, "factor": "tracker.repair_m",
          "value": 0.06}]}

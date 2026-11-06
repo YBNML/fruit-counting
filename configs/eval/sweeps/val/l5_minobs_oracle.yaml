@@ -1,0 +1,4 @@
+# The oracle rung with the cached-rung minimum track length, to split its share from the detector's (report only).
+bases: [L3]
+factors:
+  tracker.min_obs: [2, 3]

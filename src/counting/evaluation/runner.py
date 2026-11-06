@@ -1,23 +1,25 @@
 """Stage runner: check a bundle, run one stage setting through Y1 and Y6, and walk the oracle ladder.
 
 `prepare` checks a bundle against the config and builds what every stage
-setting shares: frames by pass, the (optionally noisy) oracle detections,
+setting shares: frames by pass, the oracle, noisy oracle or cached detections,
 source ids and truth tables.
 `evaluate` runs one setting of `cfg.stages` and scores it with the exact error
 ledger. `evaluate_seeds` and `run_config` run a setting with noise once per
 noise seed and combine the results (`combine_seeds`). `run_ladder` evaluates
 the ladder rungs and the (track, dedup) 2 x 2 table of
-`configs/eval/sweeps/ladder.yaml`.
+`configs/eval/sweeps/ladder.yaml`; a rung that changes the detections (L5 of
+`configs/eval/sweeps/ladder_l5.yaml`) runs on a context of its own.
 Results are JSON-shaped dicts of plain Python values (str, int, float, bool, None).
 """
 
 from __future__ import annotations
 
 import copy
+import json
 import time
 from dataclasses import dataclass, field, replace
 from pathlib import Path
-from typing import Mapping, Sequence
+from typing import Callable, Mapping, Sequence
 
 import numpy as np
 import yaml
@@ -27,6 +29,7 @@ from counting.data.formats.orchard_synth import (
     FrameInput, OrchardLayout, PassKey, SceneTruth, SynthRun, read_depth_m, select_frames,
 )
 from counting.detection.base import Detections
+from counting.detection.cached import CachedDetector, cache_path
 from counting.detection.oracle import OracleDetector
 from counting.evaluation.ledger import UnitView, build_ledger, combine
 from counting.evaluation.match import match_frame, unit_majority
@@ -46,6 +49,8 @@ from counting.multiview.lift import box_far_depth, box_median_depth, lift_points
 from counting.tracking.landmark import PassTracks, track_pass
 
 VARIANTS = ("count1", "any", "strict")
+FRAME_KEYS = ("crop", "split", "passes", "detector.positives")   # the frames and truth a ladder rung may not change
+SUBSET_RUNGS = ("L3", "L5")   # the ladder rungs that get the pass-subset table under `subsets`
 
 
 class CheckFailed(ValueError):
@@ -62,6 +67,9 @@ class RunContext:
 
     `prepared` holds the config settings `prepare` checked or built from
     (`_prepared_settings`); `evaluate` refuses a config that differs in any.
+    `cache` identifies the detection cache under `stages.det=cached`
+    (`file`, `digest`, and the cache meta's `weights_sha256` and `pretrained`,
+    None when the meta has none); it is None otherwise.
     """
 
     run: SynthRun
@@ -72,6 +80,7 @@ class RunContext:
     src: dict[int, np.ndarray]
     tables: dict[str, TruthTables]
     prepared: dict[str, object]
+    cache: dict | None = None
     _frame_of: dict[int, FrameInput] = field(init=False, repr=False)
     _box_depth: dict[tuple, np.ndarray] = field(default_factory=dict, init=False, repr=False)
 
@@ -103,42 +112,34 @@ class RunContext:
         return self._box_depth[key]
 
 
-def _unsupported_setting(cfg: EvalAppConfig) -> str | None:
-    """The first config setting this version does not support, or None."""
-    if cfg.stages.det not in ("oracle", "oracle_noisy"):
-        return f"stages.det={cfg.stages.det}"
-    if cfg.detector.cache is not None:
-        return "detector.cache"
-    return None
-
-
-def _refuse_unsupported(root: Path, cfg: EvalAppConfig) -> None:
-    refused = _unsupported_setting(cfg)
-    if refused is not None:
-        raise NotImplementedError(f"{root}: {refused} is not supported in this version")
-
-
 def _prepared_settings(cfg: EvalAppConfig, det_seed: int | None = None) -> dict[str, object]:
-    """The settings `prepare` checks (crop, split) or fixes in the context (frames by pass, detections).
+    """The settings `prepare` checks (crop, split) or fixes in the context (frames by pass, detections, source ids).
 
     `det_seed` (the detection noise seed) is kept under `stages.det=oracle_noisy` only, else None.
+    The cache folder, post-processing, pinned digests and score thresholds (`score_lo` drops
+    boxes, `score_hi` orders the matching) are kept under `stages.det=cached` only, else None.
     """
-    noise = cfg.detector.noise
+    det, cached = cfg.detector, cfg.stages.det == "cached"
     return {"crop": cfg.crop, "split": cfg.split, "passes": cfg.passes.model_dump(),
-            "detector.positives": cfg.detector.positives, "stages.det": cfg.stages.det,
-            "detector.noise": None if noise is None else noise.model_dump(),
-            "det_seed": det_seed if cfg.stages.det == "oracle_noisy" else None}
+            "detector.positives": det.positives, "stages.det": cfg.stages.det,
+            "detector.noise": None if det.noise is None else det.noise.model_dump(),
+            "det_seed": det_seed if cfg.stages.det == "oracle_noisy" else None,
+            "detector.cache": det.cache if cached else None,
+            "detector.post": det.post_settings().model_dump() if cached else None,
+            "detector.digests": det.digests if cached else None,
+            "tracker.score_hi": cfg.tracker.score_hi if cached else None,
+            "tracker.score_lo": cfg.tracker.score_lo if cached else None}
 
 
 def _check_config(ctx: RunContext, cfg: EvalAppConfig, det_seed: int | None = None) -> None:
-    """Refuse a config `prepare` would not accept, or one that differs from the config `ctx` was prepared with.
+    """Refuse a config that differs from the config `ctx` was prepared with.
 
     `evaluate` scores the frames, detections and source ids that `prepare`
     built, so a stage setting (a ladder rung) may change what `evaluate` runs
     (`stages` other than `det`, `lift`, `noise`, `tracker`, `dedup`, `truth`,
-    `stop_after`) but none of `_prepared_settings(cfg, det_seed)`.
+    `stop_after`) but none of `_prepared_settings(cfg, det_seed)`, which under
+    `stages.det=cached` also holds the tracker's score thresholds.
     """
-    _refuse_unsupported(ctx.run.root, cfg)
     for key, value in _prepared_settings(cfg, det_seed).items():
         had = ctx.prepared.get(key)
         if value != had:
@@ -146,18 +147,72 @@ def _check_config(ctx: RunContext, cfg: EvalAppConfig, det_seed: int | None = No
                              "run prepare with this config")
 
 
+def _check_frames(ctx: RunContext, cfg: EvalAppConfig) -> None:
+    """Refuse a config whose `FRAME_KEYS` settings differ from the ones `ctx` was prepared with.
+
+    A ladder rung may run on a context of its own (other detections), but on
+    the same frames, passes and truth as the ladder's base context.
+    """
+    settings = _prepared_settings(cfg)
+    for key in FRAME_KEYS:
+        value, had = settings[key], ctx.prepared.get(key)
+        if value != had:
+            raise ValueError(f"{ctx.run.root}: {key}={value} differs from the prepared {key}={had}; "
+                             "a rung may change the detector, not the frames")
+
+
+def open_cache(run: SynthRun, cfg: EvalAppConfig) -> CachedDetector:
+    """The detection cache of `run` in the folder `cfg.detector.cache`, opened as a `CachedDetector`.
+
+    The file is `cache_path(detector.cache, run_id)`; a missing one raises
+    `FileNotFoundError`, and with `detector.digests` a run it does not pin
+    raises `ValueError`, both before the file is read. `CachedDetector` then
+    checks the file, the bundle fingerprint and, with `detector.digests`, the
+    pinned content digest (`ValueError` naming the cache path), and
+    post-processes with `detector.post`.
+    """
+    run_id, digests = run.meta.run_id, cfg.detector.digests
+    path = cache_path(Path(cfg.detector.cache).expanduser(), run_id)
+    if not path.is_file():
+        raise FileNotFoundError(f"{path}: no detection cache for this bundle")
+    if digests is not None and run_id not in digests:
+        raise ValueError(f"{run.root}: detector.digests pins no cache for run {run_id}")
+    return CachedDetector(path, fingerprint=run.meta.fingerprint, digest=None if digests is None else digests[run_id],
+                          **cfg.detector.post_settings().model_dump())
+
+
+def _match_by_score(dets, recs, score_hi, prefer):
+    """Source ids of `dets`: the boxes scoring at least `score_hi` are matched first, then the rest
+    against the records still free in this frame (both with `match_frame`)."""
+    out = np.full(len(dets), -1, dtype=np.int64)
+    hi, lo = np.flatnonzero(dets.scores >= score_hi), np.flatnonzero(dets.scores < score_hi)
+    out[hi] = match_frame(dets.subset(hi), recs, prefer=prefer)
+    used = set(out[hi][out[hi] >= 0].tolist())
+    if len(lo):
+        out[lo] = match_frame(dets.subset(lo), [r for r in recs if r.id not in used], prefer=prefer)
+    return out
+
+
 def prepare(
     run: SynthRun, cfg: EvalAppConfig, splits: SplitsConfig, *, truth: SceneTruth | None = None,
     det_seed: int | None = None, allow_test: bool = False,
 ) -> RunContext:
-    """Check `run` against `cfg`, then build its oracle detections, source ids and truth tables.
+    """Check `run` against `cfg`, then build its detections, source ids and truth tables.
 
-    Checks, in order (each message starts with the bundle path): crop,
+    Checks, in order (each message starts with the bundle or cache path): crop,
     split=test without `allow_test` (`ProtectionError`), the seed's split
     (`CheckFailed`), sequence bundle, the summary.json self-check
-    (`SummaryMismatch`, or `CheckFailed` when the file is missing), settings
-    this version does not support (`NotImplementedError`), and that `det_seed`
-    is given exactly when `stages.det=oracle_noisy`.
+    (`SummaryMismatch`, or `CheckFailed` when the file is missing), that
+    `det_seed` is given exactly when `stages.det=oracle_noisy`, and, under
+    `stages.det=cached`, the cache (`open_cache`: the file exists
+    (`FileNotFoundError`), `detector.digests` pins the run, then the file, the
+    bundle fingerprint and the pinned digest (`ValueError`)).
+    The detections are the oracle's, the noisy oracle's or, under
+    `stages.det=cached`, the cache's after `detector.post`, without the boxes
+    scoring under `tracker.score_lo`. Source ids come from `match_frame`; for
+    cached detections it runs twice per frame (`_match_by_score`): the boxes
+    scoring at least `tracker.score_hi` first, then the rest against the
+    records they left free.
     `allow_test` lets a split=test config on to the seed check; only the protected eval commands pass it.
     `det_seed` is the detection noise seed under `stages.det=oracle_noisy`, and only there.
     `truth` replaces `run.truth()` (leak tests pass a relabelled copy).
@@ -180,8 +235,7 @@ def prepare(
         raise SummaryMismatch(f"{root}: {e}") from e
     except ValueError as e:
         raise CheckFailed(f"{root}: {e}") from e
-    _refuse_unsupported(root, cfg)
-    noisy_det = cfg.stages.det == "oracle_noisy"
+    noisy_det, cached = cfg.stages.det == "oracle_noisy", cfg.stages.det == "cached"
     if noisy_det and det_seed is None:
         raise ValueError(f"{root}: stages.det=oracle_noisy needs a detection noise seed")
     if not noisy_det and det_seed is not None:
@@ -192,20 +246,32 @@ def prepare(
     passes: dict[PassKey, list[FrameInput]] = {}
     for f in frames:
         passes.setdefault(f.pass_key, []).append(f)
-    if noisy_det:
+    cache = None
+    if cached:
+        detector = open_cache(run, cfg)
+        cache = {"file": detector.path.name, "digest": detector.digest,
+                 "weights_sha256": detector.meta.get("weights_sha256"), "pretrained": detector.meta.get("pretrained")}
+    elif noisy_det:
         detector = OracleDetector(truth, cfg.detector.positives, cfg.detector.noise,
                                   rng_key=(cfg.seed, det_seed, STEP_DET, meta.seed))
     else:
         detector = OracleDetector(truth, cfg.detector.positives)
-    dets = {f.idx: detector.detect(f) for f in frames}
+    dets: dict[int, Detections] = {}
+    for f in frames:
+        D = detector.detect(f)
+        dets[f.idx] = D.subset(np.flatnonzero(D.scores >= cfg.tracker.score_lo)) if cached else D
 
     def prefer(r) -> bool:   # first tie-break: prefer the detector's own positives
         return is_positive(r, cfg.detector.positives, truth.count1)
 
-    src = {f.idx: match_frame(dets[f.idx], truth.records[f.idx], prefer=prefer) for f in frames}
+    if cached:
+        src = {f.idx: _match_by_score(dets[f.idx], truth.records[f.idx], cfg.tracker.score_hi, prefer)
+               for f in frames}
+    else:
+        src = {f.idx: match_frame(dets[f.idx], truth.records[f.idx], prefer=prefer) for f in frames}
     tables = {v: truth_sets(truth, run.layout, passes, v) for v in VARIANTS}
     return RunContext(run=run, truth=truth, layout=run.layout, passes=passes, dets=dets, src=src, tables=tables,
-                      prepared=_prepared_settings(cfg, det_seed))
+                      prepared=_prepared_settings(cfg, det_seed), cache=cache)
 
 
 def describe_run(ctx: RunContext) -> dict:
@@ -265,10 +331,11 @@ def evaluate(ctx: RunContext, cfg: EvalAppConfig, *, subsets: bool = False, nois
     `G1`/`G6` are the `cfg.truth.variant` truth; a ratio with a zero
     denominator, and the median/max/percentile of an empty set, is None.
     `cfg` is checked first (`_check_config`, against `noise_seed` as the
-    detection noise seed, or the prepared one without it): an unsupported
-    setting raises `NotImplementedError`, one that differs from the prepared
-    config `ValueError`. Then `noise_seed` must be given exactly when
-    `cfg.is_noisy()` (`ValueError`).
+    detection noise seed, or the prepared one without it): a config that
+    differs from the prepared one raises `ValueError`. Then `noise_seed` must
+    be given exactly when `cfg.is_noisy()` (`ValueError`).
+    A track is kept with at least `cfg.tracker.min_obs_for(stages.det)`
+    observations. A cached context's result also has `cache` (`ctx.cache`).
     Each pass's and the summary's `depth_err` is `depth_error_stats` of box depth
     minus detection depth (`None` under `lift.depth=det_depth`, without detector
     depth, or with no detections).
@@ -327,7 +394,7 @@ def evaluate(ctx: RunContext, cfg: EvalAppConfig, *, subsets: bool = False, nois
             row, tree = truth_row_mask(maj, X, ctx.layout, ctx.truth), truth_trees(maj, X, ctx.layout, ctx.truth)
         else:
             row, tree = in_target_row(X, ctx.layout), assign_trees(X, ctx.layout)
-        enough = tracks.n_obs >= cfg.tracker.min_obs
+        enough = tracks.n_obs >= cfg.tracker.min_obs_for(st.det)
         has3d = np.isfinite(X).all(axis=1)
         keep = enough & has3d & row
         kept = np.flatnonzero(keep)
@@ -364,6 +431,8 @@ def evaluate(ctx: RunContext, cfg: EvalAppConfig, *, subsets: bool = False, nois
     if cfg.stop_after != "y1":
         y6 = _y6(ctx, cfg, stages, ctx.tables)
     out = {"stages": st.model_dump(), "lift_depth": cfg.lift.depth, "y1": y1, "y6": y6}
+    if ctx.cache is not None:
+        out["cache"] = _cache_result(ctx)
     if subsets:
         out["subsets"] = _score_subsets(ctx, cfg, stages, y6)
     return out
@@ -372,8 +441,9 @@ def evaluate(ctx: RunContext, cfg: EvalAppConfig, *, subsets: bool = False, nois
 def _score_subsets(ctx: RunContext, cfg: EvalAppConfig, stages: Sequence[_PassStage], y6_all: dict) -> list[dict]:
     """One row per subset S of `pass_subsets`: Y6 scored on S's passes alone, against S's truth and the whole truth.
 
-    S's truth tables are rebuilt from S's frames. `U`, `G6`, `e_pipe` and `ledger`
-    (the `cfg.truth.variant` row ledger) are S's Y6 row; `e_all` and
+    S's truth tables are rebuilt from S's frames. `U`, `G6`, `e_pipe`, `ledger`
+    and `tree_mae_over_mean` (the `cfg.truth.variant` row ledger and its Y6
+    metric, both against S's own truth) are S's Y6 row; `e_all` and
     `tree_mae_over_mean_all` compare S's counts with the `G6` of every pass
     (`y6_all`). A subset with no pass has None everywhere but `S` and `n_passes`.
     """
@@ -383,7 +453,7 @@ def _score_subsets(ctx: RunContext, cfg: EvalAppConfig, stages: Sequence[_PassSt
     for name, keys in pass_subsets(list(ctx.passes)):
         if not keys:
             rows.append({"S": name, "n_passes": 0, "U": None, "G6": None, "e_pipe": None, "e_all": None,
-                         "tree_mae_over_mean_all": None, "ledger": None})
+                         "tree_mae_over_mean_all": None, "tree_mae_over_mean": None, "ledger": None})
             continue
         sel = [s for s in stages if s.key in keys]
         tables = {v: truth_sets(ctx.truth, ctx.layout, {k: ctx.passes[k] for k in keys}, v) for v in VARIANTS}
@@ -393,7 +463,7 @@ def _score_subsets(ctx: RunContext, cfg: EvalAppConfig, stages: Sequence[_PassSt
                      "e_all": _ratio(U - G_all, G_all),
                      "tree_mae_over_mean_all": _ratio(sum(abs(t["U"] - g_all[t["tree"]]) for t in y6["trees"]),
                                                       sum(g_all.values())),
-                     "ledger": y6["ledger"]})
+                     "tree_mae_over_mean": y6["metrics"]["tree_mae_over_mean"], "ledger": y6["ledger"]})
     return rows
 
 
@@ -467,18 +537,27 @@ def _y6(ctx: RunContext, cfg: EvalAppConfig, stages: Sequence[_PassStage], table
             "metrics": metrics}
 
 
+def _cache_result(ctx: RunContext) -> dict:
+    """The `cache` entry of a cached context's result."""
+    return {k: ctx.cache[k] for k in ("file", "digest", "weights_sha256", "pretrained")}
+
+
 def evaluate_seeds(ctx: RunContext, cfg: EvalAppConfig, *, subsets: bool = False) -> dict:
     """Evaluate `cfg` on `ctx` once per `cfg.noise.seeds` entry and combine the results; without noise, once.
 
     Under `stages.det=oracle_noisy` each seed needs its own context
     (`run_config`), so `ctx` serves only the seed it was prepared with.
     The pass-subset table (`subsets`) needs a setting without noise (`ValueError`).
+    A cached context's combined result also has `cache`, as `evaluate`'s has.
     """
     if not cfg.is_noisy():
         return evaluate(ctx, cfg, subsets=subsets)
     if subsets:
         raise ValueError("--subsets needs a stage setting without noise")
-    return combine_seeds(cfg, [(s, evaluate(ctx, cfg, noise_seed=s)) for s in cfg.noise.seeds])
+    out = combine_seeds(cfg, [(s, evaluate(ctx, cfg, noise_seed=s)) for s in cfg.noise.seeds])
+    if ctx.cache is not None:
+        out["cache"] = _cache_result(ctx)
+    return out
 
 
 def run_config(
@@ -560,7 +639,7 @@ def check_ladder_request(
     Checks `cfg`'s base config (`stages.dedup`, `lift.depth`, `stages.det`, `noise`), every
     name in `rungs` (`rung_config` raises `unknown rung ...` for one it does not
     know), with `with_2x2`, the `interaction_2x2` section and its base rung, and,
-    with `subsets`, that `rungs` has `L3` and `cfg` runs to `stop_after=y6`.
+    with `subsets`, that `rungs` has a rung of `SUBSET_RUNGS` and `cfg` runs to `stop_after=y6`.
     """
     if cfg.stages.dedup == "oracle":
         raise ValueError("ladder base config has stages.dedup=oracle; rungs need the crop default dedup mode")
@@ -580,30 +659,68 @@ def check_ladder_request(
             raise ValueError(f"{where}: with_2x2 needs an 'interaction_2x2' mapping with base, track and dedup")
         rung_config(cfg, ladder, spec["base"])
     if subsets:
-        if "L3" not in rungs:
-            raise ValueError("--subsets needs rung L3")
+        if not any(name in rungs for name in SUBSET_RUNGS):
+            raise ValueError("--subsets needs rung L3 or L5")
         if cfg.stop_after == "y1":
             raise ValueError("--subsets needs stop_after=y6")
 
 
+def check_verdict_request(cfg: EvalAppConfig, rungs: Sequence[str], *, subsets: bool, kind: str = "ladder") -> None:
+    """With `cfg.verdict_subsets` set, the request must be a ladder (`kind`, the eval command: `eval run`
+    and `eval sweep` judge no pass subset), `subsets` must be true and `rungs` must include rung L5
+    (`ValueError` otherwise)."""
+    if not cfg.verdict_subsets:
+        return
+    if kind != "ladder":
+        raise ValueError(f"verdict_subsets is judged by eval ladder only; eval {kind} does not read it")
+    if not (subsets and "L5" in rungs):
+        raise ValueError("verdict_subsets needs --subsets and rung L5")
+
+
+def check_verdict_subsets(bundles: Sequence[SynthRun], cfg: EvalAppConfig) -> None:
+    """With `cfg.verdict_subsets` set, every name must be one of `bundles`' pass-subset names
+    (`pass_subsets` of the frames `select_frames` selects under `cfg.passes`, the same selection
+    `prepare` makes), or `ValueError` naming the bundle. Reads no video or depth."""
+    if not cfg.verdict_subsets:
+        return
+    for run in bundles:
+        frames = select_frames(run.frames, base_step_m=run.meta.base_step_m, pitches=cfg.passes.pitches,
+                               sides=cfg.passes.sides, step_m=cfg.passes.step_m)
+        keys = list(dict.fromkeys(f.pass_key for f in frames))
+        names = [name for name, _ in pass_subsets(keys)]
+        for name in cfg.verdict_subsets:
+            if name not in names:
+                raise ValueError(f"{run.root}: verdict_subsets names {name!r}, not a pass subset of this "
+                                 f"bundle ({', '.join(names)})")
+
+
 def run_ladder(
     ctx: RunContext, cfg: EvalAppConfig, ladder: dict, rungs: Sequence[str], *, with_2x2: bool = False,
-    subsets: bool = False,
+    subsets: bool = False, context_for: Callable[[EvalAppConfig], RunContext] | None = None,
 ) -> dict:
     """Evaluate `rungs` (and, with `with_2x2`, the (track, dedup) 2 x 2 table on the ladder's base rung).
 
     `chain` lists the requested rungs in ladder order (baselines are not on
-    it). Every rung inherits `cfg.stages.det`; a rung without its own
-    `stages.dedup` (`L2c`, `L3`, `L3_dd`, the L4 rungs) inherits `cfg`'s; a
-    rung without its own `lift` section (`L2c`, `L3`, the L4 rungs) inherits
-    `cfg.lift`, so it uses `cfg`'s box depth method and parameters. So `cfg`
-    must use `stages.det=oracle`, `lift.depth` other than `det_depth`,
-    `stages.dedup` other than `oracle`, and no noise. A rung with noise (the
-    L4 rungs) runs once per `cfg.noise.seeds` entry and is combined
-    (`combine_seeds`). Each 2 x 2 cell is evaluated with its own config; its
-    values are None under `stop_after=y1`. Every rung and cell config is
-    checked against `ctx` (`_check_config`) before any of them runs. With
-    `subsets`, rung `L3` alone also gets the pass-subset table
+    it); `rungs` holds their results in the requested order. A rung inherits
+    `cfg.stages.det` unless it sets its own (L5: `cached`); a rung without its
+    own `stages.dedup` (`L2c`, `L3`, `L3_dd`, the L4 and L5 rungs) inherits
+    `cfg`'s; a rung without its own `lift` section (`L2c`, `L3`, the L4 and L5
+    rungs) inherits `cfg.lift`, so it uses `cfg`'s box depth method and
+    parameters. So `cfg` must use `stages.det=oracle`, `lift.depth` other than
+    `det_depth`, `stages.dedup` other than `oracle`, and no noise. A rung with
+    noise (the L4 rungs, `L5_L4base`) runs once per `cfg.noise.seeds` entry and
+    is combined (`combine_seeds`). Each 2 x 2 cell is evaluated with its own
+    config on `ctx`; its values are None under `stop_after=y1`.
+
+    A rung whose `_prepared_settings` equal `ctx.prepared` runs on `ctx`. The
+    others are grouped by their `_prepared_settings` (first-seen order); each
+    group runs on `context_for(the group's first config)`, one such context at
+    a time, so L5 and `L5_L4base` (which differ in noise only) share one. Such a
+    rung may change the detector, not `FRAME_KEYS` (`_check_frames`); without
+    `context_for` it is refused as `evaluate` refuses it (`_check_config`).
+    Every rung and cell config is checked before any of them runs, and the
+    rungs of a group against their own context before they run. With
+    `subsets`, the rungs of `SUBSET_RUNGS` alone also get the pass-subset table
     (`evaluate(..., subsets=True)`).
     """
     check_ladder_request(cfg, ladder, rungs, with_2x2=with_2x2, subsets=subsets)
@@ -616,14 +733,36 @@ def run_ladder(
             for d in spec["dedup"]:
                 d = cfg.stages.dedup if d == "crop_default" else d
                 cells.append((track, d, _patched(base, {"stages": {"track": track, "dedup": d}})))
-    for c in [*configs.values(), *(c for _, _, c in cells)]:
+    on_ctx: list[str] = []
+    groups: dict[str, list[str]] = {}
+    for name, c in configs.items():
+        settings = _prepared_settings(c)
+        if settings == ctx.prepared:
+            on_ctx.append(name)
+            continue
+        _check_frames(ctx, c)
+        if context_for is None:
+            _check_config(ctx, c)
+        groups.setdefault(json.dumps(settings, sort_keys=True), []).append(name)
+    for c in [*(configs[name] for name in on_ctx), *(c for _, _, c in cells)]:
         _check_config(ctx, c)
-    out = {"chain": [n for n in (ladder.get("rungs") or {}) if n in rungs],
-           "rungs": {name: evaluate_seeds(ctx, c, subsets=subsets and name == "L3") for name, c in configs.items()},
-           "interaction_2x2": None}
+
+    def run_rung(rung_ctx: RunContext, name: str) -> dict:
+        return evaluate_seeds(rung_ctx, configs[name], subsets=subsets and name in SUBSET_RUNGS)
+
+    results = {name: run_rung(ctx, name) for name in on_ctx}
+    interaction = None
     if with_2x2:
-        out["interaction_2x2"] = {"cells": [_cell(track, d, evaluate(ctx, c)["y6"]) for track, d, c in cells]}
-    return out
+        interaction = {"cells": [_cell(track, d, evaluate(ctx, c)["y6"]) for track, d, c in cells]}
+    for names in groups.values():
+        group_ctx = context_for(configs[names[0]])
+        for name in names:
+            _check_config(group_ctx, configs[name])
+        results.update((name, run_rung(group_ctx, name)) for name in names)
+        group_ctx = None   # one extra context at a time: drop it before the next group's
+    return {"chain": [n for n in (ladder.get("rungs") or {}) if n in rungs],
+            "rungs": {name: results[name] for name in configs},
+            "interaction_2x2": interaction}
 
 
 def _cell(track: str, dedup_mode: str, y6: dict | None) -> dict:

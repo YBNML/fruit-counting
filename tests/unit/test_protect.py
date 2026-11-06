@@ -21,17 +21,19 @@ from counting.config.loader import load_yaml_model
 from counting.data.formats.orchard_synth import SynthRun
 from counting.evaluation.cli import eval_app
 from counting.evaluation.protect import (
-    LOG_HEADER, ProtectedRequest, append_log_row, check_test_bundles, check_test_grid, check_test_log,
-    check_test_request, earlier_log_runs,
+    LOG_HEADER, ProtectedRequest, append_log_row, check_test_bundles, check_test_caches, check_test_grid,
+    check_test_log, check_test_request, check_test_rungs, detect_log_row, earlier_log_runs,
 )
-from counting.evaluation.runner import CheckFailed, ProtectionError, load_ladder
+from counting.evaluation.runner import CheckFailed, ProtectionError, load_ladder, rung_config
 from counting.evaluation.sweep import Grid, load_grid
+from tests.unit.cachefake import write_truth_cache
 from tests.unit.conftest import budget_seconds
-from tests.unit.synthfake import SIDECAR_COMMIT, load_splits
+from tests.unit.synthfake import SIDECAR_COMMIT, fake_cfg, load_splits
 
 ROOT = Path(__file__).resolve().parents[2]
 SWEEPS = ROOT / "configs" / "eval" / "sweeps"
 LADDER = load_ladder(SWEEPS / "ladder.yaml")
+L5LADDER = load_ladder(SWEEPS / "ladder_l5.yaml")
 FROZEN = "configs/eval/frozen/apple_test.yaml"
 MISSING = "configs/eval/frozen/apple_missing.yaml"     # its bundle path does not exist
 OLD_LOG = "configs/eval/frozen/apple_old_log.yaml"     # MISSING, with its own output folder `old_log`
@@ -49,23 +51,28 @@ def _commit(repo):
     _git(repo, "commit", "-qm", "x")
 
 
-def _make_frozen_repo(repo, out, configs, outs=None):
+def _make_frozen_repo(repo, out, configs, outs=None, patches=None, files=None):
     """A git repo with copies of the eval files a test run reads, and `configs` ({repo path: runs}) committed.
 
     Each config is `apple_dev.yaml` with split test, tuning false, stop_after y1 and output under `out`
-    (or under `outs[repo path]`).
+    (or under `outs[repo path]`), with `patches[repo path]` ({section: {key: value}}) merged into its
+    sections one level deep. `files` ({repo path: text}) are written as they are and committed too.
     """
-    for rel in ("splits.yaml", "criteria.yaml", "sweeps/ladder.yaml", "sweeps/pose_noise.yaml",
-                "sweeps/det_noise.yaml"):
+    for rel in ("splits.yaml", "criteria.yaml", "sweeps/ladder.yaml", "sweeps/ladder_l5.yaml",
+                "sweeps/pose_noise.yaml", "sweeps/det_noise.yaml"):
         (repo / "configs" / "eval" / rel).parent.mkdir(parents=True, exist_ok=True)
         shutil.copy(ROOT / "configs" / "eval" / rel, repo / "configs" / "eval" / rel)
     raw = yaml.safe_load((ROOT / "configs" / "eval" / "apple_dev.yaml").read_text(encoding="utf-8"))
     for rel, runs in configs.items():
+        conf = {**raw, "run_name": "apple_test", "split": "test", "tuning": False, "stop_after": "y1",
+                "runs": [str(r) for r in runs], "output_dir": str((outs or {}).get(rel, out))}
+        for section, values in (patches or {}).get(rel, {}).items():
+            conf[section] = {**(conf.get(section) or {}), **values}
         (repo / rel).parent.mkdir(parents=True, exist_ok=True)
-        (repo / rel).write_text(yaml.safe_dump({**raw, "run_name": "apple_test", "split": "test", "tuning": False,
-                                                "stop_after": "y1", "runs": [str(r) for r in runs],
-                                                "output_dir": str((outs or {}).get(rel, out))}),
-                                encoding="utf-8")
+        (repo / rel).write_text(yaml.safe_dump(conf), encoding="utf-8")
+    for rel, text in (files or {}).items():
+        (repo / rel).parent.mkdir(parents=True, exist_ok=True)
+        (repo / rel).write_text(text, encoding="utf-8")
     subprocess.run(["git", "init", "-q", str(repo)], check=True)
     _commit(repo)
     return repo
@@ -80,11 +87,11 @@ def frozen_repo(tmp_path_factory, heldout_run, apple_run):
         outs={OLD_LOG: root / "old_log"})
 
 
-def _check(repo, config=None, *, sets=(), runs=(), files=None, grid=None, ladder=None, code=CLEAN):
+def _check(repo, config=None, *, sets=(), runs=(), files=None, grid=None, ladder=None, code=CLEAN, overrides=None):
     """`check_test_request` on the frozen config's settings; `config` is the --config path (default: absolute)."""
     if files is None:
         files = {"--splits": repo / "configs/eval/splits.yaml", "--criteria": repo / "configs/eval/criteria.yaml"}
-    return check_test_request(load_yaml_model(repo / FROZEN, EvalAppConfig),
+    return check_test_request(load_yaml_model(repo / FROZEN, EvalAppConfig, overrides=overrides),
                               config_path=repo / FROZEN if config is None else config, sets=sets, runs=runs,
                               files=files, grid=grid, ladder=ladder, repo=repo, code=code)
 
@@ -147,6 +154,8 @@ def test_test_request_refusals_name_each_condition(frozen_repo, tmp_path):
          "split=test needs --criteria to be a file tracked in the counting repository"),
         (dict(files={"--splits": frozen_repo / "configs/eval/nope.yaml"}), "split=test needs --splits to be a file"),
         (dict(files={"--splits": splits, "--ladder": SWEEPS / "ladder.yaml"}), "split=test needs --ladder to be a file"),
+        (dict(overrides=["detector.cache=/no/such/cache"]),
+         "split=test with detector.cache needs detector.digests in the frozen config"),
     ]
     for kw, phrase in cases:
         with pytest.raises(ProtectionError, match=re.escape(phrase)):
@@ -158,13 +167,13 @@ def test_only_pose_noise_is_a_test_grid():
              "det_noise.yaml": "point 'detector.noise.miss_p=0.1' changes stages.det"}
     for path in sorted(SWEEPS.rglob("*.yaml")):
         name = str(path.relative_to(SWEEPS))
-        if name == "ladder.yaml":
+        if name in ("ladder.yaml", "ladder_l5.yaml"):
             continue
         if name == "pose_noise.yaml":
-            check_test_grid(load_grid(path), LADDER)
+            check_test_grid(load_grid(path), L5LADDER)
             continue
         with pytest.raises(ProtectionError, match=re.escape(first.get(name, "split=test grid may change only"))):
-            check_test_grid(load_grid(path), LADDER)
+            check_test_grid(load_grid(path), L5LADDER)
 
 
 def test_test_grid_refuses_seeds_bare_sections_and_missing_bases():
@@ -225,6 +234,50 @@ def test_test_log_rows_and_earlier_runs(tmp_path):
     for call in (lambda: check_test_log(old), lambda: earlier_log_runs(old, config_hash="h", extra="e")):
         with pytest.raises(ValueError, match=re.escape(phrase)):
             call()
+
+
+def test_test_caches_must_match_the_pins_and_the_detect_log(heldout_run, tmp_path):
+    run = SynthRun.open(heldout_run)
+    rid, fp = run.meta.run_id, run.meta.fingerprint
+    cache_dir = tmp_path / "detect" / "0123456789abcdef"
+    digest = write_truth_cache(heldout_run, cache_dir)
+    base = ("split=test", "tuning=false", f"detector.cache={cache_dir}")
+
+    def cfg(*sets):
+        return fake_cfg(heldout_run, "apple", *base, *sets)
+
+    def pin(d):
+        return f"detector.digests={{{rid}: '{d}'}}"
+
+    for c, phrase in ((cfg(f"detector.digests={{other: '{digest}'}}"), f"detector.digests pins no cache for run {rid}"),
+                      (cfg(pin("0" * 64)), f"cache digest {digest[:16]} differs from the pinned {'0' * 16}"),
+                      (cfg(pin(digest)), f"no counting detect row for cache {digest[:16]} of bundle {fp[:12]}")):
+        with pytest.raises(ProtectionError, match=re.escape(phrase)):
+            check_test_caches([run], c)
+    log = cache_dir.parent / "test_log.csv"
+    row = dict(date="d", config_rel="configs/detect/frozen/d.yaml", config_hash="h", weights_sha256="f" * 64,
+               digests=[digest], commit="c")
+    append_log_row(log, detect_log_row(fingerprints=["0" * 64], **row))           # another bundle's row
+    with pytest.raises(ProtectionError, match="no counting detect row"):
+        check_test_caches([run], cfg(pin(digest)))
+    append_log_row(log, detect_log_row(fingerprints=[fp], **row))
+    assert check_test_caches([run], cfg(pin(digest))) == [{"run_id": rid, "digest": digest}]
+    gone = fake_cfg(heldout_run, "apple", *base[:2], f"detector.cache={tmp_path / 'none'}", pin(digest))
+    with pytest.raises(ProtectionError, match="split=test needs the pinned detection cache file"):
+        check_test_caches([run], gone)
+
+
+def test_test_runs_take_cached_rung_settings_from_the_frozen_config(heldout_run, tmp_path):
+    cfg = fake_cfg(heldout_run, "apple", "split=test", "tuning=false", f"detector.cache={tmp_path}",
+                   f"detector.digests={{r: '{'a' * 64}'}}")
+    ladder = {"rungs": {"L5": {"stages": {"det": "cached"}}, "L3h": {"tracker": {"score_hi": 0.7}},
+                        "L5c": {"stages": {"det": "cached"}, "detector": {"cache": str(tmp_path / "x")}},
+                        "L5h": {"stages": {"det": "cached"}, "tracker": {"score_hi": 0.7}}}}
+    check_test_rungs(cfg, {n: rung_config(cfg, ladder, n) for n in ("L5", "L3h")})
+    for name in ("L5c", "L5h"):
+        with pytest.raises(ProtectionError, match=re.escape(f"split=test: rung {name} changes the detector or "
+                                                            "tracker settings of a cached rung")):
+            check_test_rungs(cfg, {name: rung_config(cfg, ladder, name)})
 
 
 def _invoke(repo, monkeypatch, *args):
@@ -307,7 +360,7 @@ def test_eval_ladder_on_the_test_split_logs_every_run_and_warns_on_reruns(heldou
     res = json.loads((d1 / "results.json").read_text(encoding="utf-8"))
     rec = json.loads((d1 / "record.json").read_text(encoding="utf-8"))
     verdicts = res["verdicts"]["L1"]
-    assert res["split"] == "test" and res["schema_version"] == 5 and "warning:" not in out1
+    assert res["split"] == "test" and res["schema_version"] == 6 and "warning:" not in out1
     assert [v["metric"] for v in verdicts] == ["y1.e1_median", "y1.e1_max", "y1.dup_rate", "y1.miss_rate",
                                                "y1.merge_rate"] and res["pooled"]["L1"]["n_runs"] == 1
     assert "**판정 (test, 장면 시드 1개)**" in (d1 / "report.md").read_text(encoding="utf-8")
@@ -327,3 +380,46 @@ def test_eval_ladder_on_the_test_split_logs_every_run_and_warns_on_reruns(heldou
     out2, d2, rows = ladder()
     assert d2 != d1 and len(rows) == 2 and rows[1]["experiment_id"] == d2.name
     assert f"warning: test_log.csv already lists 1 test run(s) of config {row['config_hash']}" in out2
+
+
+def test_eval_ladder_on_test_with_L5_checks_the_caches_and_judges_detection(heldout_run, tmp_path, monkeypatch):
+    run = SynthRun.open(heldout_run)
+    rid, fp = run.meta.run_id, run.meta.fingerprint
+    good = tmp_path / "detect" / "0123456789abcdef"
+    digest = write_truth_cache(heldout_run, good)
+    append_log_row(good.parent / "test_log.csv", detect_log_row(
+        date="d", config_rel="configs/detect/frozen/d.yaml", config_hash="h", weights_sha256="f" * 64,
+        fingerprints=[fp], digests=[digest], commit="c"))
+
+    def det(cache_dir, digests=None):
+        d = {"positives": "count1", "cache": str(cache_dir), "noise": None}
+        return {"passes": {"step_m": 0.45}, "detector": d if digests is None else {**d, "digests": digests}}
+
+    confs = {"configs/eval/frozen/l5.yaml": det(good, {rid: digest}), "configs/eval/frozen/l5_nopin.yaml": det(good),
+             "configs/eval/frozen/l5_wrong.yaml": det(good, {rid: "0" * 64})}
+    out = tmp_path / "out"
+    patched = copy.deepcopy(dict(L5LADDER))
+    patched["rungs"]["L5"] = {**patched["rungs"]["L5"], "tracker": {"score_hi": 0.7}}
+    repo = _make_frozen_repo(tmp_path / "repo", out, {rel: [heldout_run] for rel in confs}, patches=confs,
+                             files={"configs/eval/sweeps/ladder_l5h.yaml": yaml.safe_dump(patched)})
+    l5 = ["ladder", "--ladder", "configs/eval/sweeps/ladder_l5.yaml", "--rungs", "L5", "--config"]
+    l5h = ["ladder", "--ladder", "configs/eval/sweeps/ladder_l5h.yaml", "--rungs", "L5", "--config"]
+    # The no-detect-log rejection is unit-tested directly (`test_test_caches_must_match_the_pins_and_the_detect_log`).
+    for args, phrase in (([*l5, "configs/eval/frozen/l5_nopin.yaml"], "split=test with detector.cache needs detector.digests"),
+                         ([*l5, "configs/eval/frozen/l5_wrong.yaml"], f"cache digest {digest[:16]} differs from the pinned"),
+                         ([*l5h, "configs/eval/frozen/l5.yaml"],
+                          "split=test: rung L5 changes the detector or tracker settings of a cached rung")):
+        r = _invoke(repo, monkeypatch, *args)
+        assert r.exit_code == 1 and phrase in r.output, (args, r.output)
+    assert not out.exists()
+    r = _invoke(repo, monkeypatch, *l5, "configs/eval/frozen/l5.yaml")
+    assert r.exit_code == 0, r.output
+    folder = Path(r.output.splitlines()[0])
+    res = json.loads((folder / "results.json").read_text(encoding="utf-8"))
+    (row,) = list(csv.DictReader((out / "test_log.csv").read_text(encoding="utf-8").splitlines()))
+    rows = [v for vs in res["verdicts"].values() for v in vs]
+    assert [v["metric"] for v in res["verdicts"]["L5"]] == ["y1.e1_median"] and len(res["verdicts"]["detection"]) == 4
+    assert row["verdict"] == f"{sum(v['ok'] is True for v in rows)}/5" and digest in row["fingerprints"].split(";")
+    report = (folder / "report.md").read_text(encoding="utf-8")
+    assert "**판정 (test, 장면 시드 1개)**" in report and "| L5 검출 30° | detection.recall |" in report
+    assert "budget" not in res and not (folder / "budget.csv").exists() and "오차 예산" not in report   # one rung

@@ -144,7 +144,7 @@ def test_eval_run_with_noise_writes_seed_rows(leaf_runs, tmp_path):
     (d,) = (tmp_path / "out" / "apple_dev").iterdir()
     res = json.loads((d / "results.json").read_text(encoding="utf-8"))
     rung = res["runs"][0]["rungs"]["run"]
-    assert res["schema_version"] == 5 and rung["noisy"] and rung["seeds"] == [0, 1]
+    assert res["schema_version"] == 6 and rung["noisy"] and rung["seeds"] == [0, 1]
     assert rung["noise"]["detector"]["miss_p"] == 0.1 and rung["noise"]["depth_dropout"] == 0.05
     line = next(line for line in r.output.splitlines() if line.startswith("run: row U="))
     assert line.endswith(" (mean over noise seeds 0,1)")
@@ -204,11 +204,13 @@ def test_eval_run_reordered_runs_stay_reproducible(leaf_runs, tmp_path):
     assert (d / "results.json").read_bytes() == b1
 
 
-def test_eval_run_unsupported_option_exits_2(apple_run, tmp_path):
-    args = ["run", "--config", _cfg_file(tmp_path, apple_run, "apple"), "--splits", SPLITS,
-            "--set", "detector.cache=x"]
-    r = runner.invoke(eval_app, args)
-    assert r.exit_code == 2 and "detector.cache is not supported in this version" in r.output
+def test_eval_run_cached_without_a_cache_exits_2(apple_run, tmp_path):
+    base = ["run", "--config", _cfg_file(tmp_path, apple_run, "apple"), "--splits", SPLITS, "--set", "stages.det=cached"]
+    r = runner.invoke(eval_app, base)
+    assert r.exit_code == 2 and "stages.det=cached needs detector.cache" in r.output, r.output
+    (tmp_path / "empty").mkdir()
+    r = runner.invoke(eval_app, [*base, "--set", f"detector.cache={tmp_path / 'empty'}"])
+    assert r.exit_code == 2 and "no detection cache for this bundle" in r.output, r.output
 
 
 def test_truth_malformed_summary_exits_2(tmp_path):

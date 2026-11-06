@@ -64,6 +64,47 @@ result = pipe.run_numpy(read_image_rgb("image.jpg"), image_path="image.jpg")
 print(result.raw_count, result.verified_count)
 ```
 
+### 합성 렌더 채점 (orchard_synth)
+
+합성 렌더(orchard_synth 출력)의 정답 자세·깊이·박스를 기준으로 과수원 파이프라인(오라클 검출 → 추적 → 3D 라프팅 → 다중 시야 중복 제거 → 나무 배정)을 채점하는 별도 도구다. 아래는 명령과 규칙만 적는다.
+
+```bash
+counting eval truth <bundle...> [--pitches 30,50] [--sides A,B] [--variant count1]
+counting eval ladder --config configs/eval/apple_val.yaml [--ladder configs/eval/sweeps/ladder.yaml] [--rungs L1,L3] [--with-2x2] [--subsets]
+counting eval sweep --config configs/eval/apple_val.yaml --grid configs/eval/sweeps/val/<grid>.yaml [--ladder configs/eval/sweeps/ladder.yaml]
+```
+
+- `eval truth`는 하나 이상의 묶음에서 패스/나무 정답 표를 찍고 요약·기하·분할 확인을 돈다.
+- `eval ladder`는 오라클 사다리(와, 학습 검출기의 캐시 검출 칸을 추가한 `--ladder configs/eval/sweeps/ladder_l5.yaml`)를 돌려 실험 폴더를 쓴다.
+- `eval sweep`은 격자 파일의 점들을(사다리 칸과 곱해서도) 돌려 `sweep.csv`가 들어간 같은 모양의 실험 폴더를 쓴다.
+
+학습 검출기는 다음 두 명령으로 만들고 캐시한다. 캐시는 가중치마다 한 번만 쓴다(묶음의 캐시 파일이 이미 있으면 `detect`는 아무것도 쓰지 않고 멈춘다).
+
+```bash
+counting train detector --config configs/train/<config>.yaml
+counting detect --config configs/detect/<config>.yaml --weights <weights path> --run <bundle> [--run <bundle> ...]
+```
+
+- `detect`가 쓰는 캐시 폴더는 `<output_dir>/<가중치 sha256 앞 16자>/<run_id>.npz`다.
+
+```bash
+counting eval detmetrics --config configs/eval/apple_val.yaml --cache runs/detect/<가중치 sha256 앞 16자> [--nms-iou 0.5] [--edge-snap-px 2]
+```
+
+- 캐시를 읽을 때의 후처리(클래스 무관 NMS, 가장자리 맞춤, 최소 상자 크기)는 설정의 `detector.post`를 따른다. NMS와 가장자리 맞춤은 위 두 옵션으로 그때만 바꿀 수 있고, 최소 상자 크기는 `--set detector.post.min_short_px=<px>`로 바꾼다.
+
+학습 검출기의 캐시 검출을 사다리에 얹어 돌리려면:
+
+```bash
+counting eval ladder --config configs/eval/apple_val.yaml --ladder configs/eval/sweeps/ladder_l5.yaml --set detector.cache=runs/detect/<가중치 sha256 앞 16자>
+```
+
+test 분할은 `configs/eval/frozen/`에 커밋된 설정으로만 돈다. `--set`·`--run`을 받지 않고, 작업 트리가 깨끗해야 하며, 캐시를 쓰는 칸은 고정 설정에 캐시 digest가 박혀 있어야 하고 그 digest가 `counting detect`의 기록과 맞아야 한다(캐시 칸의 검출기·추적기 설정도 고정 설정 그대로다). 한 번 돌 때마다 `runs/eval/test_log.csv`에 한 줄이 남는다.
+
+결과는 `<output_dir>/<run_name>/<experiment_id>/` 폴더에 `results.json`, `config.yaml`, `record.json`, `report.md`, `per_pass.csv`, `per_tree.csv`(사다리나 단일 실행)·`sweep.csv`(격자), 그리고 학습 검출기 칸을 채점한 사다리라면 `budget.csv`가 함께 생긴다. 같은 실험 id를 다시 돌리면 `results.json`이 바이트 단위로 같아야 하고, 다르면 거부되며 아무 파일도 덮어쓰지 않는다.
+
+합성 렌더·정답 자세·보정 전 값이다. 실제 과원 정확도가 아니다. 검출기는 COCO 사전학습 가중치에서 시작해 연구·비상업 용도로만 쓴다.
+
 ## 진행 상황
 
 - [x] Foundation (Plan 1): 스캐폴드, 설정, 데이터 진단, 추론 파이프라인

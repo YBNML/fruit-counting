@@ -1,0 +1,4 @@
+# Frame spacing on the learned-detector rung (exp, report only).
+bases: [L5]
+factors:
+  passes.step_m: [0.05, 0.075, 0.3]

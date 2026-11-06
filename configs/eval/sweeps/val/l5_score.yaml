@@ -1,0 +1,5 @@
+# Learned-detector rung: the operating score and the cached-rung minimum track length, chosen together on val.
+bases: [L5]
+product:
+  tracker.score_hi: [0.3, 0.4, 0.5, 0.6, 0.7, 0.8]
+  tracker.min_obs_cached: [1, 2, 3]

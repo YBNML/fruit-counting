@@ -10,13 +10,17 @@ several scenes into one summary (the metrics in `POOLED_KEYS`):
   `attribution_error` = Σ|U - U_truth_attr| / ΣG6 (both `None` when ΣG6 is 0),
   and the rates `miss_rate` and `excess_rate` of the scenes' row ledgers combined.
 
+With `pitches`, the y1 half pools only the passes at those camera pitches.
+
 `pool_rung` pools one rung across bundles; for a noisy rung (every bundle sharing
 the same noise `seeds`, or `ValueError`) it pools each noise seed across the
 bundles first (their `per_seed[i]`), then averages the seeds' pooled summaries
 (`seeds._mean`), so the result is a seed mean rather than a single median over
 every seed's passes.
 `ladder_pooled` runs `pool_rung` over every rung of a set of bundles, in the
-first bundle's rung order.
+first bundle's rung order. When a rung of `PITCH_JUDGED_RUNGS` ran and the crop is
+given, every rung also gets `y1_judged`, its y1 pooled over the `JUDGED_PITCHES`
+passes alone (judged on the `PITCH_JUDGED_RUNGS` rungs, reported on the others).
 
 `ladder_verdicts` compares `ladder_pooled`'s summaries to `criteria[kind][rung][crop]`
 (`kind` is `y1` then `y6`; a rung whose pooled `kind` is `None`, e.g. under
@@ -26,13 +30,19 @@ its pooled value (`unit="pooled"`); every other metric is judged scene by scene
 `False` if any scene's is `False`, else `None` if any scene's is `None`, else
 `True`. Every row keeps each scene's own value, and, for a noisy rung, its
 noise-seed spread, under `per_run` (in the given bundle order), so a report can
-be built from `results.json` alone without rereading the bundles.
+be built from `results.json` alone without rereading the bundles. The y1 rows of a
+`PITCH_JUDGED_RUNGS` rung take the `JUDGED_PITCHES` values instead (`y1_judged` and
+`judged_y1`) and name the pitches.
+
+`subset_verdicts` judges rung L5's pass subsets (`runner._score_subsets`'s table) the
+same way, each against its own truth: `row_abs_e_pipe` scene by scene (the same scene
+rule, shared via `_scene_ok`), `tree_mae_over_mean`/`miss_rate`/`excess_rate` pooled.
 """
 
 from __future__ import annotations
 
 from dataclasses import fields
-from typing import Mapping, Sequence
+from typing import Iterable, Mapping, Sequence
 
 import numpy as np
 
@@ -44,6 +54,11 @@ POOLED_KEYS = {
     "y6": ("tree_mae_over_mean", "attribution_error", "miss_rate", "excess_rate"),
 }
 
+# The camera pitches (deg) of the passes and detection groups judged on a learned detector, per crop.
+JUDGED_PITCHES = {"pear": (45.0, 70.0), "apple": (30.0, 50.0)}
+# Rungs whose y1 is judged on the `JUDGED_PITCHES` passes alone; the other pitches are report-only there.
+PITCH_JUDGED_RUNGS = ("L5",)
+
 _LEDGER_FIELDS = tuple(f.name for f in fields(Ledger))
 
 
@@ -52,11 +67,14 @@ def _ledger_from(d: Mapping) -> Ledger:
     return Ledger(**{name: d[name] for name in _LEDGER_FIELDS})
 
 
-def pool_views(views: Sequence[Mapping]) -> dict:
+def pool_views(views: Sequence[Mapping], pitches: Sequence[float] | None = None) -> dict:
     """Pool noise-free evaluate-shaped `views`: a ladder rung per bundle, or one noise seed's
     per-bundle views. Shape: `{"n_runs", "y1": {...}, "y6": {...} | None}`.
+
+    With `pitches`, y1 pools only the passes at those pitches (y6 is unchanged); with no pass
+    there, `n_passes` is 0 and every other y1 value is None.
     """
-    passes = [p for v in views for p in v["y1"]["passes"]]
+    passes = [p for v in views for p in v["y1"]["passes"] if pitches is None or p["pitch"] in pitches]
     e1s = [abs(p["e1"]) for p in passes if p["e1"] is not None]
     rates = combine(_ledger_from(p["ledger"]) for p in passes).rates()
     y1 = {"n_passes": len(passes), "e1_median": float(np.median(e1s)) if e1s else None,
@@ -79,31 +97,46 @@ def pool_views(views: Sequence[Mapping]) -> dict:
     return {"n_runs": len(views), "y1": y1, "y6": y6}
 
 
-def pool_rung(items: Sequence[Mapping]) -> dict:
-    """Pool one rung's `items`, one per bundle (`pool_views(items)` without noise).
+def pool_rung(items: Sequence[Mapping], pitches: Sequence[float] | None = None) -> dict:
+    """Pool one rung's `items`, one per bundle (`pool_views(items, pitches)` without noise).
 
     A noisy rung's bundles must share `noise.seeds`, or `ValueError`. Otherwise `pool_views`
-    runs once per noise-seed index across the bundles' `per_seed[i]`, and the seeds' pooled
-    summaries are averaged with `seeds._mean`.
+    runs once per noise-seed index across the bundles' `per_seed[i]` (with `pitches`), and
+    the seeds' pooled summaries are averaged with `seeds._mean`.
     """
     if not items[0].get("noisy"):
-        return pool_views(items)
+        return pool_views(items, pitches)
     all_seeds = [it["seeds"] for it in items]
     if any(s != all_seeds[0] for s in all_seeds[1:]):
         raise ValueError(f"bundles disagree on the noise seeds: {all_seeds}")
     seeds = all_seeds[0]
-    return _mean([pool_views([it["per_seed"][i] for it in items]) for i in range(len(seeds))])
+    return _mean([pool_views([it["per_seed"][i] for it in items], pitches) for i in range(len(seeds))])
 
 
-def ladder_pooled(run_entries: Sequence[Mapping]) -> dict[str, dict]:
+def judged_y1(item: Mapping, crop: str) -> dict:
+    """The y1 half of `pool_views` over one bundle's rung or sweep cell `item`, at `JUDGED_PITCHES[crop]`
+    alone. Only `item["y1"]` is read, so a sweep cell that keeps no `y6.trees` works too."""
+    return pool_views([{"y1": item["y1"], "y6": None}], JUDGED_PITCHES[crop])["y1"]
+
+
+def ladder_pooled(run_entries: Sequence[Mapping], crop: str | None = None) -> dict[str, dict]:
     """`{rung: pool_rung([every bundle's that rung])}`, in the first bundle's rung order.
 
+    With `crop`, when a rung of `PITCH_JUDGED_RUNGS` is among them, every rung also gets
+    `y1_judged`: the y1 of `pool_rung` over the `JUDGED_PITCHES[crop]` passes alone.
     Every bundle must name the same set of rungs, or `ValueError`.
     """
     names = list(run_entries[0]["rungs"])
     if any(set(entry["rungs"]) != set(names) for entry in run_entries[1:]):
         raise ValueError("bundles disagree on the rungs")
-    return {name: pool_rung([entry["rungs"][name] for entry in run_entries]) for name in names}
+    judged = crop is not None and any(name in PITCH_JUDGED_RUNGS for name in names)
+    out = {}
+    for name in names:
+        items = [entry["rungs"][name] for entry in run_entries]
+        out[name] = pool_rung(items)
+        if judged:
+            out[name]["y1_judged"] = pool_rung(items, JUDGED_PITCHES[crop])["y1"]
+    return out
 
 
 def _ok(value, op: str, limit) -> bool | None:
@@ -114,6 +147,13 @@ def _ok(value, op: str, limit) -> bool | None:
     if op == "ge":
         return value >= limit
     raise ValueError(f"unknown criteria op: {op!r}")
+
+
+def _scene_ok(oks: Iterable[bool | None]) -> bool | None:
+    """The scene-row combination rule: `False` if any scene's `ok` is `False`, else `None` if any is
+    `None`, else `True`. Shared by `ladder_verdicts` and `subset_verdicts`."""
+    oks = list(oks)
+    return False if any(o is False for o in oks) else (None if any(o is None for o in oks) else True)
 
 
 def ladder_verdicts(
@@ -129,6 +169,10 @@ def ladder_verdicts(
     rung's matching `spread` entry or `None`. A row's `ok` is `None` wherever its compared value
     is `None`; a `"scene"` row's `ok` is `False` if any scene's is `False`, else `None` if any is
     `None`, else `True`. A rung left with no rows at all is left out of the result.
+
+    The y1 rows of a `PITCH_JUDGED_RUNGS` rung are judged on the `JUDGED_PITCHES[crop]` passes
+    alone (pooled: `pooled[rung]["y1_judged"]`, from `ladder_pooled(..., crop=crop)`; per scene:
+    `judged_y1`) and carry `"pitches"`; without such a pass, their values and `ok` are None.
     """
     out: dict[str, list[dict]] = {}
     for rung_name in run_entries[0]["rungs"]:
@@ -139,13 +183,17 @@ def ladder_verdicts(
             spec = ((criteria.get(kind) or {}).get(rung_name) or {}).get(crop)
             if not spec:
                 continue
-            pooled_vals = pooled[rung_name][kind]
+            judged = kind == "y1" and rung_name in PITCH_JUDGED_RUNGS
+            rungs = [entry["rungs"][rung_name] for entry in run_entries]
+            if judged:
+                pooled_vals, scene_vals = pooled[rung_name]["y1_judged"], [judged_y1(r, crop) for r in rungs]
+            else:
+                pooled_vals, scene_vals = pooled[rung_name][kind], [r[kind][metrics_key] for r in rungs]
             for key, lim in spec.items():
                 (op, limit), = lim.items()
                 per_run = []
-                for entry in run_entries:
-                    rung = entry["rungs"][rung_name]
-                    per_value = rung[kind][metrics_key].get(key)
+                for entry, rung, values in zip(run_entries, rungs, scene_vals):
+                    per_value = values.get(key)
                     spread = rung["spread"][kind][metrics_key].get(key) if rung.get("noisy") else None
                     per_run.append({"run_id": entry["meta"]["run_id"], "seed": entry["meta"]["seed"],
                                     "value": per_value, "spread": None if spread is None else list(spread),
@@ -154,14 +202,69 @@ def ladder_verdicts(
                     unit, value = "pooled", pooled_vals.get(key)
                     ok = _ok(value, op, limit)
                 else:
-                    oks = [p["ok"] for p in per_run]
                     unit, value = "scene", None
-                    ok = False if any(o is False for o in oks) else \
-                        (None if any(o is None for o in oks) else True)
-                rows.append({"metric": f"{kind}.{key}", "op": op, "limit": limit, "unit": unit,
-                            "value": value, "per_run": per_run, "ok": ok})
+                    ok = _scene_ok(p["ok"] for p in per_run)
+                row = {"metric": f"{kind}.{key}", "op": op, "limit": limit, "unit": unit,
+                       "value": value, "per_run": per_run, "ok": ok}
+                if judged:
+                    row["pitches"] = list(JUDGED_PITCHES[crop])
+                rows.append(row)
         if rows:
             out[rung_name] = rows
+    return out
+
+
+def subset_verdicts(
+    run_entries: Sequence[Mapping], criteria: Mapping, crop: str, names: Sequence[str],
+) -> dict[str, list[dict]]:
+    """Judge pass subsets `names` of rung L5 against `criteria["y6"]["L5"][crop]`, each subset scored
+    against its own truth (rung L5's `subsets` table, from `evaluate(..., subsets=True)`).
+
+    Keyed `f"L5[{name}]"`, in `criteria`'s metric order. `row_abs_e_pipe` is judged scene by scene
+    (`abs(e_pipe)`, the same scene rule as `ladder_verdicts`'s, via `_scene_ok`); `tree_mae_over_mean`,
+    `miss_rate` and `excess_rate` are pooled over the run entries: `tree_mae_over_mean` as
+    Sum(value * G6) / Sum(G6) over the subset's scenes with a pass, the rates from the subset
+    rows' ledgers `combine`d. A `name` missing from a bundle's rung L5 subset table raises
+    `ValueError` (defence only; the CLI's `check_verdict_subsets` catches this first).
+    """
+    spec = ((criteria.get("y6") or {}).get("L5") or {}).get(crop) or {}
+    out: dict[str, list[dict]] = {}
+    for name in names:
+        subset_rows = []
+        for entry in run_entries:
+            by_s = {r["S"]: r for r in entry["rungs"]["L5"]["subsets"]}
+            if name not in by_s:
+                raise ValueError(f"pass subset {name!r} is not in rung L5's table of {entry['meta']['run_id']}")
+            subset_rows.append(by_s[name])
+        rows = []
+        for key, lim in spec.items():
+            (op, limit), = lim.items()
+            per_run = []
+            for entry, s in zip(run_entries, subset_rows):
+                if key == "row_abs_e_pipe":
+                    per_value = None if s["e_pipe"] is None else abs(s["e_pipe"])
+                elif key == "tree_mae_over_mean":
+                    per_value = s["tree_mae_over_mean"]
+                else:
+                    per_value = None if s["ledger"] is None else _ledger_from(s["ledger"]).rates()[key]
+                per_run.append({"run_id": entry["meta"]["run_id"], "seed": entry["meta"]["seed"],
+                                "value": per_value, "spread": None, "ok": _ok(per_value, op, limit)})
+            if key == "row_abs_e_pipe":
+                unit, value = "scene", None
+                ok = _scene_ok(p["ok"] for p in per_run)
+            elif key == "tree_mae_over_mean":
+                weighted = [(s["tree_mae_over_mean"], s["G6"]) for s in subset_rows
+                           if s["G6"] and s["tree_mae_over_mean"] is not None]
+                den = sum(g for _, g in weighted)
+                unit, value = "pooled", (sum(v * g for v, g in weighted) / den if den else None)
+                ok = _ok(value, op, limit)
+            else:
+                ledgers = [_ledger_from(s["ledger"]) for s in subset_rows if s["ledger"] is not None]
+                unit, value = "pooled", (combine(ledgers).rates()[key] if ledgers else None)
+                ok = _ok(value, op, limit)
+            rows.append({"metric": f"y6.{key}", "op": op, "limit": limit, "unit": unit,
+                        "value": value, "per_run": per_run, "ok": ok})
+        out[f"L5[{name}]"] = rows
     return out
 
 

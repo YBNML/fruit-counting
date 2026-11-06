@@ -6,7 +6,7 @@ import yaml
 from pydantic import ValidationError
 
 from counting.config.eval_schema import (
-    DetNoise, EvalAppConfig, LiftConfig, NoiseConfig, SplitsConfig, TrackerConfig,
+    CachePostConfig, DetNoise, EvalAppConfig, LiftConfig, NoiseConfig, SplitsConfig, TrackerConfig,
 )
 from counting.config.hashing import config_hash
 from counting.config.loader import load_yaml_model
@@ -241,6 +241,43 @@ def test_noise_seeds_need_distinct_non_negative_values():
         raw["noise"]["seeds"] = seeds
         with pytest.raises(ValidationError, match=re.escape(phrase)):
             EvalAppConfig.model_validate(raw)
+
+
+def test_cache_settings_stay_out_of_unchanged_configs():
+    cfg = EvalAppConfig.model_validate(_raw())
+    dump = cfg.model_dump(mode="json")
+    assert set(dump["detector"]) == {"positives", "cache", "noise"} and "min_obs_cached" not in dump["tracker"]
+    explicit = _raw(detector={"positives": "count1", "cache": None, "noise": None, "post": None, "digests": None})
+    assert config_hash(EvalAppConfig.model_validate(explicit)) == config_hash(cfg)
+    tuned = EvalAppConfig.model_validate(_raw(tracker={**_raw()["tracker"], "min_obs_cached": 2}))
+    assert config_hash(tuned) != config_hash(cfg) and EvalAppConfig.model_validate(tuned.model_dump()) == tuned
+    p = cfg.detector.post_settings()
+    assert p == CachePostConfig() and (p.nms_iou, p.edge_snap_px, p.min_short_px) == (0.5, 2.0, 0.0)
+    assert (tuned.tracker.min_obs_for("cached"), tuned.tracker.min_obs_for("oracle"),
+            cfg.tracker.min_obs_for("cached")) == (2, 1, 1)
+
+
+def test_cached_detector_settings_are_checked():
+    det = {"positives": "count1", "noise": None}
+    with pytest.raises(ValidationError, match=re.escape("stages.det=cached needs detector.cache")):
+        EvalAppConfig.model_validate(_raw(stages={**_raw()["stages"], "det": "cached"}, detector={**det, "cache": None}))
+    with pytest.raises(ValidationError, match="detector.digests needs detector.cache"):
+        EvalAppConfig.model_validate(_raw(detector={**det, "cache": None, "digests": {"r": "a" * 64}}))
+    with pytest.raises(ValidationError, match=re.escape("detector.digests[r] must be a 64-character lowercase hex")):
+        EvalAppConfig.model_validate(_raw(detector={**det, "cache": "c", "digests": {"r": "A" * 64}}))
+    for post in ({"nms_iou": 0}, {"edge_snap_px": -1}, {"min_short_px": -1}, {"nms": 0.5}):
+        with pytest.raises(ValidationError):
+            EvalAppConfig.model_validate(_raw(detector={**det, "cache": "c", "post": post}))
+    ok = EvalAppConfig.model_validate(_raw(stages={**_raw()["stages"], "det": "cached"},
+                                           detector={**det, "cache": "runs/detect/x", "digests": {"r": "a" * 64}}))
+    assert ok.detector.cache == "runs/detect/x" and ok.detector.digests == {"r": "a" * 64}
+
+
+def test_verdict_subsets_name_at_least_one_subset():
+    with pytest.raises(ValidationError, match="verdict_subsets\n  List should have at least 1 item"):
+        EvalAppConfig.model_validate(_raw(verdict_subsets=[]))
+    assert EvalAppConfig.model_validate(_raw(verdict_subsets=["drop 20"])).verdict_subsets == ["drop 20"]
+    assert "verdict_subsets" not in EvalAppConfig.model_validate(_raw()).model_dump()
 
 
 def test_is_noisy():

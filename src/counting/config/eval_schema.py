@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field, NonNegativeInt, field_validator, model_validator
@@ -47,11 +48,40 @@ class DetNoise(BaseModel):
     score_min: float = Field(default=0.3, ge=0, le=1)
 
 
+def _unset(value: object) -> bool:
+    return value is None
+
+
+class CachePostConfig(BaseModel):
+    """Post-processing of cached detections before matching."""
+
+    model_config = ConfigDict(extra="forbid", allow_inf_nan=False)
+    nms_iou: float = Field(default=0.5, gt=0, le=1)
+    edge_snap_px: float = Field(default=2.0, ge=0)
+    min_short_px: float = Field(default=0.0, ge=0)
+
+
+# Cached-detector settings are read under stages.det=cached only; unset, they stay out of the dump and the config hash.
 class DetectorConfig(BaseModel):
     model_config = ConfigDict(extra="forbid")
     positives: Variant = "count1"
     cache: str | None = None
     noise: DetNoise | None = None
+    post: CachePostConfig | None = Field(default=None, exclude_if=_unset)
+    digests: dict[str, str] | None = Field(default=None, exclude_if=_unset)
+
+    @field_validator("digests")
+    @classmethod
+    def _check_digest_format(cls, v: dict[str, str] | None) -> dict[str, str] | None:
+        if v is None:
+            return v
+        for key, value in v.items():
+            if not re.fullmatch(r"[0-9a-f]{64}", value):
+                raise ValueError(f"detector.digests[{key}] must be a 64-character lowercase hex digest")
+        return v
+
+    def post_settings(self) -> CachePostConfig:
+        return self.post if self.post is not None else CachePostConfig()
 
 
 class LiftConfig(BaseModel):
@@ -112,6 +142,7 @@ class TrackerConfig(BaseModel):
     max_gap: int | None = Field(default=None, ge=1)
     repair_m: float = Field(default=0.04, ge=0)
     min_obs: int = Field(default=1, ge=1)
+    min_obs_cached: int | None = Field(default=None, ge=1, exclude_if=_unset)
     score_hi: float = Field(default=0.5, ge=0, le=1)
     score_lo: float = Field(default=0.1, ge=0, le=1)
 
@@ -120,6 +151,11 @@ class TrackerConfig(BaseModel):
         if self.score_lo > self.score_hi:
             raise ValueError("score_lo must be <= score_hi")
         return self
+
+    def min_obs_for(self, det: str) -> int:
+        if det == "cached" and self.min_obs_cached is not None:
+            return self.min_obs_cached
+        return self.min_obs
 
 
 class DedupConfig(BaseModel):
@@ -146,6 +182,8 @@ class EvalAppConfig(BaseModel):
     seed: int = 0
     stop_after: Literal["y1", "y6"] = "y6"
     output_dir: str = "runs/eval"
+    # Pass subsets (names from the pass-subset table) whose rung L5 row is judged too; read by eval ladder only.
+    verdict_subsets: list[str] | None = Field(default=None, min_length=1, exclude_if=_unset)
 
     @model_validator(mode="after")
     def _check_stage_combinations(self) -> EvalAppConfig:
@@ -158,6 +196,10 @@ class EvalAppConfig(BaseModel):
         if self.stages.det == "cached" and self.lift.depth == "det_depth":
             raise ValueError("det_depth needs oracle depth; use a box depth method (box_median or box_far) "
                              "with det=cached")
+        if self.stages.det == "cached" and self.detector.cache is None:
+            raise ValueError("stages.det=cached needs detector.cache (the folder of detection caches)")
+        if self.detector.digests is not None and self.detector.cache is None:
+            raise ValueError("detector.digests needs detector.cache")
         if self.split == "test" and self.tuning:
             raise ValueError("split=test requires tuning=false")
         return self

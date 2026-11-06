@@ -1,0 +1,4 @@
+# Box depth method on the oracle and the learned-detector rungs (report only).
+bases: [L3, L5]
+factors:
+  lift.depth: [box_median]

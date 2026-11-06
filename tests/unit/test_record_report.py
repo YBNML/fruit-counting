@@ -9,12 +9,13 @@ import numpy as np
 import pytest
 import yaml
 
+import counting.evaluation.report as report_module
 from counting.data.formats.orchard_synth import SynthRun
 from counting.evaluation.ledger import Ledger
 from counting.evaluation.record import experiment_id, git_state, request_extra
 from counting.evaluation.report import (
-    SCHEMA_VERSION, ReproducibilityError, _depth_err_line, _pitch_rows, _sweep_rows, _verdict_lines,
-    _y1_summary_line, criteria_rows, render_report, results_bytes, write_experiment,
+    SCHEMA_VERSION, ReproducibilityError, _depth_err_line, _pitch_rows, _SUBSET_VERDICT_NOTE, _sweep_rows,
+    _verdict_lines, _y1_summary_line, criteria_rows, render_report, results_bytes, write_experiment,
 )
 from counting.evaluation.runner import describe_run, evaluate, load_ladder, prepare, run_ladder
 from counting.evaluation.verdict import (
@@ -121,7 +122,7 @@ def test_report_depth_err_line(leaf_runs, l1_l3_report):
             f"p90 {s['p90_m']:.3f} m, p95 {s['p95_m']:.3f} m, 10 cm 넘게 가까움 {s['near_10cm']:+.1%}, "
             f"멂 {s['far_10cm']:+.1%}") in text
     assert l1_l3_report[1].count("- 깊이 오차(") == 1          # L1 (det_depth) has no line, L3 has one
-    assert SCHEMA_VERSION == 5
+    assert SCHEMA_VERSION == 6
 
 
 def test_contribution_row_names(apple_ladder, apple_ladder_ctx):
@@ -241,6 +242,17 @@ def test_sweep_rows_and_report_without_y6(tmp_path):
     assert "| baseline | L3 | - | +1.0% | +2.0% | - | - | - | - | - |" in render_report(res, criteria=None).splitlines()
     lines = render_report(res, criteria=CRIT).splitlines()
     assert "| baseline | L3 | - | +1.0% | +2.0% | - | - | - | - | 2/2 |" in lines and "- L3 · tracker.gate_m: -" in lines
+
+
+def test_write_experiment_writes_nothing_when_the_report_fails(tmp_path, monkeypatch):
+    def broken(results, *, criteria):
+        raise RuntimeError("report failed")
+
+    monkeypatch.setattr(report_module, "render_report", broken)
+    with pytest.raises(RuntimeError, match="report failed"):
+        write_experiment(tmp_path, cfg=fake_cfg(Path("bundle"), "apple"), results=_sweep_results(None), record={},
+                         criteria=None)
+    assert list(tmp_path.iterdir()) == []
 
 
 @pytest.fixture(scope="module")
@@ -498,6 +510,20 @@ def test_verdict_lines_name_unit_values_spread_and_count():
              "verdicts": ladder_verdicts(NOISY_TWO, ladder_pooled(NOISY_TWO), CRIT, "apple")}
     assert "| L4_base | y6.row_abs_e_pipe | 장면마다 | - | s1000 +20.0% (+15.0%~+25.0%), s1001 +5.0% (+0.0%~+10.0%) " \
            "| ≤+10.0% | FAIL |" in _verdict_lines(noisy)
+
+
+def test_verdict_lines_puts_a_blank_line_between_the_subset_note_and_the_table():
+    row = {"metric": "y6.row_abs_e_pipe", "unit": "scene", "value": None, "op": "le", "limit": 0.05, "ok": True,
+           "per_run": [{"seed": 1000, "value": 0.05, "spread": None, "ok": True}]}
+    res = {"split": "test", "runs": [{"meta": {"run_id": "a", "seed": 1000}, "rungs": {}}],
+           "verdicts": {"L5[A]": [row]}}
+    lines = _verdict_lines(res)
+    assert lines[0] == "**판정 (test, 장면 시드 1개)**"
+    assert lines[1] == _SUBSET_VERDICT_NOTE
+    assert lines[2] == ""          # a blank line, or CommonMark reads the table as the note's lazy continuation
+    assert lines[3] == "| 칸 | 지표 | 단위 | 합친 값 | 장면 시드별 | 기준 | 판정 |"
+    assert lines[4] == "|---|---|---|---|---|---|---|"
+    assert "| L5[A] | y6.row_abs_e_pipe | 장면마다 | - | s1000 +5.0% | ≤+5.0% | OK |" in lines
 
 
 def test_report_draws_the_verdict_table_for_test_runs_only(apple_ladder, apple_ladder_ctx):

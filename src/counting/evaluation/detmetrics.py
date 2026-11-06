@@ -13,10 +13,11 @@ background.
 `summarize` pools frames (frame order, then detection order, with stable sorts) into
 AP50 and the counts and rates at the operating and low score thresholds and at the
 F1-best one, with breakdowns by visibility, box size, row, label, image edge, match IoU
-and box depth. `summarize_groups` does this for all frames and per camera pitch, and
-`detection_verdicts` judges the val pitches against the criteria table. Results are
-JSON-shaped dicts of plain Python values; a ratio with a zero denominator, and a
-percentile of an empty set, is None.
+and box depth. `summarize_groups` does this for all frames and per camera pitch.
+`detection_verdicts` judges the val pitches against the criteria table, and
+`detection_rows` does the same for a ladder's rung L5 in the shape of the ladder
+verdicts. Results are JSON-shaped dicts of plain Python values; a ratio with a zero
+denominator, and a percentile of an empty set, is None.
 
 `bundle_frames` evaluates one bundle's selected frames against a `CachedDetector`, and
 `score_runs` groups them per bundle and pooled over all bundles; `render_detmetrics` and
@@ -42,7 +43,7 @@ from counting.detection.cached import CachedDetector
 from counting.evaluation.report import ReproducibilityError, results_bytes
 from counting.evaluation.runner import depth_error_stats
 from counting.evaluation.truth import is_positive
-from counting.evaluation.verdict import _ok
+from counting.evaluation.verdict import JUDGED_PITCHES, _ok
 from counting.multiview.lift import box_far_depth, box_median_depth, edge_touch
 
 # `schema_version` of a `counting eval detmetrics` result (`detmetrics.json`).
@@ -55,8 +56,6 @@ VISIB_BINS = ((0.0, 0.25, "<0.25"), (0.25, 0.35, "0.25-0.35"), (0.35, 0.5, "0.35
 SPLIT_VISIB_MAX = 0.6
 # `ignored_hit` also reports the ignored records with at least this many visible pixels.
 IGNORED_BIG_PX = 100
-# The camera pitches (deg) whose groups `detection_verdicts` judges, per crop.
-JUDGED_PITCHES = {"pear": (45.0, 70.0), "apple": (30.0, 50.0)}
 THRESHOLD_KEYS = ("operating", "low", "f1_max")
 M_KEYS = ("score", "tp", "fp", "fp_dup", "fp_merge", "fp_part", "fp_ign", "fp_bg", "ignored", "fn", "precision",
           "recall", "f1", "fp_per_frame", "split_rate", "split_rate_low_visib", "frag_only_rate")
@@ -188,9 +187,22 @@ def average_precision(scores, kind, n_pos: int) -> float | None:
     return float(envelope[hit].sum() / n_pos)
 
 
+def _tracker_threshold(t: float) -> float:
+    """`t` as the tracker compares it with the cached float32 scores.
+
+    NumPy compares a float32 array with a Python float in float32 (NEP 50), that is against
+    `float32(t)`. Widened back to float64, that value gives the same answer on the float64 copies
+    of the same scores, so a box scoring exactly `float32(t)` counts here as it counts for the
+    tracker, the score floor and the score-ordered matching.
+    """
+    return float(np.float32(t))
+
+
 def cross_class_pairs(raw: Detections, *, nms_iou: float, score: float) -> tuple[int, int]:
     """Pairs of `raw` boxes with different labels and IoU > `nms_iou`, and how many of those
-    have both scores below `score` but a sum at or above it."""
+    have both scores below `score` but a sum at or above it (`score` compared as the tracker
+    compares it, `_tracker_threshold`)."""
+    score = _tracker_threshold(score)
     s = raw.scores.astype(np.float64)
     pair = (box_iou(raw.boxes, raw.boxes) > nms_iou) & (raw.labels[:, None] != raw.labels[None, :])
     i, j = np.nonzero(np.triu(pair, k=1))
@@ -339,9 +351,10 @@ def _per_pos(j: FrameEval, mask: np.ndarray, of: np.ndarray) -> np.ndarray:
 
 
 def _at(j: FrameEval, n_frames: int, t: float) -> dict:
-    """The `M_KEYS` of the joined frames `j`, counting the detections that score at least `t`."""
+    """The `M_KEYS` of the joined frames `j`, counting the detections that score at least `t`
+    (compared as the tracker compares it, `_tracker_threshold`; `score` stays `t`)."""
     n_pos = len(j.pos_visib)
-    above = j.scores >= t
+    above = j.scores >= _tracker_threshold(t)
     tp_m, fp_m = above & (j.kind == 1), above & (j.kind == 0)
     tp, fp = _count(tp_m), _count(fp_m)
     tp_per = _per_pos(j, tp_m, j.tp_of)
@@ -389,7 +402,8 @@ def summarize(frames: Sequence[FrameEval], thresholds: Mapping[str, float]) -> d
     """Pool `frames` into AP50, the `M_KEYS` at each of `THRESHOLD_KEYS`, and breakdowns.
 
     `thresholds` is `{"operating": t_hi, "low": t_lo}`; a detection counts at a threshold
-    when its score is at least it. `f1_max` is the detection score of largest F1 (every
+    when its score is at least it, compared as the tracker compares it (`_tracker_threshold`).
+    `f1_max` is the detection score of largest F1 (every
     value None when no threshold has an F1). Recall by visibility is given at both
     thresholds; every other breakdown is at the operating one.
     """
@@ -401,15 +415,15 @@ def summarize(frames: Sequence[FrameEval], thresholds: Mapping[str, float]) -> d
           "f1_max": {k: None for k in M_KEYS} if best is None else _at(j, n_frames, best)}
 
     def seen_at(t: float) -> np.ndarray:
-        return _per_pos(j, (j.scores >= t) & (j.kind == 1), j.tp_of) > 0
+        return _per_pos(j, (j.scores >= _tracker_threshold(t)) & (j.kind == 1), j.tp_of) > 0
 
-    above = j.scores >= t_hi
+    above = j.scores >= _tracker_threshold(t_hi)
     tp_m, judged = above & (j.kind == 1), above & (j.kind != -1)
     tp_pos = j.tp_of[tp_m]
     seen = seen_at(t_hi)
     truth_bag, det_bag = j.pos_bagged[tp_pos], j.det_label[tp_m] == 1
     truth_edge, det_edge = j.pos_edge[tp_pos], j.det_edge[tp_m]
-    ign_hit = j.ign_hit >= t_hi
+    ign_hit = j.ign_hit >= _tracker_threshold(t_hi)
     depth = None
     if j.has_depth:
         depth = {"box_far": _depth_cell(j.err_far[tp_m]), "box_median": _depth_cell(j.err_median[tp_m]),
@@ -446,19 +460,17 @@ def summarize_groups(frames: Sequence[FrameEval], thresholds: Mapping[str, float
     return groups
 
 
-def detection_verdicts(groups: Mapping[str, dict], criteria: Mapping | None, crop: str,
-                       split: str) -> list[dict] | None:
-    """Judge the operating-point recall and precision of the `JUDGED_PITCHES[crop]` groups.
+def _detection_spec(criteria: Mapping | None, crop: str) -> Mapping | None:
+    """`criteria["detection"]["L5"][crop]`, or None when any level is missing."""
+    if not criteria:
+        return None
+    return ((criteria.get("detection") or {}).get("L5") or {}).get(crop)
 
-    None unless `split` is `val` and `criteria["detection"]["L5"][crop]` exists. One row
-    per pitch and metric (`recall`, then `precision`): `{group, metric, op, limit, value,
-    ok}`; `value` and `ok` are None when the group is missing, `ok` also when the value is.
-    """
-    if split != "val" or not criteria:
-        return None
-    spec = ((criteria.get("detection") or {}).get("L5") or {}).get(crop)
-    if not spec:
-        return None
+
+def _judged_points(groups: Mapping[str, dict], spec: Mapping, crop: str) -> list[dict]:
+    """One `{group, metric, op, limit, value, ok}` per `JUDGED_PITCHES[crop]` group and metric (`recall`,
+    then `precision`) of `spec`, from the group's operating point; `value` and `ok` are None when the
+    group is missing, `ok` also when the value is."""
     rows = []
     for pitch in JUDGED_PITCHES[crop]:
         name = f"pitch_{pitch:g}"
@@ -468,6 +480,43 @@ def detection_verdicts(groups: Mapping[str, dict], criteria: Mapping | None, cro
             value = None if point is None else point[metric]
             rows.append({"group": name, "metric": metric, "op": op, "limit": limit, "value": value,
                          "ok": _ok(value, op, limit)})
+    return rows
+
+
+def detection_verdicts(groups: Mapping[str, dict], criteria: Mapping | None, crop: str,
+                       split: str) -> list[dict] | None:
+    """Judge the operating-point recall and precision of the `JUDGED_PITCHES[crop]` groups.
+
+    None unless `split` is `val` and `criteria["detection"]["L5"][crop]` exists. One row
+    per pitch and metric (`recall`, then `precision`): `{group, metric, op, limit, value,
+    ok}`; `value` and `ok` are None when the group is missing, `ok` also when the value is.
+    """
+    spec = _detection_spec(criteria, crop)
+    if split != "val" or not spec:
+        return None
+    return _judged_points(groups, spec, crop)
+
+
+def detection_rows(detection: Mapping, criteria: Mapping | None, crop: str) -> list[dict]:
+    """The rows of `detection_verdicts`, judged on `detection["pooled"]` (`score_runs`' shape) in the
+    shape of `verdict.ladder_verdicts`' rows, on any split.
+
+    `[]` without `criteria["detection"]["L5"][crop]`. Per `JUDGED_PITCHES[crop]` group, a recall
+    then a precision row: `{metric: "detection.<m>", group, op, limit, unit: "pooled", value,
+    per_run, ok}`, `per_run` being `[{run_id, seed, value, spread: None, ok}]` from each bundle's
+    own groups in `detection["runs"]` order.
+    """
+    spec = _detection_spec(criteria, crop)
+    if not spec:
+        return []
+    scenes = [(entry["meta"], _judged_points(entry["groups"], spec, crop)) for entry in detection["runs"]]
+    rows = []
+    for i, point in enumerate(_judged_points(detection["pooled"]["groups"], spec, crop)):
+        per_run = [{"run_id": meta["run_id"], "seed": meta["seed"], "value": points[i]["value"], "spread": None,
+                    "ok": points[i]["ok"]} for meta, points in scenes]
+        rows.append({"metric": f"detection.{point['metric']}", "group": point["group"], "op": point["op"],
+                     "limit": point["limit"], "unit": "pooled", "value": point["value"], "per_run": per_run,
+                     "ok": point["ok"]})
     return rows
 
 

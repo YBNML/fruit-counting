@@ -1,6 +1,8 @@
 import dataclasses
 import json
 import os
+import re
+import zipfile
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -86,6 +88,32 @@ def test_read_cache_refuses_malformed_files(tmp_path):
         read_cache(tmp_path / "cut.npz")
 
 
+def test_corrupt_compressed_members_are_bad_caches(tmp_path):
+    whole = tmp_path / "whole.npz"
+    write_cache(whole, {0: _dets([(10, 5, 20, 15, 0.9, 0)])}, META)
+    data = whole.read_bytes()
+    with zipfile.ZipFile(whole) as z:
+        info = z.getinfo("boxes.npy")
+    off = info.header_offset           # the local header's own name and extra lengths (the central ones may differ)
+    start = off + 30 + int.from_bytes(data[off + 26:off + 28], "little") + int.from_bytes(data[off + 28:off + 30], "little")
+    flip = tmp_path / "flip.npz"
+    for k in range(info.compress_size):
+        b = bytearray(data)
+        b[start + k] ^= 0xFF
+        flip.write_bytes(bytes(b))
+        for read in (read_cache, cache_digest):
+            with pytest.raises(ValueError, match="bad detection cache"):
+                read(flip)
+    part, one = tmp_path / "part.npz", tmp_path / "one.npz"
+    np.savez(part, meta=np.array("{}"), boxes=np.zeros((0, 4), np.float32))     # arrays missing
+    with open(one, "wb") as fh:                                                  # one .npy array named .npz
+        np.save(fh, np.zeros(3))
+    for p in (part, one):
+        for read in (read_cache, cache_digest):
+            with pytest.raises(ValueError, match=re.escape(f"{p}: bad detection cache")):
+                read(p)
+
+
 def test_postprocess_clips_snaps_and_suppresses_across_classes():
     raw = _dets([(0.8, 10, 40, 50, 0.8, 0),         # the same object as a fruit (IoU 0.97, lower score): suppressed
                  (1, 10, 41, 50, 0.9, 1),           # kept as a bag, snapped to the left border
@@ -100,6 +128,26 @@ def test_postprocess_clips_snaps_and_suppresses_across_classes():
     np.testing.assert_allclose(loose.boxes, [[0.8, 10, 40, 50], [1, 10, 41, 50], [200, 200, 220, 220],
                                              [600, 340, 639.5, 360]], atol=1e-6)
     assert len(postprocess(_dets([]), width=640, height=360)) == 0
+
+
+def test_postprocess_boundary_rules_are_strict():
+    raw = _dets([(0, 0, 10, 10, 0.9, 0), (0, 0, 10, 5, 0.8, 0),        # IoU exactly 0.5: both stay
+                 (2, 100, 30, 130, 0.7, 0), (1.5, 200, 30, 230, 0.6, 0),  # 2.0 from the border stays, 1.5 snaps
+                 (600, 300, 638, 330, 0.5, 1), (600, 200, 638.5, 230, 0.4, 1)])
+    out = postprocess(raw, width=640, height=360, nms_iou=0.5, edge_snap_px=2.0)
+    assert sorted(map(tuple, out.boxes.tolist())) == [(0, 0, 10, 5), (0, 0, 10, 10), (0, 200, 30, 230),
+                                                      (2, 100, 30, 130), (600, 200, 640, 230), (600, 300, 638, 330)]
+
+
+def test_postprocess_drops_small_boxes_off_the_border():
+    raw = _dets([(0, 10, 8, 30, 0.9, 0), (100, 100, 108, 130, 0.9, 0), (200, 200, 215, 215, 0.9, 1),
+                 (300, 352.5, 340, 359, 0.9, 0), (400, 100, 412, 140, 0.9, 0)])
+    assert len(postprocess(raw, width=640, height=360)) == 5
+    kept = postprocess(raw, width=640, height=360, min_short_px=12.0)
+    assert sorted(map(tuple, kept.boxes.tolist())) == [(0, 10, 8, 30), (200, 200, 215, 215), (300, 352.5, 340, 360),
+                                                       (400, 100, 412, 140)]
+    assert sorted(map(tuple, postprocess(raw, width=640, height=360, min_short_px=16.0).boxes.tolist())) == \
+        [(0, 10, 8, 30), (300, 352.5, 340, 360)]
 
 
 def test_cached_detector_refuses_foreign_or_incomplete_caches(tmp_path, apple_run):
@@ -118,6 +166,24 @@ def test_cached_detector_refuses_foreign_or_incomplete_caches(tmp_path, apple_ru
         det.detect(dataclasses.replace(frames[0], run_id="other"))
     with pytest.raises(ValueError, match=f"no detections stored for frame {frames[2].idx}"):
         det.detect(frames[2])
+
+
+def test_cached_detector_reads_once_and_checks_the_pinned_digest(tmp_path, apple_run, monkeypatch):
+    import counting.detection.cached as cached
+
+    run = SynthRun.open(apple_run)
+    f = run.frames[0]
+    path = cache_path(tmp_path, run.meta.run_id)
+    digest = write_cache(path, {f.idx: _dets([(100, 100, 108, 130, 0.9, 0), (10, 10, 30, 30, 0.8, 0)])},
+                         {"run_id": run.meta.run_id, "fingerprint": run.meta.fingerprint})
+    opened, real = [], cached._open_npz
+    monkeypatch.setattr(cached, "_open_npz", lambda p: opened.append(p) or real(p))
+    det = CachedDetector(path, fingerprint=run.meta.fingerprint, digest=digest, min_short_px=12.0)
+    assert opened == [path] and det.digest == digest and det.min_short_px == 12.0
+    assert det.detect(f).boxes.tolist() == [[10, 10, 30, 30]]
+    with pytest.raises(ValueError, match=re.escape(f"{path}: cache digest {digest[:16]} differs from the pinned "
+                                                   f"{'0' * 16}")):
+        CachedDetector(path, digest="0" * 64)
 
 
 class _Stub:
@@ -156,6 +222,20 @@ def test_detect_to_cache_counts_frames_at_the_cap(tmp_path, apple_run, monkeypat
     path.unlink()                                 # a sidecar without its cache still blocks a rewrite
     with pytest.raises(FileExistsError, match="cache exists"):
         detect_to_cache(frames, stub, path, meta=meta, max_dets=5)
+
+
+def test_writers_refuse_what_the_reader_refuses(tmp_path, apple_run):
+    for name, row, phrase in (("label", (10, 5, 20, 15, 0.9, 2), "labels must be 0 (fruit) or 1 (bag)"),
+                              ("nan", (10, 5, np.nan, 15, 0.9, 0), "boxes must be finite")):
+        p = tmp_path / f"{name}.npz"
+        with pytest.raises(ValueError, match=re.escape(f"{p}: bad detection cache: {phrase}")):
+            write_cache(p, {0: _dets([row])}, META)
+        assert not p.exists() and not p.with_name(p.name + ".tmp").exists()
+    f = SynthRun.open(apple_run).frames[0]
+    p = tmp_path / "twice.npz"
+    with pytest.raises(ValueError, match=re.escape(f"{p}: frame {f.idx} is listed twice")):
+        detect_to_cache([f, f], _Stub({f.idx: 1}), p, meta=META, max_dets=10)
+    assert not p.exists() and not p.with_suffix(".json").exists()
 
 
 def test_rgb_fingerprint_and_file_sha(tmp_path):

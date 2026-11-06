@@ -1,13 +1,23 @@
 """Test split protection: the checks a split=test request must pass before it may read a test bundle.
 
-Two checks, each raising `ProtectionError` (exit code 1) at the first broken rule:
+Four checks, each raising `ProtectionError` (exit code 1) at the first broken rule:
 
 - `check_test_request` before any bundle is opened: the config file sits under
   `configs/eval/frozen/` in the counting repository, there is no `--set` or `--run`,
   the work tree is clean and committed, the config and every file option are tracked
-  in the repository, and a grid changes only noise settings on ladder rungs or baselines.
+  in the repository, a config with `detector.cache` pins one cache digest per bundle
+  (`detector.digests`), and a grid changes only noise settings on ladder rungs or baselines.
+- `check_test_rungs` after the ladder request or the sweep cells are checked, before any
+  bundle is opened: no rung or sweep cell on cached detections (`stages.det=cached`) patches
+  the detector or tracker settings, so the cached rungs score with the frozen config's;
+  the oracle rungs keep their patches (`last_box`'s `tracker.repair_m`).
 - `check_test_bundles` after the bundles are opened and before `prepare`: every bundle
   has a test seed and an `orchard_synth.commit` sidecar, and all bundles share one commit.
+- `check_test_caches` right after `check_test_bundles` when the config has `detector.cache`:
+  every bundle's cache file is there, its content digest is the pinned one, and the
+  `test_log.csv` next to the cache folder (the `counting detect` output folder) has a detect
+  row with that digest and the bundle's fingerprint, so every test cache comes from the
+  protected `counting detect`.
 
 Every split=test run that writes its results adds one row (`LOG_HEADER` columns) to the
 output folder's `test_log.csv` with `append_log_row`; `earlier_log_runs` counts the earlier
@@ -35,6 +45,7 @@ from typing import Mapping, Sequence
 
 from counting.config.eval_schema import EvalAppConfig, SplitsConfig
 from counting.data.formats.orchard_synth import SynthRun
+from counting.detection.cached import cache_digest, cache_path
 from counting.evaluation.record import git_state
 from counting.evaluation.runner import ProtectionError
 from counting.evaluation.sweep import Grid, _leaf_paths, grid_points
@@ -114,7 +125,8 @@ def check_test_request(
     Checks, in order: `config_path` sits under `configs/eval/frozen/` in `repo`; no
     `--set` (`sets`) or `--run` (`runs`); `code` (default: `git_state(repo)`) has a
     commit and is not dirty; `config_path` and each `files` value (keyed by its
-    option, such as `--splits`) is a file git tracks in `repo`; and, with a `grid`,
+    option, such as `--splits`) is a file git tracks in `repo`; a config with
+    `detector.cache` has `detector.digests`; and, with a `grid`,
     `check_test_grid(grid, ladder)`. A config whose split is not test raises `ValueError`.
     """
     if cfg.split != "test":
@@ -136,9 +148,26 @@ def check_test_request(
         if repo_relative(path, repo) not in tracked:
             raise ProtectionError(f"split=test needs {option} to be a file tracked in the counting repository, "
                                   f"got {path}")
+    if cfg.detector.cache is not None and not cfg.detector.digests:
+        raise ProtectionError("split=test with detector.cache needs detector.digests in the frozen config, "
+                              "one pinned cache digest per bundle")
     if grid is not None:
         check_test_grid(grid, ladder)
     return ProtectedRequest(config_rel=config_rel, code=code)
+
+
+def check_test_rungs(cfg: EvalAppConfig, configs: Mapping[str, EvalAppConfig]) -> None:
+    """Refuse a split=test rung on cached detections that changes the frozen config's detector or tracker settings.
+
+    `configs` maps each requested ladder rung (or sweep cell) name to its config. Every one
+    with `stages.det=cached` must have the `detector` and `tracker` dumps of `cfg`; the first
+    one that does not is named. The other rungs may patch both (`last_box`'s `tracker.repair_m`).
+    """
+    frozen = (cfg.detector.model_dump(), cfg.tracker.model_dump())
+    for name, c in configs.items():
+        if c.stages.det == "cached" and (c.detector.model_dump(), c.tracker.model_dump()) != frozen:
+            raise ProtectionError(f"split=test: rung {name} changes the detector or tracker settings of a cached "
+                                  "rung; a test run takes them from the frozen config")
 
 
 # The first four rules repeat those of `check_test_request` (for configs/detect/frozen/); change them together.
@@ -195,6 +224,45 @@ def check_test_bundles(bundles: Sequence[SynthRun], splits: SplitsConfig) -> Non
     commits = sorted({run.meta.synth_commit for run in bundles})
     if len(commits) > 1:
         raise ProtectionError(f"split=test needs one orchard_synth commit across the bundles, got {commits}")
+
+
+def check_test_caches(bundles: Sequence[SynthRun], cfg: EvalAppConfig) -> list[dict]:
+    """Check the detection caches of opened split=test bundles against `cfg`'s pins and the detect log.
+
+    For each bundle in turn: `cfg.detector.digests` pins a digest for its run id, the
+    cache file `cache_path(detector.cache, run_id)` exists, its `cache_digest` is the
+    pinned one, and `test_log.csv` in the cache folder's parent (the `counting detect`
+    output folder) has a `detect` row whose experiment id lists the pinned digest's first
+    16 characters and whose fingerprints list the bundle's. Returns `{"run_id", "digest"}`
+    per bundle, in `bundles` order. A cache file `cache_digest` cannot read raises its
+    `ValueError`; a config without `detector.cache` raises `ValueError`.
+    """
+    if cfg.detector.cache is None:
+        raise ValueError("check_test_caches needs a config with detector.cache")
+    folder = Path(cfg.detector.cache).expanduser()
+    log = folder.parent / "test_log.csv"
+    pins = cfg.detector.digests or {}
+    rows = []
+    if log.is_file():
+        with log.open(newline="", encoding="utf-8") as f:
+            rows = list(csv.DictReader(f))
+    out = []
+    for run in bundles:
+        run_id, fp = run.meta.run_id, run.meta.fingerprint
+        if run_id not in pins:
+            raise ProtectionError(f"{run.root}: detector.digests pins no cache for run {run_id}")
+        pinned, path = pins[run_id], cache_path(folder, run_id)
+        if not path.is_file():
+            raise ProtectionError(f"{path}: split=test needs the pinned detection cache file")
+        digest = cache_digest(path)
+        if digest != pinned:
+            raise ProtectionError(f"{path}: cache digest {digest[:16]} differs from the pinned {pinned[:16]}")
+        if not any(row.get("kind") == "detect" and pinned[:16] in (row.get("experiment_id") or "").split(";")
+                   and fp in (row.get("fingerprints") or "").split(";") for row in rows):
+            raise ProtectionError(f"{log}: no counting detect row for cache {pinned[:16]} of bundle {fp[:12]}; "
+                                  "a test cache must come from the protected counting detect")
+        out.append({"run_id": run_id, "digest": pinned})
+    return out
 
 
 def check_test_log(path: Path) -> None:

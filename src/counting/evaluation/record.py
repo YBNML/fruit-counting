@@ -103,17 +103,23 @@ def request_extra(
 
 def build_record(
     *, cfg: EvalAppConfig, runs: Sequence[dict], code: dict, timings: dict, started: str, finished: str,
-    extra: dict | None = None,
+    extra: dict | None = None, detector: dict | None = None,
 ) -> dict:
-    """Assemble a `record.json` payload. Carries no machine name."""
+    """Assemble a `record.json` payload. Carries no machine name.
+
+    `detector` (the CLI's account of the detection caches it scored) replaces the
+    default `detector` entry, which names `cfg.stages.det` and its noise.
+    """
+    if detector is None:
+        detector = {"name": cfg.stages.det,
+                    "noise": None if cfg.detector.noise is None else cfg.detector.noise.model_dump(),
+                    "weights_sha256": None, "cache_sha256": None, "pretrained": None}
     return {
         "config_hash": config_hash(cfg),
         "data": list(runs),
         "code": code,
         "seeds": {"seed": cfg.seed, "noise_seeds": cfg.noise.seeds, "detector_seed": None},
-        "detector": {"name": cfg.stages.det,
-                     "noise": None if cfg.detector.noise is None else cfg.detector.noise.model_dump(),
-                     "weights_sha256": None, "cache_sha256": None, "pretrained": None},
+        "detector": detector,
         "env": env_info(),
         "timings": timings,
         "started": started,

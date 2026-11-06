@@ -2,7 +2,8 @@
 report. `render_report` and `criteria_rows` skip the Y6 sections
 of a rung whose `stop_after=y1` left `rung["y6"]` as `None`.
 A noisy rung or cell (`noisy`) is drawn from its seed means, with a noise line and a
-per-seed table; the CSVs carry one row per noise seed and a `mean` row.
+per-seed table; the CSVs carry one row per noise seed and a `mean` row. A ladder result with a
+`budget` (`counting.evaluation.budget`) also gets `budget.csv` and the budget tables.
 """
 
 from __future__ import annotations
@@ -17,9 +18,10 @@ import numpy as np
 import yaml
 
 from counting.config.eval_schema import EvalAppConfig
-from counting.evaluation.verdict import verdict_counts
+from counting.evaluation.budget import TERMS, contrib_pairs, path_pairs
+from counting.evaluation.verdict import JUDGED_PITCHES, PITCH_JUDGED_RUNGS, judged_y1, pool_rung, verdict_counts
 
-SCHEMA_VERSION = 5
+SCHEMA_VERSION = 6
 
 
 class ReproducibilityError(RuntimeError):
@@ -71,6 +73,7 @@ _SWEEP_HEADER = [
     "y6_miss_rate", "excess_rate",
     "fp_bg", "fp_off", "boundary", "dup_track", "dup_cross", "miss_det", "miss_drop", "miss_merge", "impure",
 ]
+_BUDGET_HEADER = ["run_id", "kind", "group", "pair", "n_truth", "d_e", "d_tree_mae", "d_e1_median", *TERMS, "residual"]
 
 
 def _seed_views(res: dict) -> list[tuple[str | int, dict]]:
@@ -156,12 +159,23 @@ def write_experiment(
 ) -> tuple[Path, bool]:
     """Write the experiment folder `out_root/<run_name>/<experiment_id>/`.
 
-    Computes the new `results.json` bytes first; if a different `results.json` already
-    exists there, raises `ReproducibilityError` before writing anything. Otherwise
-    (re-)writes every file and returns `(folder, reproduced)`.
+    Computes the new `results.json` bytes, the CSV rows and the `report.md` text first, so
+    neither an error building them nor a different `results.json` already there
+    (`ReproducibilityError`) leaves a file behind. Otherwise (re-)writes every file and returns
+    `(folder, reproduced)`. A result with a `budget` also gets `budget.csv`, one row per budget
+    row in order.
     """
     folder = Path(out_root) / results["run_name"] / results["experiment_id"]
     new_bytes = results_bytes(results)
+    if results["kind"] == "sweep":
+        tables = [("sweep.csv", _SWEEP_HEADER, _sweep_rows(results))]
+    else:
+        tables = [("per_pass.csv", _PER_PASS_HEADER, _per_pass_rows(results)),
+                  ("per_tree.csv", _PER_TREE_HEADER, _per_tree_rows(results))]
+        if results.get("budget") is not None:
+            tables.append(("budget.csv", _BUDGET_HEADER,
+                           [[row[k] for k in _BUDGET_HEADER] for row in results["budget"]]))
+    report_text = render_report(results, criteria=criteria)
     results_path = folder / "results.json"
     reproduced = False
     if results_path.exists():
@@ -174,12 +188,9 @@ def write_experiment(
         yaml.safe_dump(cfg.model_dump(mode="json"), sort_keys=True, allow_unicode=True), encoding="utf-8")
     (folder / "record.json").write_bytes(results_bytes(record))
     results_path.write_bytes(new_bytes)
-    if results["kind"] == "sweep":
-        _write_csv(folder / "sweep.csv", _SWEEP_HEADER, _sweep_rows(results))
-    else:
-        _write_csv(folder / "per_pass.csv", _PER_PASS_HEADER, _per_pass_rows(results))
-        _write_csv(folder / "per_tree.csv", _PER_TREE_HEADER, _per_tree_rows(results))
-    (folder / "report.md").write_text(render_report(results, criteria=criteria), encoding="utf-8")
+    for name, header, rows in tables:
+        _write_csv(folder / name, header, rows)
+    (folder / "report.md").write_text(report_text, encoding="utf-8")
     return folder, reproduced
 
 
@@ -226,6 +237,8 @@ _CONTRIB_LABELS = {
     ("L2c", "L3"): "L2c→L3 (줄 거르기·귀속)",
     ("L3_dd", "L3"): "L3_dd→L3 (상자 깊이)",
     ("L3", "L4_base"): "L3→L4_base (자세·깊이 잡음(기준 조합))",
+    ("L3", "L5"): "L3→L5 (검출)",
+    ("L5", "L5_L4base"): "L5→L5_L4base (자세·깊이 잡음(기준 조합), 학습 검출기)",
 }
 _OP_SYMBOL = {"le": "≤", "ge": "≥"}
 # Criteria metrics that are ratios, shown in percent like everywhere else in the report.
@@ -425,7 +438,8 @@ def _subset_rows(subsets: list[dict]) -> list[list[str]]:
 
 
 def _has_dd(rungs: Mapping) -> bool:
-    """Whether both `L3` and `L3_dd` ran, so the report adds the `L3_dd→L3` contribution row."""
+    """Whether both `L3` and `L3_dd` ran, so the report draws the contribution table (with its `L3_dd→L3` row)
+    even without a chain of two rungs."""
     return "L3" in rungs and "L3_dd" in rungs
 
 
@@ -446,20 +460,128 @@ def _y6_delta(ra: dict, rb: dict, key_path: tuple[str, ...]):
     return _delta(a, b)
 
 
-def _contrib_table(chain: list[str], rungs: dict) -> list[str]:
-    headers = ["구간", "Δ Y1 e1 중앙값", "Δ Y1 e1 최대", "Δ 줄 e_pipe", "Δ 그루 MAE÷평균"]
-    pairs = list(zip(chain, chain[1:]))
-    if _has_dd(rungs):
-        pairs.append(("L3_dd", "L3"))
+def _judged_pitches_text(crop: str) -> str:
+    """`JUDGED_PITCHES[crop]` as `30·50`."""
+    return "·".join(f"{p:g}" for p in JUDGED_PITCHES[crop])
+
+
+def _contrib_table(chain: list[str], rungs: dict, crop: str | None = None) -> list[str]:
+    """The contribution table, one row per `contrib_pairs(chain, rungs)` pair.
+
+    With `crop`, on a ladder with a `PITCH_JUDGED_RUNGS` rung, the two Y1 columns are the change of
+    each rung's `pool_rung([rung], JUDGED_PITCHES[crop])` y1 (a noisy rung's seed mean, the budget's
+    `d_e1_median` of a bundle row) and name the pitches; otherwise they are the change of `y1.summary`.
+    """
+    if crop is not None and any(name in PITCH_JUDGED_RUNGS for name in rungs):
+        pitches = _judged_pitches_text(crop)
+        y1_headers = [f"Δ Y1 e1 중앙값 (판정 기울기 {pitches}°)", f"Δ Y1 e1 최대 (판정 기울기 {pitches}°)"]
+
+        def y1_of(rung: dict) -> dict:
+            return pool_rung([rung], JUDGED_PITCHES[crop])["y1"]
+    else:
+        y1_headers = ["Δ Y1 e1 중앙값", "Δ Y1 e1 최대"]
+
+        def y1_of(rung: dict) -> dict:
+            return rung["y1"]["summary"]
     rows = []
-    for a, b in pairs:
+    for a, b in contrib_pairs(chain, rungs):
         ra, rb = rungs[a], rungs[b]
-        d_e1 = _delta(ra["y1"]["summary"]["e1_median"], rb["y1"]["summary"]["e1_median"])
-        d_e1_max = _delta(ra["y1"]["summary"]["e1_max"], rb["y1"]["summary"]["e1_max"])
+        ya, yb = y1_of(ra), y1_of(rb)
+        d_e1, d_e1_max = _delta(ya["e1_median"], yb["e1_median"]), _delta(ya["e1_max"], yb["e1_max"])
         d_epipe = _y6_delta(ra, rb, ("row", "e_pipe"))
         d_mae = _y6_delta(ra, rb, ("metrics", "tree_mae_over_mean"))
         rows.append([_contrib_label(a, b), _pct(d_e1), _pct(d_e1_max), _pct(d_epipe), _pct(d_mae)])
-    return _table(headers, rows)
+    return _table(["구간", *y1_headers, "Δ 줄 e_pipe", "Δ 그루 MAE÷평균"], rows)
+
+
+_BUDGET_TERM_HEADERS = ["FP_bg", "FP_off", "Boundary", "Dup_track", "Dup_cross", "−Miss_det", "−Miss_drop",
+                        "−Miss_merge"]
+_BUDGET_NOTE = ("- L5의 −Miss_det는 score_lo 이상 상자가 하나도 맞지 않은 과실이다. score_lo 이상 score_hi 미만 "
+                "상자만 맞은 과실은 검출된 것으로 세고, 그 상자가 남은 트랙에 들지 않으면 −Miss_drop, 다른 트랙에 "
+                "섞이면 −Miss_merge에 든다.")
+
+
+def _sum_or_none(values: list):
+    return None if any(v is None for v in values) else math.fsum(values)
+
+
+def _budget_table(rows: list[dict], keys: list[str], headers: list[str], chain: list[str]) -> list[str]:
+    """One row per budget row (`keys` then `TERMS`, in percent), then the sum over `path_pairs(chain)`
+    when every pair of that path has a row."""
+    keys = [*keys, *TERMS]
+    body = [[_contrib_label(*r["pair"].split("→")), *(_pct(r[k]) for k in keys)] for r in rows]
+    path = path_pairs(chain)
+    by_pair = {r["pair"]: r for r in rows}
+    on_path = [by_pair.get(f"{a}→{b}") for a, b in path]
+    if path and all(r is not None for r in on_path):
+        body.append([f"합 ({path[0][0]}→L5)", *(_pct(_sum_or_none([r[k] for r in on_path])) for k in keys)])
+    return _table(["구간", *headers, *_BUDGET_TERM_HEADERS], body)
+
+
+def _budget_lines(budget: list[dict], chain: list[str], crop: str) -> list[str]:
+    """The Y6 budget (pooled row-ledger rows) and the Y1 budget (pooled rows of the judged pitches), each
+    when it has rows, with the note on the L5 miss terms under the last one; `[]` when neither has rows."""
+    pooled = [r for r in budget if r["run_id"] == "pooled"]
+    blocks = []
+    y6 = [r for r in pooled if r["kind"] == "y6"]
+    if y6:
+        blocks.append(["**오차 예산 (Y6 줄 장부, 장면 합)**",
+                       *_budget_table(y6, ["d_e", "d_tree_mae"], ["Δ e_pipe", "Δ 그루 MAE÷평균"], chain)])
+    y1 = [r for r in pooled if r["kind"] == "y1" and r["group"] == "judged"]
+    if y1:
+        blocks.append([f"**Y1 오차 예산 (판정 기울기 {_judged_pitches_text(crop)}° 패스 장부 합)**",
+                       *_budget_table(y1, ["d_e1_median", "d_e"], ["Δ e1 중앙값", "Δ (U1−G1)/G1"], chain)])
+    if not blocks:
+        return []
+    lines = [line for block in blocks for line in (*block, "")]
+    return [*lines[:-1], _BUDGET_NOTE, ""]
+
+
+_DETECTION_HEADERS = ["그룹", "프레임", "AP50", "P", "R", "찍는 줄 R", "다른 줄 비율", "<16 px R", "오검출/프레임",
+                      "(배경+무시 겹침)/프레임", "쪼개짐(가시율<0.6)"]
+_FP_TRACK_HEADERS = ["기울기", "배경 트랙 증가", "배경 오검출 상자", "비율", "경계·다른 줄 트랙 증가", "무시 겹침 상자",
+                     "비율"]
+
+
+def _group_label(name: str) -> str:
+    """A detection group's label: `all` is `전체`, `pitch_<p>` is `<p>°`."""
+    return "전체" if name == "all" else f"{name.removeprefix('pitch_')}°"
+
+
+def _detection_lines(detection: dict) -> list[str]:
+    """The pooled detection groups of rung L5's frames at the operating threshold, values to 3 decimals."""
+    rows = []
+    for name, g in detection["pooled"]["groups"].items():
+        op, n = g["at"]["operating"], g["n_frames"]
+        rows.append([_group_label(name), str(n), _m(g["ap50"]), _m(op["precision"]), _m(op["recall"]),
+                     _m(g["recall_by_row"]["target"]["recall"]), _m(g["other_row_share"]),
+                     _m(g["recall_by_size"]["<16"]["recall"]), _m(op["fp_per_frame"]),
+                     _m((op["fp_bg"] + op["fp_ign"]) / n if n else None), _m(op["split_rate_low_visib"])])
+    return [f"**검출 (L5와 같은 프레임, 운영점 {detection['thresholds']['operating']:g})**",
+            *_table(_DETECTION_HEADERS, rows), ""]
+
+
+def _track_ratio(tracks: int, boxes) -> str:
+    return "-" if not boxes else _m(tracks / boxes)
+
+
+def _fp_track_lines(budget: list[dict], detection: dict) -> list[str]:
+    """Per pitch, the L3→L5 growth of background and boundary/other-row tracks (the pooled Y1 pass-ledger
+    row's terms times its truth count) next to the same pitch's false-positive boxes at the operating
+    threshold; `[]` without such budget rows."""
+    groups = detection["pooled"]["groups"]
+    rows = []
+    for r in budget:
+        if r["run_id"] != "pooled" or r["kind"] != "y1" or r["pair"] != "L3→L5" or not r["group"].startswith("pitch_"):
+            continue
+        op = groups[r["group"]]["at"]["operating"] if r["group"] in groups else {"fp_bg": None, "fp_ign": None}
+        bg = round(r["fp_bg"] * r["n_truth"])
+        off = round((r["boundary"] + r["fp_off"]) * r["n_truth"])
+        rows.append([_group_label(r["group"]), str(bg), _count(op["fp_bg"]), _track_ratio(bg, op["fp_bg"]),
+                     str(off), _count(op["fp_ign"]), _track_ratio(off, op["fp_ign"])])
+    if not rows:
+        return []
+    return ["**트랙이 된 오검출 (L3→L5, Y1 패스 장부, 기울기별)**", *_table(_FP_TRACK_HEADERS, rows), ""]
 
 
 def _cell_table(cells: list[dict]) -> list[str]:
@@ -475,7 +597,9 @@ def criteria_rows(rung: dict, criteria: Mapping, rung_name: str, crop: str) -> l
 
     A metric row's `ok` is `None` when the metric is absent from `rung`. The whole Y6 half
     is skipped when `rung["y6"] is None`; a `rung_name`/`crop` missing from
-    `criteria` contributes no rows for that half.
+    `criteria` contributes no rows for that half. A `PITCH_JUDGED_RUNGS` rung (or a sweep
+    cell on such a base) takes its Y1 values from its judged-pitch passes alone (`judged_y1`),
+    as the ladder verdicts do.
     """
     rows = []
     for kind, metrics_key in (("y1", "summary"), ("y6", "metrics")):
@@ -484,7 +608,10 @@ def criteria_rows(rung: dict, criteria: Mapping, rung_name: str, crop: str) -> l
         spec = ((criteria.get(kind) or {}).get(rung_name) or {}).get(crop)
         if not spec:
             continue
-        values = rung[kind][metrics_key]
+        if kind == "y1" and rung_name in PITCH_JUDGED_RUNGS:
+            values = judged_y1(rung, crop)
+        else:
+            values = rung[kind][metrics_key]
         for key, lim in spec.items():
             (op, limit), = lim.items()
             value = values.get(key)
@@ -524,6 +651,7 @@ def _criteria_table(entries: list[tuple[str, list[dict]]]) -> list[str]:
 
 
 _VERDICT_HEADERS = ["칸", "지표", "단위", "합친 값", "장면 시드별", "기준", "판정"]
+_SUBSET_VERDICT_NOTE = "- L5[S] 줄은 G6①(S) 기준이다. 덮음 손실 e_cover는 따로 본다."
 
 
 def _verdict_per_run_cell(metric: str, p: dict) -> str:
@@ -541,7 +669,16 @@ def _verdict_row(rung_name: str, row: dict) -> list[str]:
     limit = f"{_OP_SYMBOL[row['op']]}{_criteria_cell(metric, row['limit'])}"
     verdict = "-" if row["ok"] is None else ("OK" if row["ok"] else "FAIL")
     unit = "장면마다" if row["unit"] == "scene" else "합침"
-    return [rung_name, metric, unit, pooled, per_run, limit, verdict]
+    label = metric
+    if row.get("pitches"):
+        label = f"{metric} ({'·'.join(f'{p:g}' for p in row['pitches'])}°)"
+    return [rung_name, label, unit, pooled, per_run, limit, verdict]
+
+
+def _detection_label(group: str) -> str:
+    """The rung column of a detection verdict row of group `pitch_<deg>`."""
+    pitch = float(group.removeprefix("pitch_"))
+    return f"L5 검출 {pitch:g}°"
 
 
 def _verdict_lines(results: dict) -> list[str]:
@@ -549,12 +686,19 @@ def _verdict_lines(results: dict) -> list[str]:
 
     Rung order follows `results["runs"][0]["rungs"]` (not `results["verdicts"]`, whose keys a
     JSON round trip would sort); each rung's rows keep `results["verdicts"][rung]`'s order.
+    The rung rows are followed by the rows of the `L5[` keys (sorted), then the detection rows.
+    With any `L5[` key, a note on what that row judges goes above the table.
     """
     verdicts = results["verdicts"]
+    subset_keys = sorted(k for k in verdicts if k.startswith("L5["))
     rows = [_verdict_row(rung_name, row) for rung_name in results["runs"][0]["rungs"]
             for row in verdicts.get(rung_name, [])]
+    rows += [_verdict_row(key, row) for key in subset_keys for row in verdicts[key]]
+    rows += [_verdict_row(_detection_label(row["group"]), row) for row in verdicts.get("detection", [])]
     n_ok, n = verdict_counts(verdicts)
     lines = [f"**판정 (test, 장면 시드 {len(results['runs'])}개)**"]
+    if subset_keys:
+        lines += [_SUBSET_VERDICT_NOTE, ""]
     lines += _table(_VERDICT_HEADERS, rows)
     lines.append(f"- 통과 {n_ok} / 항목 {n} (값이 없는 항목은 통과로 세지 않는다)")
     lines.append("")
@@ -650,16 +794,42 @@ def _sweep_body(results: dict, criteria: Mapping | None) -> list[str]:
     return lines
 
 
+def _first_cache(results: dict) -> dict | None:
+    """The first `cache` of a rung (run, ladder) or cell (sweep), bundles in order, then rungs or cells in order."""
+    for run in results["runs"]:
+        items = run["cells"] if results["kind"] == "sweep" else run["rungs"].values()
+        for item in items:
+            if item.get("cache"):
+                return item["cache"]
+    return None
+
+
+def _detector_line(cache: dict) -> str:
+    """The head line naming the learned detector of the cached detections, with the COCO note when it applies."""
+    w, p = cache["weights_sha256"], cache["pretrained"]
+    line = f"> 검출: 학습 검출기 캐시 · 가중치 {(w or '-')[:16]} · 사전학습 {p['weights'] if p else '정보 없음'}"
+    if p and "COCO" in p["weights"]:
+        line += " · COCO 사전학습 가중치에서 시작한 결과다(연구·비상업 용도)"
+    return line
+
+
 def render_report(results: dict, *, criteria: Mapping | None) -> str:
     """Build the human-readable `report.md` for one experiment.
 
     A rung with `subsets` (ladder rung L3 under `--subsets`) gets its pass-subset table after its Y6
     section. `kind == "sweep"` replaces the per-rung body with `_sweep_body`'s point table(s) and
-    collapse section, after the same head and bundle-info table. A non-sweep result whose
-    `split` is `"test"` and carries `verdicts` ends with `_verdict_lines`'s table.
+    collapse section, after the same head and bundle-info table. After the per-bundle sections, a
+    result with a `budget` (a ladder with rung L5) gets the budget tables (`_budget_lines`) and, with
+    `detection`, the detection table and the table of false positives that became tracks. A
+    non-sweep result whose `split` is `"test"` and carries `verdicts` ends with `_verdict_lines`'s
+    table. When a rung or sweep cell ran on cached detections, the head's third line names the
+    detector (`_detector_line` of `_first_cache`).
     """
     lines = [f"# Y1·Y6 합성 채점 — {results['run_name']} ({results['experiment_id']})",
              f"> 합성 렌더 · {_pose_text(results)} · 보정 전(U). 실제 정확도가 아니다."]
+    cache = _first_cache(results)
+    if cache is not None:
+        lines.append(_detector_line(cache))
     if results["split"] == "dev":
         lines.append("> dev 묶음: 개발용 수치다. 판정에 쓰지 않는다.")
     lines.append("")
@@ -713,7 +883,7 @@ def render_report(results: dict, *, criteria: Mapping | None) -> str:
 
         if len(run.get("chain") or []) >= 2 or _has_dd(run["rungs"]):
             lines.append("**기여**")
-            lines += _contrib_table(run["chain"], run["rungs"])
+            lines += _contrib_table(run["chain"], run["rungs"], crop=crop)
             lines.append("")
 
         if run.get("interaction_2x2") is not None:
@@ -729,6 +899,13 @@ def render_report(results: dict, *, criteria: Mapping | None) -> str:
                 lines.append("**기준과 비교(가정값, 참고)**")
                 lines += _criteria_table(entries)
                 lines.append("")
+
+    budget = results.get("budget")
+    if budget is not None:
+        lines += _budget_lines(budget, results["runs"][0]["chain"], crop)
+        if results.get("detection") is not None:
+            lines += _detection_lines(results["detection"])
+            lines += _fp_track_lines(budget, results["detection"])
 
     if results["split"] == "test" and results.get("verdicts"):
         lines += _verdict_lines(results)

@@ -69,8 +69,8 @@ import yaml
 from counting.config.eval_schema import EvalAppConfig, SplitsConfig
 from counting.data.formats.orchard_synth import SynthRun, select_frames
 from counting.evaluation.runner import (
-    _merge, _patched, _prepared_settings, _unsupported_setting, check_ladder_request, describe_run, evaluate,
-    evaluate_seeds, prepare, rung_config,
+    _merge, _patched, _prepared_settings, check_ladder_request, describe_run, evaluate, evaluate_seeds, prepare,
+    rung_config,
 )
 from counting.evaluation.seeds import combine_seeds
 
@@ -245,9 +245,8 @@ def sweep_cells(cfg: EvalAppConfig, grid: Grid, ladder: Mapping | None) -> list[
     With `bases`, `ladder` must be given (`ValueError` naming the grid file),
     and the ladder request is checked next (`check_ladder_request`, its errors
     as they are). A cell's config is `cfg` with the point patch and then the
-    rung patch merged in. A config error (`ValueError`, pydantic's included) or
-    an unsupported setting (`NotImplementedError`) names the grid file, the
-    point and the base.
+    rung patch merged in. A config error (`ValueError`, pydantic's included)
+    names the grid file, the point and the base.
     """
     if grid.bases and ladder is None:
         raise ValueError(f"{grid.path}: bases need a ladder")
@@ -264,9 +263,6 @@ def sweep_cells(cfg: EvalAppConfig, grid: Grid, ladder: Mapping | None) -> list[
                     c = rung_config(c, ladder, base)
             except ValueError as e:
                 raise ValueError(f"{where}: {e}") from e
-            refused = _unsupported_setting(c)
-            if refused is not None:
-                raise NotImplementedError(f"{where}: {refused} is not supported in this version")
             overridden: tuple[str, ...] = ()
             if base is not None:
                 rung_leaves = _leaf_paths(_rung_patch(ladder, base))
@@ -317,6 +313,7 @@ def _kept(cell: SweepCell, res: dict) -> dict:
     """The part of `evaluate`'s or `evaluate_seeds`'s result a sweep keeps for `cell`.
 
     A noisy `res` also keeps `noisy`, `seeds`, `noise`, `spread` and a `per_seed` trimmed the same way.
+    A cached cell's `cache` (noisy or not) is kept as it is.
     """
     out = {"point": cell.point.name, "base": cell.base, "overridden": list(cell.overridden),
            "stages": res["stages"], "lift_depth": res["lift_depth"], **_kept_view(cell, res["y1"], res["y6"])}
@@ -324,6 +321,8 @@ def _kept(cell: SweepCell, res: dict) -> dict:
         out.update(noisy=True, seeds=res["seeds"], noise=res["noise"], spread=res["spread"],
                    per_seed=[{"noise_seed": p["noise_seed"], **_kept_view(cell, p["y1"], p["y6"])}
                              for p in res["per_seed"]])
+    if "cache" in res:
+        out["cache"] = res["cache"]
     return out
 
 

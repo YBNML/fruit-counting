@@ -4,7 +4,8 @@ A cache holds one bundle's raw detector output, one `.npz` file per run id. `wri
 and `read_cache` round-trip it; `cache_digest` hashes its content (not its file bytes, so a
 rewrite with the same arrays and meta digests the same). `postprocess` turns raw per-frame
 detections into the detector's actual output (clip, drop degenerate boxes, class-agnostic
-NMS, edge-snap); `CachedDetector` is a `Detector` that reads a cache and applies it.
+NMS, edge-snap, an optional minimum box size off the border); `CachedDetector` is a
+`Detector` that reads a cache once and applies it.
 
 Only `FrameInput` is imported from `counting.data.formats.orchard_synth` (no `SceneTruth`),
 and only `Detections`/`Detector`/`box_iou` from `counting.detection.base`: this module never
@@ -18,6 +19,7 @@ import json
 import os
 import time
 import zipfile
+import zlib
 from pathlib import Path
 from typing import Mapping, Sequence
 
@@ -80,7 +82,9 @@ def write_cache(path: Path, dets: Mapping[int, Detections], meta: Mapping) -> st
 
     `path` must not exist yet. No `Detections` may carry `depth_m` (a detection cache stores no
     depth), and `meta` must have `run_id` and `fingerprint` (the identity a reader checks against).
-    The write is atomic: a sibling `<file name>.tmp` is written, fsynced and `os.replace`d onto `path`.
+    The arrays pass the reader's `_check_arrays` before anything is written, so a cache the reader
+    would refuse is never written. The write is atomic: a sibling `<file name>.tmp` is written,
+    fsynced and `os.replace`d onto `path`.
     """
     path = Path(path)
     if path.exists():
@@ -97,6 +101,7 @@ def write_cache(path: Path, dets: Mapping[int, Detections], meta: Mapping) -> st
     labels = np.concatenate([d.labels for d in ordered], axis=0) if ordered else np.zeros(0, np.int8)
     frame_idx = np.array(idxs, dtype=np.int32)
     offsets = np.array([0, *np.cumsum([len(d) for d in ordered])], dtype=np.int64)
+    _check_arrays(path, frame_idx, offsets, boxes, scores, labels)
     meta_json = json.dumps({**meta, "format": CACHE_FORMAT}, sort_keys=True)
 
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -111,38 +116,37 @@ def write_cache(path: Path, dets: Mapping[int, Detections], meta: Mapping) -> st
 
 
 def _open_npz(path: Path) -> dict[str, np.ndarray]:
-    """The arrays of the npz at `path`, as a plain dict; a corrupt or pickled file raises `ValueError`."""
+    """The arrays of the npz at `path`, as a plain dict, after every check on the file itself.
+
+    A file `np.load` cannot read (not a zip, a corrupt compressed member, pickled data), a single
+    `.npy` array under an `.npz` name, or an archive whose array set is not `CACHE_ARRAYS` plus
+    `meta` raises `ValueError` naming `path`. `read_cache`, `cache_digest` and `CachedDetector`
+    all read through here, so they refuse the same files.
+    """
     try:
-        with np.load(path, allow_pickle=False) as data:
-            return {k: data[k] for k in data.files}
-    except (zipfile.BadZipFile, EOFError, OSError) as e:
+        obj = np.load(path, allow_pickle=False)
+        if isinstance(obj, np.lib.npyio.NpzFile):      # a `.npy` comes back as one array, not a context manager
+            with obj as data:
+                arrays = {k: data[k] for k in data.files}
+    except (zipfile.BadZipFile, EOFError, OSError, zlib.error) as e:
         raise _bad(path, f"not a readable npz ({e})") from None
     except ValueError as e:
         raise _bad(path, str(e)) from None
+    if not isinstance(obj, np.lib.npyio.NpzFile):
+        raise _bad(path, "not a readable npz (a single array, not an archive)")
+    if set(arrays) != {*CACHE_ARRAYS, "meta"}:
+        raise _bad(path, f"expected arrays {{{', '.join((*CACHE_ARRAYS, 'meta'))}}}, got {sorted(arrays)}")
+    return arrays
 
 
-def read_cache(path: Path) -> tuple[dict, dict[int, Detections]]:
-    """Read and validate a detection cache; return (meta, {frame idx: Detections}).
+def _check_arrays(path: Path, frame_idx: np.ndarray, offsets: np.ndarray, boxes: np.ndarray, scores: np.ndarray,
+                  labels: np.ndarray) -> None:
+    """Refuse cache arrays a reader cannot trust; raises `ValueError` naming `path`.
 
-    Checks the array set, the format tag, every array's dtype and shape, that `offsets` starts
-    at 0, never decreases and ends at the detection count, that `labels` is 0 or 1, that every
-    box is finite, and that `frame_idx` strictly increases. Any violation raises `ValueError`.
+    Checks every array's dtype and shape, that `offsets` starts at 0, never decreases and ends at
+    the detection count, that `frame_idx` strictly increases, that `labels` is 0 or 1 and that
+    every box is finite.
     """
-    path = Path(path)
-    data = _open_npz(path)
-    if set(data) != {*CACHE_ARRAYS, "meta"}:
-        raise _bad(path, f"expected arrays {{{', '.join((*CACHE_ARRAYS, 'meta'))}}}, got {sorted(data)}")
-
-    try:
-        meta = json.loads(data["meta"].item())
-    except (ValueError, TypeError) as e:
-        raise _bad(path, f"meta is not a JSON string ({e})") from None
-    if not isinstance(meta, dict):
-        raise _bad(path, "meta is not a JSON object")
-    if meta.get("format") != CACHE_FORMAT:
-        raise _bad(path, f"format is {meta.get('format')!r}, expected {CACHE_FORMAT!r}")
-
-    frame_idx, offsets, boxes, scores, labels = (data[k] for k in CACHE_ARRAYS)
     for name, arr, dtype in (("frame_idx", frame_idx, np.int32), ("offsets", offsets, np.int64),
                              ("boxes", boxes, np.float32), ("scores", scores, np.float32),
                              ("labels", labels, np.int8)):
@@ -169,6 +173,21 @@ def read_cache(path: Path) -> tuple[dict, dict[int, Detections]]:
     if not np.all(np.isfinite(boxes)):
         raise _bad(path, "boxes must be finite")
 
+
+def _parse(path: Path, data: Mapping[str, np.ndarray]) -> tuple[dict, dict[int, Detections]]:
+    """(meta, {frame idx: Detections}) from the arrays `_open_npz` returned for `path`."""
+    try:
+        meta = json.loads(data["meta"].item())
+    except (ValueError, TypeError) as e:
+        raise _bad(path, f"meta is not a JSON string ({e})") from None
+    if not isinstance(meta, dict):
+        raise _bad(path, "meta is not a JSON object")
+    if meta.get("format") != CACHE_FORMAT:
+        raise _bad(path, f"format is {meta.get('format')!r}, expected {CACHE_FORMAT!r}")
+
+    frame_idx, offsets, boxes, scores, labels = (data[k] for k in CACHE_ARRAYS)
+    _check_arrays(path, frame_idx, offsets, boxes, scores, labels)
+
     out: dict[int, Detections] = {}
     for i, idx in enumerate(frame_idx.tolist()):
         s, e = int(offsets[i]), int(offsets[i + 1])
@@ -176,11 +195,8 @@ def read_cache(path: Path) -> tuple[dict, dict[int, Detections]]:
     return meta, out
 
 
-def cache_digest(path: Path) -> str:
-    """sha256 of the cache's content: the meta JSON, then each `CACHE_ARRAYS` array's (name,
-    dtype, shape, bytes). Independent of the file's own bytes (the npz/zip framing)."""
-    path = Path(path)
-    data = _open_npz(path)
+def _digest(data: Mapping[str, np.ndarray]) -> str:
+    """sha256 over the meta JSON, then each `CACHE_ARRAYS` array's (name, dtype, shape, bytes)."""
     h = hashlib.sha256()
     h.update(str(data["meta"].item()).encode("utf-8"))
     for name in CACHE_ARRAYS:
@@ -190,15 +206,38 @@ def cache_digest(path: Path) -> str:
     return h.hexdigest()
 
 
+def read_cache(path: Path) -> tuple[dict, dict[int, Detections]]:
+    """Read and validate a detection cache; return (meta, {frame idx: Detections}).
+
+    Checks the file and its array set (`_open_npz`), the format tag, every array's dtype and
+    shape, that `offsets` starts at 0, never decreases and ends at the detection count, that
+    `labels` is 0 or 1, that every box is finite, and that `frame_idx` strictly increases. Any
+    violation raises `ValueError`; the reader and the writers share `_check_arrays`.
+    """
+    path = Path(path)
+    return _parse(path, _open_npz(path))
+
+
+def cache_digest(path: Path) -> str:
+    """sha256 of the cache's content: the meta JSON, then each `CACHE_ARRAYS` array's (name,
+    dtype, shape, bytes). Independent of the file's own bytes (the npz/zip framing). It refuses
+    what `read_cache` refuses about the file and its array set (`ValueError` naming `path`)."""
+    path = Path(path)
+    return _digest(_open_npz(path))
+
+
 def postprocess(
-    dets: Detections, *, width: int, height: int, nms_iou: float = NMS_IOU, edge_snap_px: float = EDGE_SNAP_PX
+    dets: Detections, *, width: int, height: int, nms_iou: float = NMS_IOU, edge_snap_px: float = EDGE_SNAP_PX,
+    min_short_px: float = 0.0
 ) -> Detections:
     """Raw cache detections turned into a detector's actual output, for one frame of `width` x `height`.
 
     In order: clip boxes to the screen, drop boxes with zero width or height, run class-agnostic
     greedy NMS (score-descending, ties keep their original order; a box is dropped once its IoU
     with a kept, higher-scoring box exceeds `nms_iou`), snap near-edge sides onto the border
-    (within `edge_snap_px`), then store in `raw_order`. `depth_m` is always `None`.
+    (within `edge_snap_px`), drop boxes whose shorter side is under `min_short_px` unless they
+    touch the border (a cut-off box is small because the screen cut it), then store in
+    `raw_order`. With `min_short_px` 0 nothing is dropped by size. `depth_m` is always `None`.
     """
     boxes = dets.boxes.astype(np.float64, copy=True)
     boxes[:, (0, 2)] = np.clip(boxes[:, (0, 2)], 0.0, float(width))
@@ -225,30 +264,42 @@ def postprocess(
     x1 = np.where(x1 > width - edge_snap_px, float(width), x1)
     y1 = np.where(y1 > height - edge_snap_px, float(height), y1)
 
+    inside = (x0 > 0) & (y0 > 0) & (x1 < width) & (y1 < height)
+    keep = ~(inside & (np.minimum(x1 - x0, y1 - y0) < min_short_px))
+    x0, y0, x1, y1, scores, labels = x0[keep], y0[keep], x1[keep], y1[keep], scores[keep], labels[keep]
+
     out = Detections(np.stack([x0, y0, x1, y1], axis=1).astype(np.float32),
                      scores.astype(np.float32), labels.astype(np.int8))
     return out.subset(raw_order(out))
 
 
 class CachedDetector:
-    """A `Detector` that replays a written cache: raw boxes through `postprocess`."""
+    """A `Detector` that replays a written cache: raw boxes through `postprocess`.
+
+    The file is read once: its meta, detections and `digest` come from the same read. A
+    `fingerprint` must match the cache's bundle, and a pinned `digest` the cache's content.
+    """
 
     name = "cached"
 
     def __init__(
-        self, path: Path, *, fingerprint: str | None = None, nms_iou: float = NMS_IOU,
-        edge_snap_px: float = EDGE_SNAP_PX
+        self, path: Path, *, fingerprint: str | None = None, digest: str | None = None, nms_iou: float = NMS_IOU,
+        edge_snap_px: float = EDGE_SNAP_PX, min_short_px: float = 0.0
     ) -> None:
         self.path = Path(path)
-        self.meta, self._dets = read_cache(self.path)
-        self.digest = cache_digest(self.path)
+        data = _open_npz(self.path)
+        self.meta, self._dets = _parse(self.path, data)
+        self.digest = _digest(data)
         if fingerprint is not None and self.meta.get("fingerprint") != fingerprint:
             raise ValueError(
                 f"{self.path}: cache was made for bundle fingerprint {self.meta.get('fingerprint', '')[:12]}, "
                 f"this bundle has {fingerprint[:12]}"
             )
+        if digest is not None and self.digest != digest:
+            raise ValueError(f"{self.path}: cache digest {self.digest[:16]} differs from the pinned {digest[:16]}")
         self.nms_iou = nms_iou
         self.edge_snap_px = edge_snap_px
+        self.min_short_px = min_short_px
 
     def raw(self, idx: int) -> Detections:
         """The stored detections for frame `idx`, unprocessed."""
@@ -262,7 +313,7 @@ class CachedDetector:
                 f"{self.path}: cache is for run {self.meta.get('run_id')}, frame is from run {frame.run_id}"
             )
         return postprocess(self.raw(frame.idx), width=frame.camera.width, height=frame.camera.height,
-                           nms_iou=self.nms_iou, edge_snap_px=self.edge_snap_px)
+                           nms_iou=self.nms_iou, edge_snap_px=self.edge_snap_px, min_short_px=self.min_short_px)
 
 
 def detect_to_cache(
@@ -271,14 +322,20 @@ def detect_to_cache(
     """Run `detector` over `frames`, write the raw detections to `path`, and return a summary.
 
     Refuses to run if the cache file or its sidecar JSON record already exists (a cache is
-    written once). A frame whose detector output reaches `max_dets` is listed in `saturated`
-    (detections past the cap, if any, are simply what the detector returned). The sidecar
+    written once) or if a frame idx is listed twice; both are checked before the detector runs.
+    A frame whose detector output reaches `max_dets` is listed in `saturated` (detections past
+    the cap, if any, are simply what the detector returned). The sidecar
     `path.with_suffix(".json")` mirrors the returned summary, for reading without `numpy`.
     """
     path = Path(path)
     side_path = path.with_suffix(".json")
     if path.exists() or side_path.exists():
         raise _exists_error(path)
+    seen: set[int] = set()
+    for f in frames:
+        if f.idx in seen:
+            raise ValueError(f"{path}: frame {f.idx} is listed twice")
+        seen.add(f.idx)
 
     start = time.perf_counter()
     dets: dict[int, Detections] = {}

@@ -208,6 +208,23 @@ def test_cross_class_pairs_count_overlapping_fruit_and_bag_boxes():
     assert cross_class_pairs(_dets([]), nms_iou=0.5, score=0.5) == (0, 0)
 
 
+def test_a_score_of_exactly_float32_of_the_threshold_counts_as_the_tracker_counts_it():
+    t = 0.9
+    edge = float(np.float32(t))                          # 0.89999998 < t in float64
+    under = float(np.nextafter(np.float32(t), np.float32(0)))
+    dets = _dets([(0, 5, 10, 15, edge, 0), (20, 5, 30, 15, under, 0), (60, 5, 70, 15, edge, 0)])
+    assert (dets.scores >= t).tolist() == [True, False, True]     # the tracker's `D.scores >= cfg.score_hi`
+    g = summarize([_frame(dets, [RECS[0], RECS[1], RECS[3]])], {"operating": t, "low": t})
+    for key in ("operating", "low"):
+        op = g["at"][key]
+        assert (op["score"], op["tp"], op["fn"], op["ignored"], op["recall"]) == (0.9, 1, 1, 1, 0.5), key
+    assert g["recall_by_visib"]["operating"][">=0.5"] == {"n": 2, "tp": 1, "recall": 0.5}
+    assert g["recall_by_size"]["<16"]["tp"] == 1 and g["precision_by_size"]["<16"] == {"n": 1, "tp": 1, "precision": 1.0}
+    assert g["ignored_hit"]["all"] == {"n": 1, "hit": 1, "rate": 1.0}
+    raw = _dets([(0, 0, 10, 10, edge, 0), (0, 0, 10, 10, 0.5, 1)])   # one box at the threshold: not both below it
+    assert cross_class_pairs(raw, nms_iou=0.5, score=t) == (1, 0)
+
+
 CRIT = {"detection": {"L5": {"pear": {"recall": {"ge": 0.90}, "precision": {"ge": 0.90}},
                              "apple": {"recall": {"ge": 0.85}, "precision": {"ge": 0.90}}}}}
 
@@ -342,9 +359,22 @@ def test_eval_detmetrics_passes_its_postprocess_options_to_each_cache(val_run, t
         res = json.loads((Path(r.output.splitlines()[0]) / "detmetrics.json").read_text(encoding="utf-8"))
         assert res["postprocess"] == {"nms_iou": nms, "edge_snap_px": snap}
         dup[nms] = res["pooled"]["groups"]["all"]["at"]["operating"]["fp_dup"]
-    assert seen == [{"fingerprint": run.meta.fingerprint, "nms_iou": 0.5, "edge_snap_px": 2.0},
-                    {"fingerprint": run.meta.fingerprint, "nms_iou": 1.0, "edge_snap_px": 3.0}]
+    assert seen == [{"fingerprint": run.meta.fingerprint, "nms_iou": 0.5, "edge_snap_px": 2.0, "min_short_px": 0.0},
+                    {"fingerprint": run.meta.fingerprint, "nms_iou": 1.0, "edge_snap_px": 3.0, "min_short_px": 0.0}]
     assert n_copies > 0 and dup == {0.5: 0, 1.0: n_copies}
+
+
+def test_eval_detmetrics_reads_the_postprocess_from_the_config(val_run, val_cache, tmp_path):
+    cfg_path = _val_cfg(tmp_path, val_run)
+    out = tmp_path / "out"
+    base = ["detmetrics", "--config", cfg_path, "--cache", str(val_cache), "--splits", SPLITS, "--out", str(out)]
+    r = runner.invoke(eval_app, [*base, "--set", "detector.post.nms_iou=0.7", "--set", "detector.post.min_short_px=4"])
+    assert r.exit_code == 0, r.output
+    res = json.loads((Path(r.output.splitlines()[0]) / "detmetrics.json").read_text(encoding="utf-8"))
+    assert res["postprocess"] == {"nms_iou": 0.7, "edge_snap_px": 2.0, "min_short_px": 4.0}
+    r = runner.invoke(eval_app, [*base, "--set", "detector.post.nms_iou=0.7", "--nms-iou", "0.6"])
+    res = json.loads((Path(r.output.splitlines()[0]) / "detmetrics.json").read_text(encoding="utf-8"))
+    assert r.exit_code == 0 and res["postprocess"] == {"nms_iou": 0.6, "edge_snap_px": 2.0}
 
 
 def test_eval_detmetrics_refuses_test_configs_and_bundles_of_other_splits_or_crops(val_run, val_cache, heldout_run,
@@ -353,8 +383,7 @@ def test_eval_detmetrics_refuses_test_configs_and_bundles_of_other_splits_or_cro
             "--out", str(tmp_path / "out")]
     for extra in ([], ["--run", str(tmp_path / "missing")]):    # refused before any bundle is opened
         r = runner.invoke(eval_app, [*base, "--set", "split=test", "--set", "tuning=false", *extra])
-        assert r.exit_code == 1 and "detection metrics are not computed on split=test; detection quality is judged " \
-            "on val" in r.output, r.output
+        assert r.exit_code == 1 and "counting eval detmetrics does not run on split=test" in r.output, r.output
     for run, seed, split in ((heldout_run, 1000, "test"), (apple_run, 5, "dev")):
         r = runner.invoke(eval_app, [*base, "--run", str(run)])
         assert r.exit_code == 1 and f"seed {seed} belongs to split {split}, config split is val" in r.output

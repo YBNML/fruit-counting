@@ -20,7 +20,7 @@ dependencies:
       - torch==2.15.0
       - torchvision==0.29.2
       - typer>=0.12
-      - pydantic>=2.0
+      - pydantic>=2.12
       - albumentations<=2.0.8
       - timm
       - rich

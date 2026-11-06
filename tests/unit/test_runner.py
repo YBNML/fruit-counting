@@ -14,8 +14,8 @@ from counting.evaluation.ledger import Ledger
 from counting.evaluation.oracle_stages import oracle_dedup
 from counting.evaluation.report import SCHEMA_VERSION, criteria_rows, render_report
 from counting.evaluation.runner import (
-    CheckFailed, ProtectionError, depth_error_stats, describe_run, evaluate, evaluate_seeds, load_ladder, prepare,
-    rung_config, run_config, run_ladder,
+    CheckFailed, ProtectionError, _prepared_settings, depth_error_stats, describe_run, evaluate, evaluate_seeds,
+    load_ladder, prepare, rung_config, run_config, run_ladder,
 )
 from counting.evaluation.sweep import SweepCell, SweepPoint, run_sweep
 from counting.tracking.landmark import PassTracks
@@ -182,16 +182,17 @@ def test_stop_after_y1_and_naive(apple_run, ctx_of):
     assert res["y1"]["summary"]["naive_U"] == sum(p["U1"] for p in res["y1"]["passes"])
 
 
-def test_unsupported_options_refused(apple_run):
-    for sets in (("stages.det=cached",), ("detector.cache=x",)):
-        with pytest.raises(NotImplementedError, match="is not supported in this version"):
-            _ctx(apple_run, "apple", *sets)
+def test_cached_needs_a_cache_folder(apple_run):
+    with pytest.raises(ValueError, match=re.escape("stages.det=cached needs detector.cache")):
+        fake_cfg(apple_run, "apple", "stages.det=cached")
+    # an oracle config may carry the folder for rung L5; its own context ignores it
+    assert _prepared_settings(fake_cfg(apple_run, "apple", "detector.cache=x")) == \
+        _prepared_settings(fake_cfg(apple_run, "apple"))
 
 
 def test_patched_ladder_is_checked_against_prepare(apple_run, ctx_of, monkeypatch):
-    """A hand-edited rung may not use unsupported settings or change what prepare fixed (frames, detections)."""
+    """A hand-edited rung may not break the config checks or change what prepare fixed (frames, detections)."""
     ctx, cfg = ctx_of["apple"], fake_cfg(apple_run, "apple")
-    refused = {"detector.cache": {"detector": {"cache": "x"}}, "stages.det=cached": {"stages": {"det": "cached"}}}
     differs = {"stages.det": {"stages": {"det": "oracle_noisy"}, "detector": {"noise": {"miss_p": 0.1}}},
                "detector.positives": {"detector": {"positives": "any"}},
                "passes": {"passes": {"pitches": [30.0]}},
@@ -199,8 +200,8 @@ def test_patched_ladder_is_checked_against_prepare(apple_run, ctx_of, monkeypatc
                "split": {"split": "val"}}
     calls = []
     monkeypatch.setattr(runner_module, "evaluate", lambda *a, **k: calls.append(a[1]) or evaluate(*a, **k))
-    cases = [(NotImplementedError, f"{k} is not supported in this version", p) for k, p in refused.items()]
-    cases += [(ValueError, f"{k}=.* differs from the prepared {k}=", p) for k, p in differs.items()]
+    cases = [(ValueError, f"{k}=.* differs from the prepared {k}=", p) for k, p in differs.items()]
+    cases.append((ValueError, "stages.det=cached needs detector.cache", {"stages": {"det": "cached"}}))
     for exc, phrase, patch in cases:
         ladder = {"rungs": {"L0": LADDER["rungs"]["L0"], "bad": patch}}
         with pytest.raises(exc, match=phrase):
@@ -208,9 +209,9 @@ def test_patched_ladder_is_checked_against_prepare(apple_run, ctx_of, monkeypatc
         with pytest.raises(exc, match=phrase):
             run_ladder(ctx, cfg, ladder, ["L0", "bad"])
         assert calls == [], phrase   # checked before any rung runs
-    ladder = {"rungs": {**LADDER["rungs"], "bad": {"detector": {"cache": "x"}}},
+    ladder = {"rungs": {**LADDER["rungs"], "bad": {"stages": {"det": "cached"}}},
               "interaction_2x2": {"base": "bad", "track": ["oracle"], "dedup": ["oracle"]}}
-    with pytest.raises(NotImplementedError, match="detector.cache is not supported in this version"):
+    with pytest.raises(ValueError, match="stages.det=cached needs detector.cache"):
         run_ladder(ctx, cfg, ladder, ["L0"], with_2x2=True)
     assert calls == []
 
@@ -459,11 +460,13 @@ def test_subsets_match_runs_restricted_to_those_passes(leaf_ctx, leaf_runs):
     by = {r["S"]: r for r in res["subsets"]}
     assert list(by) == ["all", "A", "B", "only 30", "drop 30"]
     assert by["drop 30"] == {"S": "drop 30", "n_passes": 0, "U": None, "G6": None, "e_pipe": None,
-                             "e_all": None, "tree_mae_over_mean_all": None, "ledger": None}
+                             "e_all": None, "tree_mae_over_mean_all": None, "tree_mae_over_mean": None,
+                             "ledger": None}
     y6 = res["y6"]
     assert by["all"] == {"S": "all", "n_passes": 2, "U": y6["row"]["U"], "G6": y6["row"]["G6"],
                          "e_pipe": y6["row"]["e_pipe"], "e_all": y6["row"]["e_pipe"],
-                         "tree_mae_over_mean_all": y6["metrics"]["tree_mae_over_mean"], "ledger": y6["ledger"]}
+                         "tree_mae_over_mean_all": y6["metrics"]["tree_mae_over_mean"],
+                         "tree_mae_over_mean": y6["metrics"]["tree_mae_over_mean"], "ledger": y6["ledger"]}
     for name in ("A", "B"):
         ctx_s, cfg_s = _ctx(root, "apple", f"passes.sides=[{name}]")
         alone = evaluate(ctx_s, cfg_s)["y6"]

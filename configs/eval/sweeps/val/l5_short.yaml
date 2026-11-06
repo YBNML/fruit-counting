@@ -1,0 +1,4 @@
+# Learned-detector rung: the minimum short side of a cached box away from the image border (px).
+bases: [L5]
+factors:
+  detector.post.min_short_px: [8, 12, 16]
