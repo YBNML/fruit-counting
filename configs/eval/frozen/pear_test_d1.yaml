@@ -1,0 +1,18 @@
+# held-out verdict run with the learned detector's cached boxes; every setting was fixed on val and is never tuned here
+run_name: pear_test_d1
+crop: pear
+split: test                # held-out verdict run; settings below are fixed on val and never tuned here
+tuning: false
+runs: [~/datasets/orchard_synth/pear/test_s1000, ~/datasets/orchard_synth/pear/test_s1001,
+       ~/datasets/orchard_synth/pear/test_s1002]
+truth: {variant: count1}
+passes: {pitches: null, sides: [A, B], step_m: null}
+stages: {det: oracle, track: landmark, center: measured, dedup: self_side, assign: grid}
+detector: {positives: count1, cache: runs/detect/88e8c93628216703, noise: null, digests: {pear_s1000_9c5b1d61: "2eb3016fc8f6c2a28faa179b42c13aacfdd31e5568031769380a482bcdfd305d", pear_s1001_b7dad9a1: "534e7b2d52c8ff51370264bbd7861c173d001ed375516e3102768fdda776d300", pear_s1002_a154f09c: "613e7c2b6b7f3673677d8426c990699faf3da9281552292abd16f4cce7c6fc7b"}}
+lift: {depth: box_far, box_frac: 0.5, center_offset_m: {bag: 0.04}}
+noise: {pose_trans_sigma_m: 0, pose_rot_sigma_deg: 0, pass_bias_m: 0, depth_rel_sigma: 0, depth_dropout: 0, seeds: [0, 1, 2]}
+tracker: {predict: pose, gate_px_frac: 0.5, gate_m: 0.10, max_gap: null, repair_m: 0.18, min_obs: 1, score_hi: 0.9, score_lo: 0.1, min_obs_cached: 3, depth_gate: soft}
+dedup: {radius_m: 0.135, band_m: 0.10}
+seed: 0
+stop_after: y6
+output_dir: runs/eval

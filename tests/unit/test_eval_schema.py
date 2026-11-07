@@ -83,6 +83,24 @@ def test_frozen_test_config_follows_val(crop):
                                 "tuning": False, "runs": cfg.runs}
 
 
+@pytest.mark.parametrize("crop", ["apple", "pear"])
+def test_frozen_d1_configs_add_only_the_detector_settings(crop):
+    oracle = load_yaml_model(EVAL / "frozen" / f"{crop}_test_oracle.yaml", EvalAppConfig).model_dump()
+    d1 = load_yaml_model(EVAL / "frozen" / f"{crop}_test_d1.yaml", EvalAppConfig).model_dump()
+
+    def strip(d):
+        d = {k: v for k, v in d.items() if k not in ("run_name", "verdict_subsets")}
+        d["detector"] = {k: v for k, v in d["detector"].items() if k not in ("cache", "post", "digests")}
+        d["tracker"] = {k: v for k, v in d["tracker"].items() if k not in ("score_hi", "score_lo", "min_obs_cached")}
+        return d
+
+    assert strip(d1) == strip(oracle) and d1["run_name"] == f"{crop}_test_d1"
+    assert d1["detector"]["cache"] == "runs/detect/88e8c93628216703"
+    digests = d1["detector"]["digests"]
+    assert len(digests) == 3 and all(k.startswith(f"{crop}_s100") for k in digests)
+    assert all(re.fullmatch(r"[0-9a-f]{64}", v) for v in digests.values())
+
+
 def test_unknown_key_rejected():
     raw = _raw()
     raw["stages"]["bogus"] = 1
@@ -190,7 +208,8 @@ def test_config_hash_generic_and_ignores_runtime_keys():
 COMMITTED_HASHES = {"apple_dev": "38b74b45e42d9213", "pear_dev": "b85d292df18d8261", "apple_val": "b26494b8830a44fa",
                     "apple_exp": "7f6be6772929d5ed", "pear_val": "a16d22fe031ee666", "pear_exp": "8c67f0e894d833c7",
                     "frozen/apple_test_oracle": "a5d60d44aaf799f2",
-                    "frozen/pear_test_oracle": "7fcb765786bad4bb"}
+                    "frozen/pear_test_oracle": "7fcb765786bad4bb",
+                    "frozen/apple_test_d1": "a78a8e26beafabb6", "frozen/pear_test_d1": "1c6708892241aec8"}
 
 
 def test_committed_config_hashes_unchanged():

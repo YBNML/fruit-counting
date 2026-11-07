@@ -1,0 +1,18 @@
+# held-out verdict run with the learned detector's cached boxes; every setting was fixed on val and is never tuned here
+run_name: apple_test_d1
+crop: apple
+split: test                # held-out verdict run; settings below are fixed on val and never tuned here
+tuning: false
+runs: [~/datasets/orchard_synth/apple/test_s1000, ~/datasets/orchard_synth/apple/test_s1001,
+       ~/datasets/orchard_synth/apple/test_s1002]
+truth: {variant: count1}
+passes: {pitches: null, sides: [A, B], step_m: null}
+stages: {det: oracle, track: landmark, center: measured, dedup: hybrid, assign: grid}
+detector: {positives: count1, cache: runs/detect/88e8c93628216703, noise: null, digests: {apple_s1000_e9e90d83: "fadb0c76eaf99dbb62319f11dd60efba94cf71fcd5ea0cf7a0ecd29d58f1efb9", apple_s1001_47e0e5e5: "8b84b9bf3763ee811213ff4696d8b91c3adef3f9b31bf449d47bdc1dcce98913", apple_s1002_2ce2ad83: "d93b19d9228280955b748f142856da3649316818feb7d3754d784bcdb7e9bd8d"}}
+lift: {depth: box_far, box_frac: 0.5, center_offset_m: {fruit: 0.02, bag: 0.03}}
+noise: {pose_trans_sigma_m: 0, pose_rot_sigma_deg: 0, pass_bias_m: 0, depth_rel_sigma: 0, depth_dropout: 0, seeds: [0, 1, 2]}
+tracker: {predict: pose, gate_px_frac: 0.5, gate_m: 0.05, max_gap: null, repair_m: 0.08, min_obs: 1, score_hi: 0.6, score_lo: 0.2, min_obs_cached: 4, depth_gate: soft}
+dedup: {radius_m: 0.09, band_m: 0.05}
+seed: 0
+stop_after: y6
+output_dir: runs/eval
