@@ -10,7 +10,7 @@ noise_blocks:        # named noise values the rungs combine through YAML anchors
   depth: &depth {depth_rel_sigma: 0.02, depth_dropout: 0.05}
   imu: &imu {imu_gyro_n: 1.16e-3, imu_acc_n: 4.97e-3, imu_gyro_w: 1.82e-5, imu_acc_w: 4.75e-4, imu_gyro_b0_dps: 1.0, imu_acc_b0_mg: 4.0, imu_temp_k: 1.0}
   imu_belief: &imu_belief {imu_time_offset_ms: 0.0, imu_extr_trans_mm: 10.0, imu_extr_rot_deg: 0.3}
-  stage_one: &stage_one {pose_trans_sigma_m: 0.02, pose_rot_sigma_deg: 0.5, pass_bias_m: 0.02, depth_rel_sigma: 0.02, depth_dropout: 0.05}
+  independent: &independent {pose_trans_sigma_m: 0.02, pose_rot_sigma_deg: 0.5, pass_bias_m: 0.02, depth_rel_sigma: 0.02, depth_dropout: 0.05}
 rungs:
   L3:       {stages: &l3 {track: landmark, center: measured, assign: grid}, pose: {}}
   L4_drift: {stages: *l3, pose: {rig: true, fuse: imu}, align: {mode: [tracks, row_plane]},
@@ -41,8 +41,8 @@ baselines:
   LVI_thin50:        {stages: *l3, pose: *lvi, align: {mode: [tracks, row_plane], stress_pair_keep: 0.5}, noise: *lvi_noise}
   LVI_thin80:        {stages: *l3, pose: *lvi, align: {mode: [tracks, row_plane], stress_pair_keep: 0.2}, noise: *lvi_noise}
   LVI_oracle_struct: {stages: *l3, pose: *lvi, align: {mode: oracle_struct}, noise: *lvi_noise}
-  L4_base:           {stages: *l3, pose: {}, noise: *stage_one}
-  L5_L4base:         {stages: *l5, pose: {}, noise: *stage_one}
+  L4_base:           {stages: *l3, pose: {}, noise: *independent}
+  L5_L4base:         {stages: *l5, pose: {}, noise: *independent}
   # report rungs that run on val only (val_only)
   L4_drift_know:     {stages: *l3, pose: {rig: true, fuse: imu, vio: {estimator_imu: generator}}, align: {mode: [tracks, row_plane]}, noise: {<<: [*vo, *start, *rig, *depth, *imu, *imu_belief]}}
   L4_drift_stop5:    {stages: *l3, pose: {rig: true, fuse: imu, vio: {stop_s: 5.0}}, align: {mode: [tracks, row_plane]}, noise: {<<: [*vo, *start, *rig, *depth, *imu, *imu_belief]}}

@@ -26,7 +26,7 @@ POSE_LADDER = {"rungs": {"L3": {"stages": {"track": "landmark", "center": "measu
 
 POSE_DEPTH = ("noise.pose_trans_sigma_m=0.02", "noise.pose_rot_sigma_deg=0.5", "noise.pass_bias_m=0.02",
               "noise.depth_rel_sigma=0.02", "noise.depth_dropout=0.05")
-STAGE_ONE_COUNTS = {   # the counts of the loop before it was split into stages
+UNSPLIT_COUNTS = {   # the counts of the loop before it was split in three
     "pose_depth_seed1": (
         (
             (65, 66, 1, (("boundary", 0), ("dup_cross", 0), ("dup_track", 53), ("fp_bg", 0),
@@ -64,12 +64,12 @@ def _counts(res: dict) -> tuple:
     return passes, (None if res["y6"] is None else (tuple(t["U"] for t in res["y6"]["trees"]), led(res["y6"]["ledger"])))
 
 
-def test_split_loop_keeps_stage_one_counts(leaf_runs, leaf_ctx, leaf_det_ctx):
+def test_split_loop_keeps_the_unsplit_counts(leaf_runs, leaf_ctx, leaf_det_ctx):
     root = leaf_runs[0]
     got = {"pose_depth_seed1": _counts(evaluate(leaf_ctx[0], fake_cfg(root, "apple", *POSE_DEPTH), noise_seed=1)),
            "det_pose_depth_seed0": _counts(evaluate(leaf_det_ctx(0), fake_cfg(root, "apple", *DET_NOISE, *POSE_DEPTH),
                                                     noise_seed=0))}
-    assert got == STAGE_ONE_COUNTS
+    assert got == UNSPLIT_COUNTS
 
 
 def test_pass_stages_follow_ctx_passes(apple_run, ctx_of):
@@ -87,11 +87,11 @@ def test_zero_drift_keys_match_l3_bytes(apple_run, ctx_of):
     assert _core(evaluate(ctx_of["apple"], cfg)) == _core(evaluate(ctx_of["apple"], fake_cfg(apple_run, "apple")))
 
 
-def test_zero_drift_keys_with_depth_noise_match_stage_one_bytes(apple_run, ctx_of):
+def test_zero_drift_keys_with_depth_noise_match_independent_noise_bytes(apple_run, ctx_of):
     depth = "noise.depth_rel_sigma=0.02"
     cfg = fake_cfg(apple_run, "apple", "pose.rig_ref=30", *ZERO_DRIFT, depth)
-    stage_one = fake_cfg(apple_run, "apple", depth)
-    assert _core(evaluate(ctx_of["apple"], cfg, noise_seed=0)) == _core(evaluate(ctx_of["apple"], stage_one,
+    independent = fake_cfg(apple_run, "apple", depth)
+    assert _core(evaluate(ctx_of["apple"], cfg, noise_seed=0)) == _core(evaluate(ctx_of["apple"], independent,
                                                                                  noise_seed=0))
 
 

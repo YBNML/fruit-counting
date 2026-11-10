@@ -23,7 +23,7 @@ ROOT = Path(__file__).resolve().parents[2]
 SWEEPS = ROOT / "configs" / "eval" / "sweeps"
 BUNDLE = Path("bundle")        # sweep_cells never opens it
 L3_STAGES = {"track": "landmark", "center": "measured", "assign": "grid"}   # the stages of ladder rung L3
-STAGE_ONE_RUNGS = ["L0", "L1", "L2a", "L2b", "L2c", "L3", "L4_base", "L5", "L3_dd", "L5_L4base"]
+PLAIN_RUNGS = ["L0", "L1", "L2a", "L2b", "L2c", "L3", "L4_base", "L5", "L3_dd", "L5_L4base"]
 RIG_NOTE = "> 패스 안 표류와 RPE는 기준 카메라 틀이다(리그 보정을 믿는 값으로 옮김)."
 
 
@@ -96,8 +96,8 @@ def test_pose_pairs_and_ladder_pairs():
                 ("LV", "LVI"), ("L3", "L3_al")]
     assert pose_pairs(rungs) == expected
     assert ladder_pairs(list(rungs), rungs) == expected
-    chain = STAGE_ONE_RUNGS[:8]
-    for rungs in (dict.fromkeys(STAGE_ONE_RUNGS), {n: {"pose": {"source": "truth"}} for n in STAGE_ONE_RUNGS}):
+    chain = PLAIN_RUNGS[:8]
+    for rungs in (dict.fromkeys(PLAIN_RUNGS), {n: {"pose": {"source": "truth"}} for n in PLAIN_RUNGS}):
         assert ladder_pairs(chain, rungs) == contrib_pairs(chain, rungs)
 
 
@@ -152,7 +152,7 @@ def test_sweep_cells_check_pose_settings_after_the_rung(tmp_path):
     assert base.imu_gyro_n is None and base.rig_extr_trans_mm is None      # the baseline point has no common
     assert point.imu_gyro_n == 1.16e-3 and point.rig_extr_trans_mm == 2.0 and point.pass_side_trans_m == 0.05
 
-    # the committed stage-one grids keep their cells: one validation gives what two gave
+    # the committed grids without a pose section keep their cells: one validation gives what two gave
     ladder = load_ladder(SWEEPS / "ladder_l5.yaml")
     for name, (_, _, crops) in GRIDS.items():
         grid = load_grid(SWEEPS / name)

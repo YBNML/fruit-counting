@@ -5,11 +5,14 @@ builds raw numbers that the modules under test then consume. `write_run` writes
 a small render bundle; `fake_cfg` and `load_splits` read the repo's eval
 configs; `ctx_with` varies a shared prepared context; `python_c` runs a snippet
 in a fresh interpreter, for checks on import side effects.
+`write_run(shake=True)` writes a bundle rendered with body shake (frame times,
+planned poses, a 1 kHz body trajectory per side).
 """
 
 from __future__ import annotations
 
 import copy
+import hashlib
 import json
 import os
 import subprocess
@@ -21,6 +24,7 @@ from typing import Iterable, Mapping, Sequence
 
 import numpy as np
 from PIL import Image
+from scipy.spatial.transform import Rotation
 
 from counting.config.eval_schema import EvalAppConfig, SplitsConfig
 from counting.config.loader import load_yaml_model
@@ -253,6 +257,94 @@ def _summary(frames: list[tuple[str, list[dict]]], spec_trees: list[dict]) -> di
     return {"summary": {"trees": trees}, "realism": {}}
 
 
+# --- fake body shake (write_run(shake=True)) -------------------------------------------------
+
+# One sine per shake component: (amplitude, wavelength m, phase rad). Amplitudes are metres for
+# along, lateral and height and degrees for yaw, pitch and roll; at path distance s the value is
+# amplitude * sin(2 pi s / wavelength + phase + FAKE_SIDE_PHASE[side]).
+FAKE_SHAKE: dict[str, tuple[float, float, float]] = {
+    "along": (0.01, 1.3, 0.0),
+    "lateral": (0.02, 1.7, 0.5),
+    "height": (0.01, 2.3, 1.0),
+    "yaw": (0.5, 1.9, 1.5),
+    "pitch": (0.5, 2.9, 2.0),
+    "roll": (0.5, 1.1, 2.5),
+}
+FAKE_SIDE_PHASE = {"A": 0.0, "B": 1.0}
+# The drive along a pass, s(t) = -a + v0 t + b sin(2 pi t / T) with (a, v0, b, T) = (path to the
+# first frame m, speed m/s, wobble m, wobble period s): always forward, 0.5 +- 0.055 m/s.
+FAKE_RUN = (0.4, 0.5, 0.02, 2.3)
+FAKE_RATE_HZ = 1000
+_SIDE_ROT = {"A": np.eye(3), "B": np.diag([-1.0, -1.0, 1.0])}   # nominal body-to-world turn per side
+
+
+def _drive(t: np.ndarray) -> np.ndarray:
+    """Path distance s(t) of the fake drive `FAKE_RUN`; s = 0 at the first frame of a pass."""
+    a, v0, b, period = FAKE_RUN
+    return -a + v0 * t + b * np.sin(2 * np.pi * t / period)
+
+
+def _frame_times(n: int, step: float) -> np.ndarray:
+    """The times t_j with s(t_j) = j * step, j = 0 .. n-1, by Newton steps from (j * step + a) / v0."""
+    a, v0, b, period = FAKE_RUN
+    s = np.arange(n) * step
+    t = (s + a) / v0
+    for _ in range(50):
+        r = _drive(t) - s
+        if np.abs(r).max() < 1e-13:
+            return t
+        t = t - r / (v0 + b * 2 * np.pi / period * np.cos(2 * np.pi * t / period))
+    raise AssertionError("fake drive: the frame times did not converge")
+
+
+def _fake_bodies(side: str, start: np.ndarray, s: np.ndarray) -> np.ndarray:
+    """Body-to-world poses (N, 4, 4) of the shaken body on `side` at path distances `s` (N,).
+
+    The body frame has x along the travel, y to the left and z up, origin at the camera centre.
+    The nominal body turns by `_SIDE_ROT[side]` and sits at `start + R_side (s, 0, 0)`, where
+    `start` is the side's first eye position; the shake `[[Rz(yaw) Ry(pitch) Rx(roll), (along,
+    lateral, height)]]` multiplies it on the right, in the body frame.
+    """
+    s = np.asarray(s, dtype=float)
+    v = {c: amp * np.sin(2 * np.pi * s / wave + phase + FAKE_SIDE_PHASE[side])
+         for c, (amp, wave, phase) in FAKE_SHAKE.items()}
+    shake = np.zeros((len(s), 4, 4))
+    shake[:, :3, :3] = Rotation.from_euler("ZYX", np.stack([v["yaw"], v["pitch"], v["roll"]], axis=1),
+                                           degrees=True).as_matrix()
+    shake[:, :3, 3] = np.stack([v["along"], v["lateral"], v["height"]], axis=1)
+    shake[:, 3, 3] = 1.0
+    rot = _SIDE_ROT[side]
+    nominal = np.zeros_like(shake)
+    nominal[:, :3, :3] = rot
+    nominal[:, :3, 3] = np.asarray(start, dtype=float) + s[:, None] * rot[:, 0]
+    nominal[:, 3, 3] = 1.0
+    return nominal @ shake
+
+
+def _camera_on_body(pitch_deg: float) -> np.ndarray:
+    """The Blender camera-to-body transform of the camera tilted up by `pitch_deg`, no translation."""
+    q = radians(pitch_deg)
+    m = np.eye(4)
+    m[:3, :3] = [[-1.0, 0.0, 0.0], [0.0, sin(q), cos(q)], [0.0, cos(q), -sin(q)]]
+    return m
+
+
+def _write_trajectories(root: Path, starts: Mapping[str, np.ndarray], t_last: float) -> None:
+    """trajectory_A.npz and trajectory_B.npz (t, p, q_wxyz: the body every 1 ms from t = 0 to the
+    first sample at or after `t_last`), then trajectory.json with their sha256."""
+    t = np.arange(ceil(t_last * FAKE_RATE_HZ) + 1) / FAKE_RATE_HZ
+    digests = {}
+    for side in SIDES:
+        body = _fake_bodies(side, starts[side], _drive(t))
+        path = root / f"trajectory_{side}.npz"
+        np.savez(path, t=t, p=np.ascontiguousarray(body[:, :3, 3]),
+                 q_wxyz=Rotation.from_matrix(body[:, :3, :3]).as_quat(scalar_first=True))
+        digests[path.name] = hashlib.sha256(path.read_bytes()).hexdigest()
+    meta = {"version": "fake_shake", "rate_hz": FAKE_RATE_HZ, "digests": digests}
+    (root / "trajectory.json").write_text(json.dumps(meta, sort_keys=True, separators=(",", ":")),
+                                          encoding="utf-8")
+
+
 def _write_json(path: Path, obj) -> None:
     path.write_text(json.dumps(obj, sort_keys=True, ensure_ascii=False), encoding="utf-8")
 
@@ -272,6 +364,7 @@ def write_run(
     step_param: bool = True,
     occlude: Mapping[int, Iterable[int]] | None = None,
     images: bool = False,
+    shake: bool = False,
 ) -> Path:
     """Write a small orchard_synth-shaped render bundle under `root` (created if needed) and return it.
 
@@ -284,6 +377,13 @@ def write_run(
 
     `occlude` paints a nearer patch into depth16 only, so geometry checks that read depth at
     fruit centres fail on such a bundle.
+
+    With `shake`, each frame is taken from a shaken robot body: the body drives along the pass by
+    `FAKE_RUN` and shakes by `FAKE_SHAKE` (phase-shifted per side by `FAKE_SIDE_PHASE`), and the
+    frame pose is that body at the frame's planned position times the tilted camera. frame.json also holds
+    the frame time `t`, the position `pos_k` (index into the pass positions in ascending x) and the
+    straight pose `plan`, manifest `args.shake` is true, and trajectory_A.npz, trajectory_B.npz and
+    trajectory.json record the body of both sides at 1 kHz.
     """
     sc = _SCENES[crop]
     pitches = tuple(float(p) for p in (sc.pitches if pitches is None else pitches))
@@ -300,19 +400,27 @@ def write_run(
 
     x0, x1 = -1.0, (trees_per_row - 1) * sc.tree_dx + 1.0
     xs = [x0 + i * step for i in range(floor((x1 - x0) / step + 1e-9) + 1)]
-    poses = [(side, pitch, robot_matrix(x, row_ys[target_row], side, pitch, sc.distance, sc.height))
-             for pitch in pitches for side, order in (("A", xs), ("B", xs[::-1])) for x in order]
+    passes = (("A", xs), ("B", xs[::-1]))
+    poses = [(side, pitch, j, robot_matrix(x, row_ys[target_row], side, pitch, sc.distance, sc.height))
+             for pitch in pitches for side, order in passes for j, x in enumerate(order)]
     chosen = range(len(poses)) if max_frames is None else \
         np.unique(np.round(np.linspace(0, len(poses) - 1, max_frames))).astype(int).tolist()
+
+    if shake:   # frame j of a pass sits at path distance j * step from the side's first eye position
+        times = _frame_times(len(xs), step)
+        starts = {side: np.asarray(robot_matrix(order[0], row_ys[target_row], side, 0.0, sc.distance,
+                                                sc.height))[:3, 3] for side, order in passes}
+        bodies = {side: _fake_bodies(side, starts[side], np.arange(len(xs)) * step) for side in SIDES}
 
     root = Path(root)
     root.mkdir(parents=True, exist_ok=True)
     grounds: dict[tuple[str, float], tuple[np.ndarray, np.ndarray]] = {}
     written = []
     for idx, frame_no in enumerate(chosen):
-        side, pitch, matrix = poses[frame_no]
+        side, pitch, j, plan = poses[frame_no]
+        matrix = (bodies[side][j] @ _camera_on_body(pitch)).tolist() if shake else plan
         records, paints = _records(matrix, obj, width, height, fx, dim)
-        if (side, pitch) not in grounds:              # R and camera height are fixed within a pass
+        if shake or (side, pitch) not in grounds:     # R and camera height are fixed within a straight pass
             grounds[(side, pitch)] = _ground(matrix, width, height, fx)
         depth, sem = (a.copy() for a in grounds[(side, pitch)])
         inst = np.zeros((height, width), dtype=np.uint16)
@@ -338,8 +446,10 @@ def write_run(
             Image.fromarray(inst).save(root / f"{idx:06d}_instances.png", compress_level=1)
         pose = {"name": f"{sc.preset}_{pitch:g}", "matrix_world": matrix, "width": width, "height": height,
                 "hfov_deg": HFOV_DEG, "side": side, "frame": frame_no}
-        _write_json(root / f"{idx:06d}_frame.json",
-                    {"idx": idx, "frame": frame_no, "side": side, "pose": pose, "records": records})
+        frame = {"idx": idx, "frame": frame_no, "side": side, "pose": pose, "records": records}
+        if shake:
+            frame.update(t=float(times[j]), pos_k=j if side == "A" else len(xs) - 1 - j, plan=plan)
+        _write_json(root / f"{idx:06d}_frame.json", frame)
         written.append((side, records))
 
     manifest = {
@@ -357,6 +467,9 @@ def write_run(
                         "instances": "uint16 과실 번호(봉지는 안에 든 과실 번호), 0 = 그 밖", "semantic": dict(_SEM)},
         "unverified": [],
     }
+    if shake:
+        manifest["args"]["shake"] = True
+        _write_trajectories(root, starts, float(times[-1]))
     _write_json(root / "manifest.json", manifest)
     _write_json(root / "summary.json", _summary(written, spec_trees))
     return root

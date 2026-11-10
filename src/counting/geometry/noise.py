@@ -11,9 +11,16 @@ depth k 9 `(..., idx)` one value per depth; camera-to-IMU calibration 11
 `(..., round(pitch * 1000))` t(3) then r(3); flow scale and rate 12 `(..., *flow)` s then w(3);
 pitch-to-pitch rigid 13 `(..., *side, round(pitch * 1000))` t(3) then r(3); line-end GPS fix 14
 `(..., *flow, end)`, end 0 for the first frame and 1 for the last, x then y then z. The IMU 10 is
-one generator for the whole IMU stream, keyed `(10, IMU seed, noise seed, scene, layout)`. Only a
-config with a drift key draws these steps, and it draws them even when the values are 0, so its
-draws are the same for every value.
+one generator for the whole IMU stream, keyed `(10, IMU seed, noise seed, scene, layout)`.
+
+Which of these steps a run draws. Under pose.source=truth, with a pose section, a noise seed and a
+drift camera key set (a key at 0 included): each flow draws 5 and 12, each flow draws 6 (keyed by
+its side) when a `pass_side_*` key is set and, without the rig, each pass draws 13 when a
+`pass_pitch_*` key is set. With a pose section, `pose.rig`, a `rig_extr_*` key set and a noise seed,
+each pitch other than the reference draws 7. With a noise seed and `noise.depth_k` set, each frame
+draws 9, drift camera key or not. Step 8 is not drawn: a time offset above 0 stops the run. Steps 10,
+11 and 14 have keys here and no draws. A key set to 0 draws like any other value, so configs that
+set the same keys share their draws.
 """
 
 from __future__ import annotations

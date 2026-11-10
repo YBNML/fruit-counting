@@ -31,7 +31,7 @@ def _dev():
     return load_yaml_model(EVAL / "apple_dev.yaml", EvalAppConfig)
 
 
-def test_new_settings_stay_out_of_stage_one_dumps():
+def test_new_settings_stay_out_of_existing_dumps():
     cfg = _dev()
     dump = cfg.model_dump()
     assert "pose" not in dump and "align" not in dump

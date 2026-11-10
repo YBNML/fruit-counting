@@ -35,8 +35,8 @@ DEPTH = {"depth_rel_sigma": 0.02, "depth_dropout": 0.05}
 IMU = {"imu_gyro_n": 1.16e-3, "imu_acc_n": 4.97e-3, "imu_gyro_w": 1.82e-5, "imu_acc_w": 4.75e-4,
        "imu_gyro_b0_dps": 1.0, "imu_acc_b0_mg": 4.0, "imu_temp_k": 1.0}
 BELIEF = {"imu_time_offset_ms": 0.0, "imu_extr_trans_mm": 10.0, "imu_extr_rot_deg": 0.3}
-STAGE_ONE = {"pose_trans_sigma_m": 0.02, "pose_rot_sigma_deg": 0.5, "pass_bias_m": 0.02, "depth_rel_sigma": 0.02,
-             "depth_dropout": 0.05}
+INDEPENDENT = {"pose_trans_sigma_m": 0.02, "pose_rot_sigma_deg": 0.5, "pass_bias_m": 0.02, "depth_rel_sigma": 0.02,
+               "depth_dropout": 0.05}
 JUDGED = {**VO, **START, **RIG, **DEPTH, **IMU, **BELIEF}
 REF = {**JUDGED, **PITCH}
 
@@ -124,7 +124,7 @@ def test_judged_rungs_carry_the_judged_point():
     assert baselines["L4_drift_noimu"]["noise"] == {**VO, **START, **RIG, **DEPTH}
     assert baselines["L4_drift_c1x"]["noise"] == {**VO, **START, **PITCH, **DEPTH, **IMU, **BELIEF}
     assert baselines["L4_drift_dvo"]["noise"] == {**VO_DVO, **START, **RIG, **DEPTH, **IMU, **BELIEF}
-    assert baselines["L4_base"]["noise"] == STAGE_ONE
+    assert baselines["L4_base"]["noise"] == INDEPENDENT
     drift = rung_config(_base(), LADDER, "L4_drift")
     assert drift.pose.rig is True and drift.pose.fuse == "imu"
     assert drift.align.mode == ["tracks", "row_plane"]

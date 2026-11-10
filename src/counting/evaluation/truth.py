@@ -1,4 +1,5 @@
-"""Ground-truth sets, the summary.json self-check, the pass subsets and their table, and the geometry check.
+"""Ground-truth sets, the summary.json self-check, the pass subsets and their table, the geometry check,
+and the rig and trajectory checks of bundles rendered with body shake.
 
 Everything here reads `SceneTruth`/`FruitGt`/`GtRecord` from an orchard_synth
 bundle, so only evaluation and oracle code should import this module (the
@@ -13,13 +14,17 @@ from typing import Iterable, Mapping, Sequence
 
 import numpy as np
 from PIL import Image
+from scipy.spatial.transform import Rotation
 
 from counting.data.formats.orchard_synth import (
-    FrameInput, GtRecord, OrchardLayout, PassKey, SceneTruth, SynthRun, read_depth_m,
+    FrameInput, FramePlan, GtRecord, OrchardLayout, PassKey, SceneTruth, SynthRun, read_depth_m,
 )
+from counting.geometry.rig import interpolate_pose, pitch_extrinsic, pose_matrix, relative_extrinsic
 
 _GROUND_SEMANTIC = 7
 _GROUND_SAMPLE_MAX = 2000
+RIG_TOL_M = 1e-6      # rig and trajectory checks: position tolerance, metres
+RIG_TOL_DEG = 1e-4    # rig and trajectory checks: rotation tolerance, degrees
 
 
 def is_positive(r: GtRecord, variant: str, count1: tuple[float, int]) -> bool:
@@ -203,3 +208,71 @@ def check_geometry(run: SynthRun, truth: SceneTruth, *, stride: int = 10) -> dic
     passed = bool(center_in_bbox == 1.0 and n_unoccluded > 0 and ground != "fail")
     return {"center_in_bbox": center_in_bbox, "n_unoccluded": n_unoccluded,
             "ground_abs_z_median_m": median, "n_ground_px": n_ground_px, "ground": ground, "passed": passed}
+
+
+def _shake_plans(run: SynthRun) -> dict[int, FramePlan]:
+    """The frame plans of `run`; ValueError when `run` is not rendered with body shake."""
+    plans = run.plans()
+    if plans is None:
+        raise ValueError(f"{run.root}: not a shake bundle")
+    return plans
+
+
+def _pose_gap(a: np.ndarray, b: np.ndarray) -> tuple[float, float]:
+    """(position gap in metres, rotation gap in degrees) between the 4x4 poses `a` and `b`."""
+    pos = float(np.linalg.norm(a[:3, 3] - b[:3, 3]))
+    rot = float(np.degrees(Rotation.from_matrix(a[:3, :3].T @ b[:3, :3]).magnitude()))
+    return pos, rot
+
+
+def check_rig(run: SynthRun, *, tol_m: float = RIG_TOL_M, tol_deg: float = RIG_TOL_DEG) -> dict:
+    """Check that the cameras at one position of a bundle rendered with body shake share their body and time.
+
+    Frames are grouped by position: (side, aisle, `FramePlan.pos_k`), the render position, also on a
+    bundle that is not a sequence. At each position the frame with the smallest pitch r is the
+    reference; every other frame, at pitch q, is a pair. Its pose must match
+    `pose_matrix(cam_r) @ relative_extrinsic(r, q)` within `tol_m` and `tol_deg`, and its time
+    `FramePlan.t` must equal the reference time exactly. With no pairs the maxima are 0.0.
+    Raises ValueError when `run` is not rendered with body shake.
+    """
+    plans = _shake_plans(run)
+    at: dict[tuple[str, int, int], list[FrameInput]] = {}
+    for f in run.frames:
+        at.setdefault((f.pass_key.side, f.pass_key.aisle, plans[f.idx].pos_k), []).append(f)
+    pairs, max_pos, max_rot, max_dt = 0, 0.0, 0.0, 0.0
+    for frames in at.values():
+        ref = min(frames, key=lambda f: f.pass_key.pitch_deg)
+        r, ref_pose, ref_t = ref.pass_key.pitch_deg, pose_matrix(ref.camera), plans[ref.idx].t
+        for f in frames:
+            if f is ref:
+                continue
+            pos, rot = _pose_gap(pose_matrix(f.camera), ref_pose @ relative_extrinsic(r, f.pass_key.pitch_deg))
+            dt = abs(plans[f.idx].t - ref_t)
+            pairs += 1
+            max_pos, max_rot, max_dt = max(max_pos, pos), max(max_rot, rot), max(max_dt, dt)
+    passed = max_pos <= tol_m and max_rot <= tol_deg and max_dt == 0.0
+    return {"passed": passed, "positions": len(at), "pairs": pairs,
+            "max_pos_m": max_pos, "max_rot_deg": max_rot, "max_dt_s": max_dt}
+
+
+def check_trajectory(run: SynthRun, *, tol_m: float = RIG_TOL_M, tol_deg: float = RIG_TOL_DEG) -> dict:
+    """Check that the recorded body trajectory of a bundle rendered with body shake gives each frame pose.
+
+    For every frame, at pitch q on one side, the body pose at the frame time `FramePlan.t`
+    (`interpolate_pose` over that side's `Trajectory.body_poses()`) times `pitch_extrinsic(q)` must
+    match the frame pose within `tol_m` and `tol_deg`.
+    Raises ValueError when `run` is not rendered with body shake.
+    """
+    plans = _shake_plans(run)
+    bodies: dict[str, tuple[np.ndarray, np.ndarray]] = {}
+    max_pos, max_rot = 0.0, 0.0
+    for f in run.frames:
+        side = f.pass_key.side
+        if side not in bodies:
+            tr = run.trajectory(side)
+            bodies[side] = (tr.t, tr.body_poses())
+        body = interpolate_pose(*bodies[side], plans[f.idx].t)
+        pos, rot = _pose_gap(pose_matrix(f.camera), body @ pitch_extrinsic(f.pass_key.pitch_deg))
+        max_pos, max_rot = max(max_pos, pos), max(max_rot, rot)
+    passed = max_pos <= tol_m and max_rot <= tol_deg
+    return {"passed": passed, "frames": len(run.frames), "max_pos_m": max_pos, "max_rot_deg": max_rot}

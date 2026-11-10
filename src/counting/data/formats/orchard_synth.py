@@ -4,12 +4,20 @@
 prediction path may see is in `FrameInput` (pose, intrinsics, image paths) and
 `OrchardLayout` (row and tree positions); records, fruit positions and tree
 totals stay in `SceneTruth`, which only scoring and oracle code should read.
+
+A bundle rendered with body shake (manifest args.shake) has shaken frame poses, and each frame also
+holds its time, its planned position and its planned pose; positions, the base step and the aisle
+come from the planned poses. Its recorded body trajectory (trajectory.json and one
+trajectory_<side>.npz per side, which `open` hashes against the digests in trajectory.json) joins the
+fingerprint. The times, planned poses and positions (FramePlan, SynthRun.plans) and the trajectory
+(Trajectory, SynthRun.trajectory) are on the truth side, like SceneTruth.
 """
 
 from __future__ import annotations
 
 import hashlib
 import json
+import zipfile
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Sequence
@@ -21,6 +29,9 @@ from counting.geometry.camera import Camera, pitch_from_blender
 
 _TOL = 1e-6
 _PITCH_TOL_DEG = 0.01
+_SHAKE_PITCH_TOL_DEG = 3.0   # pose name pitch vs a shaken matrix_world
+_SHAKE_FIELDS = ("t", "pos_k", "plan")   # frame.json fields of a bundle rendered with body shake
+_TRAJECTORY_FILES = ("trajectory.json", "trajectory_A.npz", "trajectory_B.npz")   # the recorded body trajectory
 _PLANAR_DEPTH = "평면 깊이"   # marker orchard_synth writes into conventions.depth16 ("plane depth")
 _U16_MODES = ("I;16", "I;16B", "I")
 _COMMIT_SIDECAR = "orchard_synth.commit"
@@ -111,6 +122,43 @@ class RunMeta:
     is_sequence: bool
     synth_commit: str | None
     fingerprint: str
+    shake: bool = False
+
+
+@dataclass(frozen=True, eq=False)
+class FramePlan:
+    """One frame of a bundle rendered with body shake, truth side: its time `t` (s), its planned
+    position `pos_k` (frame.json's index into the pass positions, kept even when the bundle is not a
+    sequence) and the planned camera `plan` (the straight pose, with the frame's intrinsics)."""
+
+    idx: int
+    t: float
+    pos_k: int
+    plan: Camera
+
+
+@dataclass(frozen=True, eq=False)
+class Trajectory:
+    """The recorded body of one side of a bundle rendered with body shake, truth side: sample times `t`
+    (N,) s, body positions `p` (N, 3) world m and body rotations `q_wxyz` (N, 4) world <- body, scalar first."""
+
+    side: str
+    t: np.ndarray
+    p: np.ndarray
+    q_wxyz: np.ndarray
+
+    def body_poses(self) -> np.ndarray:
+        """Body-to-world poses (N, 4, 4): the rotation of the normalised `q_wxyz`, the translation `p`."""
+        w, x, y, z = (self.q_wxyz / np.linalg.norm(self.q_wxyz, axis=1, keepdims=True)).T
+        out = np.zeros((len(self.t), 4, 4))
+        out[:, :3, :3] = np.stack([
+            np.stack([1 - 2 * (y * y + z * z), 2 * (x * y - w * z), 2 * (x * z + w * y)], axis=1),
+            np.stack([2 * (x * y + w * z), 1 - 2 * (x * x + z * z), 2 * (y * z - w * x)], axis=1),
+            np.stack([2 * (x * z - w * y), 2 * (y * z + w * x), 1 - 2 * (x * x + y * y)], axis=1),
+        ], axis=1)
+        out[:, :3, 3] = self.p
+        out[:, 3, 3] = 1.0
+        return out
 
 
 def _sha256(data: bytes) -> str:
@@ -125,11 +173,13 @@ def _fingerprint_paths(root: Path) -> list[Path]:
     paths = [root / "manifest.json"]
     if (root / "summary.json").is_file():
         paths.append(root / "summary.json")
-    return paths + sorted(root.glob("*_frame.json"))
+    paths += sorted(root.glob("*_frame.json"))
+    return paths + [root / name for name in _TRAJECTORY_FILES if (root / name).is_file()]
 
 
 def run_fingerprint(root: Path) -> str:
-    """sha256 over (name, sha256) of manifest.json, summary.json (if any) and every *_frame.json.
+    """sha256 over (name, sha256) of manifest.json, summary.json (if any), every *_frame.json and, when present,
+    trajectory.json and the trajectory npz files.
 
     RGB and depth images are left out (RGB bytes are not reproducible); see
     `SynthRun.depth_fingerprint` for the depth images.
@@ -224,26 +274,57 @@ def _parse_layout(manifest: dict, mpath: Path) -> OrchardLayout:
                          tree_x=tuple(base_x[i] for i in target))
 
 
-def _parse_frame(p: Path, f: dict, fruits: dict[int, FruitGt], layout: OrchardLayout):
-    """(idx, pass key, camera, camera x, records) of one *_frame.json, after its format checks."""
+def _parse_frame(p: Path, f: dict, fruits: dict[int, FruitGt], layout: OrchardLayout, shake: bool):
+    """(idx, pass key, camera, camera x, records, plan) of one *_frame.json, after its format checks.
+
+    `plan` is the frame's `FramePlan` when `shake` (the bundle is rendered with body shake), else None.
+    """
     idx = int(f["idx"])
     if p.name != f"{idx:06d}_frame.json":
         raise ValueError(f"{p}: frame file name does not match idx")
+    if not shake and any(k in f for k in _SHAKE_FIELDS):
+        raise ValueError(f"{p}: t, pos_k or plan in a bundle without args.shake")
     pose, matrix = f["pose"], f["pose"]["matrix_world"]
     try:
         pitch = float(pose["name"].rpartition("_")[2])
     except ValueError:
         raise ValueError(f"{p}: pose name {pose['name']!r} has no pitch suffix") from None
-    if abs(pitch - pitch_from_blender(matrix)) > _PITCH_TOL_DEG:
-        raise ValueError(f"{p}: pitch in pose name does not match matrix_world")
-    camera = Camera.from_blender(matrix, int(pose["width"]), int(pose["height"]), float(pose["hfov_deg"]))
+    planned = f["plan"] if shake else matrix
+    if abs(pitch - pitch_from_blender(planned)) > _PITCH_TOL_DEG:
+        raise ValueError(f"{p}: pitch in pose name does not match {'plan' if shake else 'matrix_world'}")
+    if shake and abs(pitch - pitch_from_blender(matrix)) > _SHAKE_PITCH_TOL_DEG:
+        raise ValueError(f"{p}: pitch in pose name is more than {_SHAKE_PITCH_TOL_DEG:g} deg from matrix_world")
+    size = int(pose["width"]), int(pose["height"]), float(pose["hfov_deg"])
+    camera = Camera.from_blender(matrix, *size)
+    plan = None
+    if shake:
+        plan = FramePlan(idx=idx, t=float(f["t"]), pos_k=int(f["pos_k"]), plan=Camera.from_blender(planned, *size))
     s = layout.row_spacing
-    aisle = round((float(matrix[1][3]) - layout.row_ys[0] + s / 2) / s)
+    aisle = round((float(planned[1][3]) - layout.row_ys[0] + s / 2) / s)
     recs = tuple(_record(r) for r in f["records"])
     for r in recs:
         if r.id not in fruits or fruits[r.id].tree != r.tree:
             raise ValueError(f"{p}: record tree != fruit tree for id {r.id}")
-    return idx, PassKey(pitch, str(f["side"]), aisle), camera, float(matrix[0][3]), recs
+    return idx, PassKey(pitch, str(f["side"]), aisle), camera, float(matrix[0][3]), recs, plan
+
+
+def _load_trajectory(path: Path, side: str) -> Trajectory:
+    """One side's trajectory_<side>.npz as read-only float arrays, after its key, shape and time checks."""
+    try:
+        with np.load(path, allow_pickle=False) as z:
+            arrays = {k: np.asarray(z[k], dtype=float) for k in z.files}
+    except (OSError, ValueError, TypeError, zipfile.BadZipFile) as e:
+        raise ValueError(f"{path}: unreadable npz ({e})") from None
+    if set(arrays) != {"t", "p", "q_wxyz"}:
+        raise ValueError(f"{path}: arrays {sorted(arrays)}, expected p, q_wxyz and t")
+    t, p, q = arrays["t"], arrays["p"], arrays["q_wxyz"]
+    if t.ndim != 1 or p.shape != (len(t), 3) or q.shape != (len(t), 4):
+        raise ValueError(f"{path}: shapes t {t.shape}, p {p.shape}, q_wxyz {q.shape}, expected (N,), (N, 3), (N, 4)")
+    if not np.all(np.diff(t) > 0):
+        raise ValueError(f"{path}: t is not strictly increasing")
+    for a in (t, p, q):
+        a.flags.writeable = False
+    return Trajectory(side=side, t=t, p=p, q_wxyz=q)
 
 
 def _parse_summary(data: dict, spath: Path) -> dict[int, dict]:
@@ -283,7 +364,8 @@ class SynthRun:
 
     def __init__(self, root: Path, meta: RunMeta, layout: OrchardLayout, frames: tuple[FrameInput, ...],
                  *, records: dict[int, tuple[GtRecord, ...]], fruits: dict[int, FruitGt],
-                 totals: dict[int, int], count1: tuple[float, int], summary: dict[int, dict] | None) -> None:
+                 totals: dict[int, int], count1: tuple[float, int], summary: dict[int, dict] | None,
+                 plans: dict[int, FramePlan] | None = None, trajectory_files: frozenset[str] | None = None) -> None:
         self.root = root
         self.meta = meta
         self.layout = layout
@@ -293,6 +375,9 @@ class SynthRun:
         self._totals = totals
         self._count1 = count1
         self._summary = summary
+        self._plans = plans
+        self._trajectory_files = trajectory_files
+        self._trajectories: dict[str, Trajectory] = {}
         self._truth: SceneTruth | None = None
 
     @classmethod
@@ -307,11 +392,13 @@ class SynthRun:
         if not frame_paths:
             raise ValueError(f"{root}: no *_frame.json files")
 
-        # Read every fingerprinted file once: hash its bytes and parse its JSON.
+        # Read every fingerprinted file once: hash its bytes and parse its JSON (the npz files are only hashed).
         digests, loaded = [], {}
         for p in paths:
             data = p.read_bytes()
             digests.append((p.name, _sha256(data)))
+            if p.suffix == ".npz":
+                continue
             try:
                 loaded[p] = json.loads(data)
             except json.JSONDecodeError as e:
@@ -336,42 +423,77 @@ class SynthRun:
             crop, seed = str(args["crop"]), int(args["seed"])
             preset, samples, time_of_day = str(args["preset"]), int(args["samples"]), str(args["time"])
             max_frames = args.get("max_frames")
+            shake = args.get("shake") is True
         except _FIELD_ERRORS as e:
             raise _field_error(mpath, e) from None
         del manifest   # drops the leaves and everything else not kept above
 
+        # The trajectory files: none without body shake; with it, every file trajectory.json lists is
+        # there with that sha256.
+        tpath = root / _TRAJECTORY_FILES[0]
+        traj_paths = [p for p in paths if p.name in _TRAJECTORY_FILES]
+        if not shake and traj_paths:
+            raise ValueError(f"{traj_paths[0]}: trajectory file in a bundle without args.shake")
+        listed: dict[str, str] = {}
+        if shake:
+            if tpath not in loaded:
+                raise ValueError(f"{root}: args.shake is set but trajectory.json is missing")
+            try:
+                listed = dict(loaded.pop(tpath)["digests"].items())
+            except _FIELD_ERRORS as e:
+                raise _field_error(tpath, e) from None
+            hashed = dict(digests)
+            for name, want in listed.items():
+                if name not in hashed:
+                    raise ValueError(f"{root / name}: listed in trajectory.json but missing")
+                if hashed[name] != want:
+                    raise ValueError(f"{root / name}: sha256 does not match trajectory.json")
+
         parsed = []
         for p in frame_paths:
             try:
-                parsed.append(_parse_frame(p, loaded[p], fruits, layout))
+                parsed.append(_parse_frame(p, loaded[p], fruits, layout, shake))
             except _FIELD_ERRORS as e:
                 raise _field_error(p, e) from None
         parsed.sort(key=lambda e: e[0])
+        if shake:
+            for side in sorted({key.side for _, key, *_ in parsed}):
+                if f"trajectory_{side}.npz" not in listed:
+                    raise ValueError(f"{root}: no trajectory_{side}.npz in trajectory.json for side {side}")
 
+        # Positions come from the planned poses on a bundle rendered with body shake, else from the frame poses.
+        pos_x = {idx: cam_x if plan is None else float(plan.plan.C[0]) for idx, _, _, cam_x, _, plan in parsed}
         xs_by_pass: dict[PassKey, list[float]] = {}
-        for _, key, _, cam_x, _ in parsed:
-            xs_by_pass.setdefault(key, []).append(cam_x)
+        for idx, key, *_ in parsed:
+            xs_by_pass.setdefault(key, []).append(pos_x[idx])
         step = None if max_frames is not None else _measured_step(xs_by_pass)
         if step is not None and "step" in cam_param and abs(step - float(cam_param["step"])) > _TOL:
             raise ValueError(f"{mpath}: measured step != cam_param step ({step:.9g} vs {cam_param['step']})")
         x_min = {key: min(xs) for key, xs in xs_by_pass.items()}
+        pos_k = {}
+        for idx, key, *_, plan in parsed:
+            k = -1 if step is None else round((pos_x[idx] - x_min[key]) / step)
+            if plan is not None and step is not None and plan.pos_k != k:
+                raise ValueError(f"{root / f'{idx:06d}_frame.json'}: pos_k {plan.pos_k} does not match "
+                                 f"the planned position {k}")
+            pos_k[idx] = k
 
         sidecar = root / _COMMIT_SIDECAR
         lines = sidecar.read_text(encoding="utf-8").splitlines() if sidecar.is_file() else []
         commit = lines[0].strip() if lines and lines[0].strip() else None
         meta = RunMeta(run_id=f"{crop}_s{seed}_{fingerprint[:8]}", crop=crop, preset=preset,
                        seed=seed, samples=samples, time=time_of_day, base_step_m=step,
-                       is_sequence=step is not None, synth_commit=commit, fingerprint=fingerprint)
+                       is_sequence=step is not None, synth_commit=commit, fingerprint=fingerprint, shake=shake)
 
         frames = tuple(
-            FrameInput(run_id=meta.run_id, idx=idx, pass_key=key,
-                       pos_k=-1 if step is None else round((cam_x - x_min[key]) / step),
+            FrameInput(run_id=meta.run_id, idx=idx, pass_key=key, pos_k=pos_k[idx],
                        camera=camera, cam_x=cam_x, rgb_path=root / f"{idx:06d}_rgb.png",
                        depth_path=root / f"{idx:06d}_depth16.png")
-            for idx, key, camera, cam_x, _ in parsed)
-        records = {idx: recs for idx, _, _, _, recs in parsed}
+            for idx, key, camera, cam_x, _, _ in parsed)
+        records = {idx: recs for idx, _, _, _, recs, _ in parsed}
+        plans = {idx: plan for idx, *_, plan in parsed} if shake else None
         return cls(root, meta, layout, frames, records=records, fruits=fruits, totals=totals, count1=count1,
-                   summary=summary)
+                   summary=summary, plans=plans, trajectory_files=frozenset(listed) if shake else None)
 
     def passes(self) -> dict[PassKey, list[FrameInput]]:
         """Frames grouped by pass, passes in order of first appearance, frames in idx order."""
@@ -386,6 +508,23 @@ class SynthRun:
             self._truth = SceneTruth(records=self._records, fruits=self._fruits, totals=self._totals,
                                      count1=self._count1, summary=self._summary)
         return self._truth
+
+    def plans(self) -> dict[int, FramePlan] | None:
+        """Frame times, planned positions and planned cameras by frame idx (truth side, like `truth`);
+        None for a bundle rendered without body shake."""
+        return self._plans
+
+    def trajectory(self, side: str) -> Trajectory:
+        """The recorded body of `side` from trajectory_<side>.npz (truth side, like `truth`; read on the
+        first call, then cached). A bundle rendered without body shake has none."""
+        if self._trajectory_files is None:
+            raise ValueError(f"{self.root}: no trajectory, not a shake bundle")
+        if side not in self._trajectories:
+            name = f"trajectory_{side}.npz"
+            if name not in self._trajectory_files:
+                raise ValueError(f"{self.root}: no {name} in trajectory.json for side {side}")
+            self._trajectories[side] = _load_trajectory(self.root / name, side)
+        return self._trajectories[side]
 
     def semantic_path(self, idx: int) -> Path:
         return self.root / f"{idx:06d}_semantic.png"

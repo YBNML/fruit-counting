@@ -359,7 +359,7 @@ def _track_passes(ctx: RunContext, cfg: EvalAppConfig, noise_seed: int | None) -
     """
     st, scene, nz = cfg.stages, ctx.run.meta.seed, cfg.noise
     cams = model_cameras(ctx.run.frames, ctx.passes, cfg, noise_seed, scene=scene,
-                         base_step_m=ctx.run.meta.base_step_m)
+                         base_step_m=ctx.run.meta.base_step_m, plans=ctx.run.plans())
     out: list[_PassTrack] = []
     for key, frames in ctx.passes.items():
         bias = None if noise_seed is None else pass_bias(
@@ -529,7 +529,7 @@ def evaluate(ctx: RunContext, cfg: EvalAppConfig, *, subsets: bool = False, nois
         y6 = _y6(ctx, cfg, stages, ctx.tables)
     out = {"stages": st.model_dump(), "lift_depth": cfg.lift.depth, "y1": y1, "y6": y6}
     if cfg.pose is not None:
-        out["pose"] = pose_settings(cfg, noise_seed)
+        out["pose"] = pose_settings(cfg, noise_seed, planned=ctx.run.meta.shake)
         out["pose_quality"] = pose_quality(
             [(p.key, [f.camera for f in p.frames], [p.cameras[f.idx] for f in p.frames]) for p in staged],
             ctx.layout, transforms, ref_pitch=cfg.pose.rig_ref if cfg.pose.rig else None,

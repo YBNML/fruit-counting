@@ -13,10 +13,11 @@ Drift. With a drift key set (`DRIFT_CAMERA_KEYS`, a key at 0 included) and a noi
 flow draws its walk, scale and rate (`flow_draws`), each side its start error (`pass_side_*`) and,
 without the rig, each pass its pitch error (`pass_pitch_*`); draws are made even when the values
 are 0, so configs with drift keys share their draws. The body chain starts at the first true body
-pose times the side start error (`pose.anchor=nominal`) or at the first true body pose
+pose times the side start error (`pose.anchor=nominal`; on a bundle rendered with body shake, at
+the planned body pose of the first reference frame instead) or at the first true body pose
 (`pose.anchor=first_truth`), then chains the noisy increments (`noisy_increments`). A pitch error
 moves the chained pass about its middle (`about_middle`). With zero sigmas and zero start and
-pitch errors the chain is the truth itself.
+pitch errors the chain is the truth itself, unless it starts at the planned body pose.
 
 Rig. A camera at pitch q is the body pose times the believed extrinsic: the reference camera's
 known extrinsic, the turn from the reference camera to q and, for q other than the reference, the
@@ -35,7 +36,7 @@ from collections.abc import Iterable, Mapping, Sequence
 import numpy as np
 
 from counting.config.eval_schema import DRIFT_KEYS, EvalAppConfig, NoiseConfig
-from counting.data.formats.orchard_synth import FrameInput, PassKey
+from counting.data.formats.orchard_synth import FrameInput, FramePlan, PassKey
 from counting.geometry.camera import Camera
 from counting.geometry.noise import (
     STEP_PITCH, STEP_RIG, STEP_START, DriftSigmas, about_middle, chain_poses, flow_draws, noisy_increments,
@@ -85,17 +86,20 @@ def drift_active(cfg: EvalAppConfig, noise_seed: int | None) -> bool:
     return cfg.pose is not None and noise_seed is not None and _present(cfg.noise, DRIFT_CAMERA_KEYS)
 
 
-def pose_settings(cfg: EvalAppConfig, noise_seed: int | None) -> dict:
+def pose_settings(cfg: EvalAppConfig, noise_seed: int | None, *, planned: bool = False) -> dict:
     """The pose settings of a result (`cfg` has a pose section): the pose source and its camera
     configuration, whether the drift model ran (`drift_active`), the anchor and, with drift, the
-    start (`nominal_from_first_frame` for `pose.anchor=nominal`, else `first_frame_truth`), the rig,
-    fusion and `align.mode` ("none" without an align section, a list for listed methods), and the
-    tracker and dedup settings the pose errors meet."""
+    start (`pose.anchor=nominal` gives `nominal_from_plan` when `planned`, on a bundle rendered with
+    body shake, and `nominal_from_first_frame` otherwise; `pose.anchor=first_truth` gives
+    `first_frame_truth`), the rig, fusion and `align.mode` ("none" without an align section, a list
+    for listed methods), and the tracker and dedup settings the pose errors meet."""
     pose, align = cfg.pose, cfg.align
     drift = drift_active(cfg, noise_seed)
     start = None
-    if drift:
-        start = "nominal_from_first_frame" if pose.anchor == "nominal" else "first_frame_truth"
+    if drift and pose.anchor == "nominal":
+        start = "nominal_from_plan" if planned else "nominal_from_first_frame"
+    elif drift:
+        start = "first_frame_truth"
     if align is None:
         mode: str | list[str] = "none"
     else:
@@ -146,17 +150,22 @@ def _near(errors: Mapping[float, np.ndarray], pitch: float) -> np.ndarray | None
 def model_cameras(
     frames: Sequence[FrameInput], passes: Mapping[PassKey, Sequence[FrameInput]], cfg: EvalAppConfig,
     noise_seed: int | None, *, scene: int, base_step_m: float | None,
+    plans: Mapping[int, FramePlan] | None = None,
 ) -> dict[PassKey, dict[int, Camera]] | None:
     """The camera of every frame of `passes`, by pass key and frame idx, under `cfg.pose`.
 
     Returns None (the true cameras) without a pose section, or without the rig and without drift
     (`drift_active`). `frames` are all the frames of the bundle: the reference frames of a flow come
     from them. `scene` is the bundle seed of the noise keys and `base_step_m` its base step.
+    `plans` are the planned frames by idx of a bundle rendered with body shake (`SynthRun.plans`):
+    with drift and `pose.anchor=nominal`, a flow's chain then starts at the planned body pose of its
+    first reference frame (times the side start error) and runs even with zero sigmas and errors.
 
     Raises `ValueError` (naming the bundle folder) when the drift model needs frame times
-    (`noise.drift_time_offset_s` > 0) or a sequence bundle (`base_step_m` None), when a flow has no
-    reference pass, or when a frame has no reference frame at its `pos_k`. Without the rig, a flow
-    whose chain is the truth gives each frame its own camera object.
+    (`noise.drift_time_offset_s` > 0; with `plans`, a time offset above 0 is not supported) or a
+    sequence bundle (`base_step_m` None), when a flow has no reference pass, or when a frame has no
+    reference frame at its `pos_k`. Without the rig, a flow whose chain is the truth gives each frame
+    its own camera object.
     """
     pose, nz = cfg.pose, cfg.noise
     if pose is None:
@@ -166,12 +175,15 @@ def model_cameras(
         return None
     where = frames[0].depth_path.parent
     if drift and nz.factor("drift_time_offset_s") > 0:
+        if plans is not None:
+            raise ValueError(f"{where}: noise.drift_time_offset_s > 0 is not supported")
         raise ValueError(f"{where}: noise.drift_time_offset_s needs frame times; this bundle has none")
     if drift and base_step_m is None:
         raise ValueError(f"{where}: the drift model needs a sequence bundle (frame positions)")
     sigmas = drift_sigmas(nz)
+    planned = drift and plans is not None and pose.anchor == "nominal"
     no_start = pose.anchor == "first_truth" or _all_zero(nz, _SIDE_KEYS)
-    flat = not drift or (sigmas.is_zero() and no_start and _all_zero(nz, _PITCH_KEYS))
+    flat = not drift or (not planned and sigmas.is_zero() and no_start and _all_zero(nz, _PITCH_KEYS))
     errors = rig_errors(cfg, noise_seed, scene=scene, pitches=[key.pitch_deg for key in passes])
 
     flows: dict[tuple[int, ...], list[PassKey]] = {}
@@ -199,7 +211,10 @@ def model_cameras(
         if flat:
             body = body_true
         else:
-            start = body_true[0] if no_start else body_true[0] @ start_error
+            first = body_true[0]
+            if planned:
+                first = body_from_reference(pose_matrix(plans[refs[0].idx].plan), pitch_extrinsic(ref))
+            start = first if no_start else first @ start_error
             body = chain_poses(start, noisy_increments(body_true, draws, sigmas, base_step_m))
             if pitch_error is not None:
                 body = about_middle(body, pitch_error)

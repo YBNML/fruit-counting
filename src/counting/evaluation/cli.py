@@ -1,5 +1,6 @@
 """`counting eval` sub-app: `eval truth` prints pass/tree ground-truth tables and runs
-the summary/geometry/split checks for one or more orchard_synth bundles; `eval run` and
+the summary/geometry/split checks for one or more orchard_synth bundles and, for bundles
+rendered with body shake, the rig and trajectory checks; `eval run` and
 `eval ladder` score a stage setting (or walk the oracle ladder) and write the experiment
 folder; `eval sweep` scores a grid of stage-setting points (optionally crossed with
 ladder bases) and writes the same kind of experiment folder with a `sweep.csv`. A split=test
@@ -46,9 +47,13 @@ def truth(
 ) -> None:
     """Print pass/tree ground-truth tables and run the summary/geometry/split checks.
 
+    For a bundle rendered with body shake it also checks that the cameras at one position
+    share their body and time (rig) and that the recorded trajectory gives each frame pose
+    (trajectory), within 1e-6 m and 1e-4 deg.
+
     Exit code 0 is success, 1 is a check failure (summary mismatch/missing, geometry,
-    split), 2 is an input error. A bundle whose sampled frames show no ground reports
-    ground=n/a; the centre check still applies.
+    split, rig, trajectory), 2 is an input error. A bundle whose sampled frames show no
+    ground reports ground=n/a; the centre check still applies.
     """
     from counting.config.eval_schema import SplitsConfig
     from counting.config.loader import load_yaml_model
@@ -56,7 +61,9 @@ def truth(
     from counting.evaluation.truth import (
         SummaryMismatch,
         check_geometry,
+        check_rig,
         check_summary,
+        check_trajectory,
         subset_table,
         truth_sets,
     )
@@ -164,6 +171,23 @@ def truth(
                     typer.echo("split OK")
                 else:
                     typer.echo(f"split MISMATCH: seed {seed} is {seed_split}")
+                    failed = True
+
+            # The whole bundle, whatever --pitches, --sides and --step select.
+            if run.meta.shake:
+                rig = check_rig(run)
+                traj = check_trajectory(run)
+                rig_detail = (
+                    f"positions={rig['positions']}, pairs={rig['pairs']}, max_pos_m={rig['max_pos_m']:.3g}, "
+                    f"max_rot_deg={rig['max_rot_deg']:.3g}, max_dt_s={rig['max_dt_s']:.3g}"
+                )
+                traj_detail = (
+                    f"frames={traj['frames']}, max_pos_m={traj['max_pos_m']:.3g}, "
+                    f"max_rot_deg={traj['max_rot_deg']:.3g}"
+                )
+                typer.echo(f"rig {'OK' if rig['passed'] else 'FAIL'} ({rig_detail})")
+                typer.echo(f"trajectory {'OK' if traj['passed'] else 'FAIL'} ({traj_detail})")
+                if not (rig["passed"] and traj["passed"]):
                     failed = True
     except (ValueError, FileNotFoundError, NotImplementedError) as e:
         typer.echo(f"error: {e}")
