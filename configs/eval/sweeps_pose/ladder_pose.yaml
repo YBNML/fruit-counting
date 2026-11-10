@@ -1,0 +1,62 @@
+# Pose ladder. rungs form the chain; baselines are report rungs and the structure rungs of the drift grids.
+# Every rung and baseline writes a pose section (an empty one keeps the base config's pose), so each one reports
+# pose quality. val_only names the baselines that run on val only, never on the held-out scenes.
+noise_blocks:        # named noise values the rungs combine through YAML anchors; the runner does not read this key
+  vo: &vo {drift_scale_sigma: 0.0045, drift_rate_deg_per_m: 0.045, drift_step_trans_mm: 2.1, drift_step_rot_deg: 0.039}
+  vo_dvo: &vo_dvo {drift_scale_sigma: 0.003, drift_rate_deg_per_m: 0.03, drift_step_trans_mm: 0.7, drift_step_rot_deg: 0.013}
+  start: &start {pass_side_trans_m: 0.05, pass_side_rot_deg: 0.5}
+  rig: &rig {rig_extr_trans_mm: 14.0, rig_extr_rot_deg: 0.4}
+  pitch: &pitch {pass_pitch_trans_m: 0.02, pass_pitch_rot_deg: 0.25}
+  depth: &depth {depth_rel_sigma: 0.02, depth_dropout: 0.05}
+  imu: &imu {imu_gyro_n: 1.16e-3, imu_acc_n: 4.97e-3, imu_gyro_w: 1.82e-5, imu_acc_w: 4.75e-4, imu_gyro_b0_dps: 1.0, imu_acc_b0_mg: 4.0, imu_temp_k: 1.0}
+  imu_belief: &imu_belief {imu_time_offset_ms: 0.0, imu_extr_trans_mm: 10.0, imu_extr_rot_deg: 0.3}
+  stage_one: &stage_one {pose_trans_sigma_m: 0.02, pose_rot_sigma_deg: 0.5, pass_bias_m: 0.02, depth_rel_sigma: 0.02, depth_dropout: 0.05}
+rungs:
+  L3:       {stages: &l3 {track: landmark, center: measured, assign: grid}, pose: {}}
+  L4_drift: {stages: *l3, pose: {rig: true, fuse: imu}, align: {mode: [tracks, row_plane]},
+             noise: {<<: [*vo, *start, *rig, *depth, *imu, *imu_belief]}}
+  LVI:      {stages: *l3, pose: &lvi {source: file, cache: vo, rig: true, fuse: imu, imu: imu_ext},
+             align: {mode: [tracks, row_plane]}, noise: &lvi_noise {<<: [*start, *rig, *depth, *imu_belief]}}
+  L5:       {stages: &l5 {det: cached, track: landmark, center: measured, assign: grid}, pose: {}}
+  L5VI:     {stages: *l5, pose: *lvi, align: {mode: [tracks, row_plane]}, noise: *lvi_noise}
+baselines:
+  # report rungs that may run on the held-out scenes
+  L3_al:             {stages: *l3, pose: {}, align: {mode: [tracks, row_plane]}}
+  L4_drift_noimu:    {stages: *l3, pose: {rig: true}, align: {mode: [tracks, row_plane]}, noise: {<<: [*vo, *start, *rig, *depth]}}
+  L4_drift_noal:     {stages: *l3, pose: {rig: true, fuse: imu}, noise: {<<: [*vo, *start, *rig, *depth, *imu, *imu_belief]}}
+  L4_drift_fitp:     {stages: *l3, pose: {rig: true, fuse: imu}, align: {mode: fit_truth_pass}, noise: {<<: [*vo, *start, *rig, *depth, *imu, *imu_belief]}}
+  L4_drift_c1x:      {stages: *l3, pose: {fuse: imu}, align: {mode: [tracks, row_plane]}, noise: {<<: [*vo, *start, *pitch, *depth, *imu, *imu_belief]}}
+  L4_drift_dvo:      {stages: *l3, pose: {rig: true, fuse: imu}, align: {mode: [tracks, row_plane]}, noise: {<<: [*vo_dvo, *start, *rig, *depth, *imu, *imu_belief]}}
+  L3_pass:           {stages: *l3, pose: {rig: true, fuse: imu}, noise: {<<: [*start, *rig, *imu, *imu_belief]}}
+  L3_pass_al:        {stages: *l3, pose: {rig: true, fuse: imu}, align: {mode: [tracks, row_plane]}, noise: {<<: [*start, *rig, *imu, *imu_belief]}}
+  L3_pass_c1x:       {stages: *l3, pose: {fuse: imu}, noise: {<<: [*start, *pitch, *imu, *imu_belief]}}
+  LV:                {stages: *l3, pose: {source: file, cache: vo, rig: true, fuse: vo}, align: {mode: [tracks, row_plane]}, noise: {<<: [*start, *rig, *depth]}}
+  L5V:               {stages: *l5, pose: {source: file, cache: vo, rig: true, fuse: vo}, align: {mode: [tracks, row_plane]}, noise: {<<: [*start, *rig, *depth]}}
+  LVI_first:         {stages: *l3, pose: {source: file, cache: vo, rig: true, fuse: imu, imu: imu_ext, anchor: first_truth}, noise: {<<: [*rig, *depth, *imu_belief]}}
+  LVI_fitp:          {stages: *l3, pose: *lvi, align: {mode: fit_truth_pass}, noise: *lvi_noise}
+  LVI_fits:          {stages: *l3, pose: *lvi, align: {mode: fit_truth_segment}, noise: *lvi_noise}
+  LVI_dd:            {stages: *l3, pose: {source: file, cache: vo_dd, rig: true, fuse: imu, imu: imu_ext}, align: {mode: [tracks, row_plane]}, noise: {<<: [*start, *rig, *imu_belief]}}
+  LVI_rowbias5:      {stages: *l3, pose: *lvi, align: {mode: [tracks, row_plane], stress_row_bias_m: 0.05}, noise: *lvi_noise}
+  LVI_rowbias10:     {stages: *l3, pose: *lvi, align: {mode: [tracks, row_plane], stress_row_bias_m: 0.10}, noise: *lvi_noise}
+  LVI_thin50:        {stages: *l3, pose: *lvi, align: {mode: [tracks, row_plane], stress_pair_keep: 0.5}, noise: *lvi_noise}
+  LVI_thin80:        {stages: *l3, pose: *lvi, align: {mode: [tracks, row_plane], stress_pair_keep: 0.2}, noise: *lvi_noise}
+  LVI_oracle_struct: {stages: *l3, pose: *lvi, align: {mode: oracle_struct}, noise: *lvi_noise}
+  L4_base:           {stages: *l3, pose: {}, noise: *stage_one}
+  L5_L4base:         {stages: *l5, pose: {}, noise: *stage_one}
+  # report rungs that run on val only (val_only)
+  L4_drift_know:     {stages: *l3, pose: {rig: true, fuse: imu, vio: {estimator_imu: generator}}, align: {mode: [tracks, row_plane]}, noise: {<<: [*vo, *start, *rig, *depth, *imu, *imu_belief]}}
+  L4_drift_stop5:    {stages: *l3, pose: {rig: true, fuse: imu, vio: {stop_s: 5.0}}, align: {mode: [tracks, row_plane]}, noise: {<<: [*vo, *start, *rig, *depth, *imu, *imu_belief]}}
+  LV_ref:            {stages: *l3, pose: {source: file, cache: vo, rig: true}, align: {mode: [tracks, row_plane]}, noise: {<<: [*start, *rig, *depth]}}
+  LVI_c1x:           {stages: *l3, pose: {source: file, cache: vo, fuse: imu, imu: imu_ext}, align: {mode: [tracks, row_plane]}, noise: {<<: [*start, *pitch, *depth, *imu_belief]}}
+  L5VI_c1x:          {stages: *l5, pose: {source: file, cache: vo, fuse: imu, imu: imu_ext}, align: {mode: [tracks, row_plane]}, noise: {<<: [*start, *pitch, *depth, *imu_belief]}}
+  LVI_lab:           {stages: *l3, pose: {source: file, cache: vo, rig: true, fuse: imu, imu: imu_lab}, align: {mode: [tracks, row_plane]}, noise: *lvi_noise}
+  LVI_icm:           {stages: *l3, pose: {source: file, cache: vo, rig: true, fuse: imu, imu: imu_icm}, align: {mode: [tracks, row_plane]}, noise: *lvi_noise}
+  LVI_ext4:          {stages: *l3, pose: {source: file, cache: vo, rig: true, fuse: imu, imu: imu_ext_x4}, align: {mode: [tracks, row_plane]}, noise: *lvi_noise}
+  LVI_stop5:         {stages: *l3, pose: {source: file, cache: vo, rig: true, fuse: imu, imu: imu_ext, vio: {stop_s: 5.0}}, align: {mode: [tracks, row_plane]}, noise: *lvi_noise}
+  # structure rungs of the drift grids: no noise (each grid's common block adds it)
+  B_drift:           {stages: *l3, pose: {rig: true, fuse: imu}, align: {mode: [tracks, row_plane]}}
+  B_drift_fitp:      {stages: *l3, pose: {rig: true, fuse: imu}, align: {mode: fit_truth_pass}}
+  B_pass:            {stages: *l3, pose: {rig: true, fuse: imu}}
+  B_pass_c1x:        {stages: *l3, pose: {fuse: imu}}
+  B_vi:              {stages: *l3, pose: *lvi, align: {mode: [tracks, row_plane]}}
+val_only: [L4_drift_know, L4_drift_stop5, LV_ref, LVI_c1x, L5VI_c1x, LVI_lab, LVI_icm, LVI_ext4, LVI_stop5, B_vi]

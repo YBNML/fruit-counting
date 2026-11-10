@@ -122,7 +122,7 @@ def test_report_depth_err_line(leaf_runs, l1_l3_report):
             f"p90 {s['p90_m']:.3f} m, p95 {s['p95_m']:.3f} m, 10 cm 넘게 가까움 {s['near_10cm']:+.1%}, "
             f"멂 {s['far_10cm']:+.1%}") in text
     assert l1_l3_report[1].count("- 깊이 오차(") == 1          # L1 (det_depth) has no line, L3 has one
-    assert SCHEMA_VERSION == 6
+    assert SCHEMA_VERSION == 7
 
 
 def test_contribution_row_names(apple_ladder, apple_ladder_ctx):

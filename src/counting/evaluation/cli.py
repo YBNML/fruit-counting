@@ -268,7 +268,9 @@ def _run_eval(
        `check_test_log` on the output folder's `test_log.csv`;
     4. check the pass-subset verdict request (`check_verdict_request`: only a ladder reads
        `cfg.verdict_subsets`), then the ladder request, or the `--set` overlap and the sweep cells;
-       under split=test, `check_test_rungs` on the requested rungs or the sweep cells;
+       under split=test, `check_test_rungs` on the requested rungs or the sweep cells; then the
+       pose settings the runner does not run (`check_pose_supported`) of the config, of every
+       requested rung (and the 2 x 2 base rung) or of every sweep cell;
     5. open every bundle in `cfg.runs` (a sweep checks each one's frame selection, split=test
        runs `check_test_bundles` and, with `detector.cache`, `check_test_caches`) and sort them
        by (fingerprint, run_id), so the results do not depend on the order the bundles were
@@ -299,6 +301,7 @@ def _run_eval(
     from counting.data.formats.orchard_synth import SynthRun
     from counting.evaluation.budget import ladder_budget
     from counting.evaluation.detmetrics import detection_rows, score_runs
+    from counting.evaluation.posesource import check_pose_supported
     from counting.evaluation.protect import (
         append_log_row, check_test_bundles, check_test_caches, check_test_log, check_test_request, check_test_rungs,
         earlier_log_runs,
@@ -362,6 +365,15 @@ def _run_eval(
             cells = sweep_cells(cfg, grid, ladder)
             if protected is not None:
                 check_test_rungs(cfg, {f"{c.point.name} @ {c.base}": c.cfg for c in cells})
+        if kind == "run":
+            check_pose_supported(cfg)
+        elif kind == "ladder":
+            names = [*rungs, ladder["interaction_2x2"]["base"]] if with_2x2 else rungs
+            for name in names:
+                check_pose_supported(rung_config(cfg, ladder, name))
+        else:
+            for cell in cells:
+                check_pose_supported(cell.cfg)
 
         started = datetime.now(timezone.utc).isoformat()
         t0 = time.perf_counter()

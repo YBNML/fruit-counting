@@ -31,17 +31,21 @@ from counting.data.formats.orchard_synth import (
 from counting.detection.base import Detections
 from counting.detection.cached import CachedDetector, cache_path
 from counting.detection.oracle import OracleDetector
-from counting.evaluation.ledger import UnitView, build_ledger, combine
+from counting.evaluation.ledger import Ledger, UnitView, build_ledger, combine
 from counting.evaluation.match import match_frame, unit_majority
 from counting.evaluation.oracle_stages import (
     oracle_dedup, oracle_tracks, truth_centers, truth_row_mask, truth_trees,
 )
+from counting.evaluation.posequality import apply_rigid, fit_truth_rigid, pose_quality
+from counting.evaluation.posesource import check_pose_supported, model_cameras, pose_settings, rig_errors
 from counting.evaluation.seeds import combine_seeds
 from counting.evaluation.truth import (
     SummaryMismatch, TruthTables, check_summary, is_positive, pass_subsets, truth_sets,
 )
+from counting.geometry.camera import Camera
 from counting.geometry.noise import (
-    STEP_BIAS, STEP_DEPTH, STEP_DET, STEP_POSE, noise_rng, pass_bias, pass_key_code, perturb_depth,
+    STEP_BIAS, STEP_DEPTH, STEP_DEPTH_K, STEP_DET, STEP_POSE, depth_k_noise, noise_rng, pass_bias, pass_key_code,
+    perturb_depth,
 )
 from counting.multiview.assign import assign_trees, in_target_row
 from counting.multiview.dedup import dedup, repair_pass
@@ -325,27 +329,171 @@ class _PassStage:
     U1: int
 
 
+@dataclass(frozen=True, eq=False)
+class _PassTrack:
+    """One pass after tracking: the cameras the lift and the tracker used, and the tracks they gave.
+
+    `frames` are the pass's frames in `ctx.passes`, with the truth cameras that scoring uses;
+    `cameras` maps each frame idx to the camera the lift and the tracker used. `tracks` are the
+    tracks after in-pass repair (or the oracle tracks). `depth_errs` are the pass's box-depth
+    errors in frame order, and `depth_err` is their `depth_error_stats`.
+    """
+
+    key: PassKey
+    frames: list[FrameInput]
+    cameras: dict[int, Camera]
+    tracks: PassTracks
+    depth_errs: list[np.ndarray]
+    depth_err: dict | None
+
+
+def _track_passes(ctx: RunContext, cfg: EvalAppConfig, noise_seed: int | None) -> list[_PassTrack]:
+    """Lift and track every pass of `ctx`, in `ctx.passes` order (the first stage of `evaluate`).
+
+    Each frame starts from the camera of the pose source (`model_cameras`: the rig and the drift
+    model under `cfg.pose`), or from its true camera when that gives None. With `noise_seed`, a
+    pass's bias is drawn before its frames, and each frame's camera then gets `Camera.perturbed`,
+    then its chosen depth `perturb_depth` (after the depth error is taken) and, with
+    `noise.depth_k` set, `depth_k_noise` on the depth before noise. The lift and the tracker use
+    these cameras; `track_pass` runs once per pass on the frames that carry them.
+    """
+    st, scene, nz = cfg.stages, ctx.run.meta.seed, cfg.noise
+    cams = model_cameras(ctx.run.frames, ctx.passes, cfg, noise_seed, scene=scene,
+                         base_step_m=ctx.run.meta.base_step_m)
+    out: list[_PassTrack] = []
+    for key, frames in ctx.passes.items():
+        bias = None if noise_seed is None else pass_bias(
+            noise_rng(cfg.seed, noise_seed, STEP_BIAS, scene, *pass_key_code(key)), nz.pass_bias_m)
+        points, seen = {}, []   # `seen`: the frames with the cameras the tracker and the lift use
+        depth_errs: list[np.ndarray] = []
+        for f in frames:
+            D = ctx.dets[f.idx]
+            z = D.depth_m if cfg.lift.depth == "det_depth" else ctx.box_depth(f.idx, cfg.lift)
+            if cfg.lift.depth != "det_depth" and D.depth_m is not None:
+                e = z - D.depth_m
+                depth_errs.append(e[np.isfinite(e)])
+            if cams is not None:
+                f = replace(f, camera=cams[key][f.idx])
+            if noise_seed is not None:
+                f = replace(f, camera=f.camera.perturbed(noise_rng(cfg.seed, noise_seed, STEP_POSE, scene, f.idx),
+                                                         nz.pose_trans_sigma_m, nz.pose_rot_sigma_deg, bias))
+                clean = z
+                z = perturb_depth(z, noise_rng(cfg.seed, noise_seed, STEP_DEPTH, scene, f.idx),
+                                  nz.depth_rel_sigma, nz.depth_dropout)
+                if nz.depth_k is not None:
+                    z = z + depth_k_noise((cfg.seed, noise_seed, STEP_DEPTH_K, scene, f.idx), clean, nz.depth_k)
+            points[f.idx] = lift_points(D.boxes, D.labels, z, f.camera, cfg.lift)
+            seen.append(f)
+        depth_err = depth_error_stats(np.concatenate(depth_errs)) if depth_errs else None
+        if st.track == "oracle":   # one track per id already: no in-pass repair
+            tracks = oracle_tracks(key, seen, ctx.dets, ctx.src, points)
+        else:
+            tracks = repair_pass(track_pass(seen, ctx.dets, points, cfg.tracker, method=st.track),
+                                 cfg.tracker.repair_m)
+        out.append(_PassTrack(key=key, frames=frames, cameras={f.idx: f.camera for f in seen}, tracks=tracks,
+                              depth_errs=depth_errs, depth_err=depth_err))
+    return out
+
+
+def _align_passes(
+    ctx: RunContext, cfg: EvalAppConfig, passes: list[_PassTrack],
+) -> tuple[list[_PassTrack], dict[PassKey, np.ndarray] | None]:
+    """Align the tracked passes by `cfg.align.mode` (the second stage of `evaluate`).
+
+    Returns the passes in the same order, with their track centres moved, and the transform
+    applied to each pass by pass key. Without an `align` section, or with `align.mode=none`,
+    the passes come back unchanged with None. `fit_truth_pass` moves each pass's track centres by
+    the rigid transform that best takes its used cameras to its true cameras (`fit_truth_rigid`);
+    a centre without 3D stays NaN. Any other mode raises `NotImplementedError`.
+    """
+    if cfg.align is None or cfg.align.mode == "none":
+        return passes, None
+    if cfg.align.mode == "fit_truth_pass":
+        out, transforms = [], {}
+        for p in passes:
+            A = fit_truth_rigid([f.camera for f in p.frames], [p.cameras[f.idx] for f in p.frames])
+            out.append(replace(p, tracks=replace(p.tracks, X=apply_rigid(A, p.tracks.X))))
+            transforms[p.key] = A
+        return out, transforms
+    mode = ",".join(cfg.align.mode) if isinstance(cfg.align.mode, list) else cfg.align.mode
+    raise NotImplementedError(f"align.mode={mode} is not supported")
+
+
+def _score_pass(ctx: RunContext, cfg: EvalAppConfig, p: _PassTrack) -> tuple[dict, Ledger, _PassStage]:
+    """Score one tracked pass against the truth of `ctx` (the third stage of `evaluate`).
+
+    Keeps the tracks with at least `cfg.tracker.min_obs_for(stages.det)` observations, a 3D
+    centre and a place in the target row. Returns the pass's `y1.passes` row, its
+    `cfg.truth.variant` ledger and the `_PassStage` that Y6 reuses.
+    """
+    st, key, frames = cfg.stages, p.key, p.frames
+    G, G_any = ctx.tables[cfg.truth.variant], ctx.tables["any"]
+    obs = [tuple(int(ctx.src[f][d]) for f, d in m) for m in p.tracks.members()]
+    maj, pur = unit_majority(obs)
+    X = truth_centers(maj, p.tracks.X, ctx.truth) if st.center == "truth" else p.tracks.X
+    tracks = replace(p.tracks, X=X)
+    if st.assign == "truth":
+        row, tree = truth_row_mask(maj, X, ctx.layout, ctx.truth), truth_trees(maj, X, ctx.layout, ctx.truth)
+    else:
+        row, tree = in_target_row(X, ctx.layout), assign_trees(X, ctx.layout)
+    enough = tracks.n_obs >= cfg.tracker.min_obs_for(st.det)
+    has3d = np.isfinite(X).all(axis=1)
+    keep = enough & has3d & row
+    kept = np.flatnonzero(keep)
+
+    detected = {int(s) for f in frames for s in ctx.src[f.idx].tolist() if s >= 0}
+    units = _units(maj, pur, obs, kept)
+    common = dict(units=units, track_majorities=[(0, int(maj[t])) for t in kept],
+                  kept_obs_ids={i for t in kept for i in obs[t]}, detected_ids=detected)
+    L = build_ledger(truth_ids=G.g1[key], target_ids=G.target_ids, **common)
+    L_any = build_ledger(truth_ids=G_any.g1[key], target_ids=G_any.target_ids, **common)
+
+    U1, G1 = len(kept), len(G.g1[key])
+    g1_tree = G.per_tree(G.g1[key])
+    row_out = {
+        "pitch": key.pitch_deg, "side": key.side, "aisle": key.aisle, "n_frames": len(frames),
+        "n_tracks": len(tracks.X), "n_no3d": int((enough & ~has3d).sum()),
+        "U1": U1, "G1": G1, "e1": _ratio(U1 - G1, G1),
+        "trees": {str(t): {"U1": int((tree[kept] == t).sum()), "G1": g1_tree[t]} for t in ctx.layout.tree_ids},
+        "ledger": L.as_dict(), "ledger_any": L_any.as_dict(), "depth_err": p.depth_err,
+    }
+    return row_out, L, _PassStage(key, tracks, keep, maj, obs, detected, U1)
+
+
 def evaluate(ctx: RunContext, cfg: EvalAppConfig, *, subsets: bool = False, noise_seed: int | None = None) -> dict:
     """Run the stage setting `cfg.stages` on `ctx` and score Y1 (per pass) and Y6 (per tree and row).
 
     `G1`/`G6` are the `cfg.truth.variant` truth; a ratio with a zero
     denominator, and the median/max/percentile of an empty set, is None.
-    `cfg` is checked first (`_check_config`, against `noise_seed` as the
+    A pose setting the runner does not run raises `NotImplementedError` before
+    anything else (`check_pose_supported`).
+    `cfg` is then checked (`_check_config`, against `noise_seed` as the
     detection noise seed, or the prepared one without it): a config that
     differs from the prepared one raises `ValueError`. Then `noise_seed` must
     be given exactly when `cfg.is_noisy()` (`ValueError`).
+    The passes go through three stages, each in `ctx.passes` order: every pass
+    is lifted and tracked (`_track_passes`), the passes are aligned
+    (`_align_passes`), and each pass is scored (`_score_pass`).
     A track is kept with at least `cfg.tracker.min_obs_for(stages.det)`
     observations. A cached context's result also has `cache` (`ctx.cache`).
     Each pass's and the summary's `depth_err` is `depth_error_stats` of box depth
     minus detection depth (`None` under `lift.depth=det_depth`, without detector
     depth, or with no detections).
-    With `noise_seed`, every frame's camera gets `Camera.perturbed` for both
-    the tracker and the lift, and every chosen depth gets `perturb_depth` after
+    The tracker and the lift use the cameras of the pose source (`model_cameras`:
+    the rig and the drift model under `cfg.pose`, else the true cameras). With
+    `noise_seed`, every such camera gets `Camera.perturbed`, and every chosen depth
+    gets `perturb_depth` (and, with `noise.depth_k`, `depth_k_noise`) after
     `depth_err` is taken; scoring always uses the truth.
+    With a pose section the result also has `pose` (`pose_settings`) and
+    `pose_quality` (`pose_quality` of the cameras the lift and the tracker used
+    against the true cameras, with the alignment transforms; under `pose.rig`
+    the in-pass drift and RPE are measured in the frame of the reference camera
+    `pose.rig_ref`, with the rig calibration errors of the passes' pitches).
     With `subsets` (which needs `stop_after=y6`), the result also has `subsets`
     (`_score_subsets`): the passes' tracks are reused, and Y6 is scored again on
     each subset of `pass_subsets`.
     """
+    check_pose_supported(cfg)
     _check_config(ctx, cfg, ctx.prepared.get("det_seed") if noise_seed is None else noise_seed)
     root = ctx.run.root
     if cfg.is_noisy() and noise_seed is None:
@@ -355,68 +503,17 @@ def evaluate(ctx: RunContext, cfg: EvalAppConfig, *, subsets: bool = False, nois
     if subsets and cfg.stop_after == "y1":
         raise ValueError("--subsets needs stop_after=y6")
     st = cfg.stages
-    scene, nz = ctx.run.meta.seed, cfg.noise
-    G, G_any = ctx.tables[cfg.truth.variant], ctx.tables["any"]
-    T = G.target_ids
+    staged = _track_passes(ctx, cfg, noise_seed)
+    aligned, transforms = _align_passes(ctx, cfg, staged)
     passes_out, ledgers = [], []
     stages: list[_PassStage] = []
     depth_errs_all: list[np.ndarray] = []
-    for key, frames in ctx.passes.items():
-        bias = None if noise_seed is None else pass_bias(
-            noise_rng(cfg.seed, noise_seed, STEP_BIAS, scene, *pass_key_code(key)), nz.pass_bias_m)
-        points, seen = {}, []   # `seen`: the frames with the cameras the tracker and the lift use
-        depth_errs_pass: list[np.ndarray] = []
-        for f in frames:
-            D = ctx.dets[f.idx]
-            z = D.depth_m if cfg.lift.depth == "det_depth" else ctx.box_depth(f.idx, cfg.lift)
-            if cfg.lift.depth != "det_depth" and D.depth_m is not None:
-                e = z - D.depth_m
-                depth_errs_pass.append(e[np.isfinite(e)])
-            if noise_seed is not None:
-                f = replace(f, camera=f.camera.perturbed(noise_rng(cfg.seed, noise_seed, STEP_POSE, scene, f.idx),
-                                                         nz.pose_trans_sigma_m, nz.pose_rot_sigma_deg, bias))
-                z = perturb_depth(z, noise_rng(cfg.seed, noise_seed, STEP_DEPTH, scene, f.idx),
-                                  nz.depth_rel_sigma, nz.depth_dropout)
-            points[f.idx] = lift_points(D.boxes, D.labels, z, f.camera, cfg.lift)
-            seen.append(f)
-        depth_err = depth_error_stats(np.concatenate(depth_errs_pass)) if depth_errs_pass else None
-        depth_errs_all.extend(depth_errs_pass)
-        if st.track == "oracle":   # one track per id already: no in-pass repair
-            tracks = oracle_tracks(key, seen, ctx.dets, ctx.src, points)
-        else:
-            tracks = repair_pass(track_pass(seen, ctx.dets, points, cfg.tracker, method=st.track),
-                                 cfg.tracker.repair_m)
-        obs = [tuple(int(ctx.src[f][d]) for f, d in m) for m in tracks.members()]
-        maj, pur = unit_majority(obs)
-        X = truth_centers(maj, tracks.X, ctx.truth) if st.center == "truth" else tracks.X
-        tracks = replace(tracks, X=X)
-        if st.assign == "truth":
-            row, tree = truth_row_mask(maj, X, ctx.layout, ctx.truth), truth_trees(maj, X, ctx.layout, ctx.truth)
-        else:
-            row, tree = in_target_row(X, ctx.layout), assign_trees(X, ctx.layout)
-        enough = tracks.n_obs >= cfg.tracker.min_obs_for(st.det)
-        has3d = np.isfinite(X).all(axis=1)
-        keep = enough & has3d & row
-        kept = np.flatnonzero(keep)
-
-        detected = {int(s) for f in frames for s in ctx.src[f.idx].tolist() if s >= 0}
-        units = _units(maj, pur, obs, kept)
-        common = dict(units=units, track_majorities=[(0, int(maj[t])) for t in kept],
-                      kept_obs_ids={i for t in kept for i in obs[t]}, detected_ids=detected)
-        L = build_ledger(truth_ids=G.g1[key], target_ids=T, **common)
-        L_any = build_ledger(truth_ids=G_any.g1[key], target_ids=G_any.target_ids, **common)
+    for p in aligned:
+        row_out, L, stage = _score_pass(ctx, cfg, p)
+        passes_out.append(row_out)
         ledgers.append(L)
-
-        U1, G1 = len(kept), len(G.g1[key])
-        g1_tree = G.per_tree(G.g1[key])
-        passes_out.append({
-            "pitch": key.pitch_deg, "side": key.side, "aisle": key.aisle, "n_frames": len(frames),
-            "n_tracks": len(tracks.X), "n_no3d": int((enough & ~has3d).sum()),
-            "U1": U1, "G1": G1, "e1": _ratio(U1 - G1, G1),
-            "trees": {str(t): {"U1": int((tree[kept] == t).sum()), "G1": g1_tree[t]} for t in ctx.layout.tree_ids},
-            "ledger": L.as_dict(), "ledger_any": L_any.as_dict(), "depth_err": depth_err,
-        })
-        stages.append(_PassStage(key, tracks, keep, maj, obs, detected, U1))
+        stages.append(stage)
+        depth_errs_all.extend(p.depth_errs)
 
     e1s = [abs(p["e1"]) for p in passes_out if p["e1"] is not None]
     rates = combine(ledgers).rates()
@@ -431,6 +528,12 @@ def evaluate(ctx: RunContext, cfg: EvalAppConfig, *, subsets: bool = False, nois
     if cfg.stop_after != "y1":
         y6 = _y6(ctx, cfg, stages, ctx.tables)
     out = {"stages": st.model_dump(), "lift_depth": cfg.lift.depth, "y1": y1, "y6": y6}
+    if cfg.pose is not None:
+        out["pose"] = pose_settings(cfg, noise_seed)
+        out["pose_quality"] = pose_quality(
+            [(p.key, [f.camera for f in p.frames], [p.cameras[f.idx] for f in p.frames]) for p in staged],
+            ctx.layout, transforms, ref_pitch=cfg.pose.rig_ref if cfg.pose.rig else None,
+            rig_errors=rig_errors(cfg, noise_seed, scene=ctx.run.meta.seed, pitches=[p.key.pitch_deg for p in staged]))
     if ctx.cache is not None:
         out["cache"] = _cache_result(ctx)
     if subsets:
@@ -636,9 +739,10 @@ def check_ladder_request(
 ) -> None:
     """Validate a ladder request against `cfg` and `ladder` alone, before any bundle is opened.
 
-    Checks `cfg`'s base config (`stages.dedup`, `lift.depth`, `stages.det`, `noise`), every
-    name in `rungs` (`rung_config` raises `unknown rung ...` for one it does not
-    know), with `with_2x2`, the `interaction_2x2` section and its base rung, and,
+    Checks `cfg`'s base config (`stages.dedup`, `lift.depth`, `stages.det`, `noise`, and, with a
+    `pose` section, the true poses without the rig or fusion, and with an `align` section,
+    `align.mode=none`), every name in `rungs` (`rung_config` raises `unknown rung ...` for one it
+    does not know), with `with_2x2`, the `interaction_2x2` section and its base rung, and,
     with `subsets`, that `rungs` has a rung of `SUBSET_RUNGS` and `cfg` runs to `stop_after=y6`.
     """
     if cfg.stages.dedup == "oracle":
@@ -650,6 +754,12 @@ def check_ladder_request(
         raise ValueError(f"ladder base config has stages.det={cfg.stages.det}; ladder rungs need oracle detections")
     if not cfg.noise.is_zero():
         raise ValueError("ladder base config has noise set; only the L4 rungs add pose and depth noise")
+    pose = cfg.pose
+    if pose is not None and (pose.source != "truth" or pose.rig or pose.fuse != "none"):
+        raise ValueError("ladder base config has pose.source, pose.rig or pose.fuse set; rungs choose the pose "
+                         "source, the rig and the fusion")
+    if cfg.align is not None and cfg.align.mode != "none":
+        raise ValueError("ladder base config has align.mode set; rungs choose the alignment")
     for name in rungs:
         rung_config(cfg, ladder, name)
     if with_2x2:
@@ -718,7 +828,8 @@ def run_ladder(
     a time, so L5 and `L5_L4base` (which differ in noise only) share one. Such a
     rung may change the detector, not `FRAME_KEYS` (`_check_frames`); without
     `context_for` it is refused as `evaluate` refuses it (`_check_config`).
-    Every rung and cell config is checked before any of them runs, and the
+    Every rung and cell config is checked before any of them runs (first
+    `check_pose_supported`, right after the configs are built), and the
     rungs of a group against their own context before they run. With
     `subsets`, the rungs of `SUBSET_RUNGS` alone also get the pass-subset table
     (`evaluate(..., subsets=True)`).
@@ -733,6 +844,8 @@ def run_ladder(
             for d in spec["dedup"]:
                 d = cfg.stages.dedup if d == "crop_default" else d
                 cells.append((track, d, _patched(base, {"stages": {"track": track, "dedup": d}})))
+    for c in [*configs.values(), *(c for _, _, c in cells)]:
+        check_pose_supported(c)
     on_ctx: list[str] = []
     groups: dict[str, list[str]] = {}
     for name, c in configs.items():

@@ -4,6 +4,8 @@ of a rung whose `stop_after=y1` left `rung["y6"]` as `None`.
 A noisy rung or cell (`noisy`) is drawn from its seed means, with a noise line and a
 per-seed table; the CSVs carry one row per noise seed and a `mean` row. A ladder result with a
 `budget` (`counting.evaluation.budget`) also gets `budget.csv` and the budget tables.
+A rung or cell run with a pose section (`pose`, `pose_quality`) names its pose source in the head
+and gets the pose quality tables; a result without one reads as it did before.
 """
 
 from __future__ import annotations
@@ -17,11 +19,11 @@ from typing import Mapping
 import numpy as np
 import yaml
 
-from counting.config.eval_schema import EvalAppConfig
-from counting.evaluation.budget import TERMS, contrib_pairs, path_pairs
+from counting.config.eval_schema import POSE_NOISE_KEYS, EvalAppConfig
+from counting.evaluation.budget import TERMS, ladder_pairs, path_pairs
 from counting.evaluation.verdict import JUDGED_PITCHES, PITCH_JUDGED_RUNGS, judged_y1, pool_rung, verdict_counts
 
-SCHEMA_VERSION = 6
+SCHEMA_VERSION = 7
 
 
 class ReproducibilityError(RuntimeError):
@@ -353,9 +355,63 @@ def _pose_values_text(triple: tuple[float, float, float]) -> str:
     return f"자세 잡음 σ_t {_g(t * 100)} cm, σ_r {_g(r)}°, b {_g(b * 100)} cm"
 
 
+_NO_POSE_NOISE = (0.0, 0.0, 0.0)
+_ALIGN_TEXT = {"none": "없음", "fit_truth_pass": "패스별 정답 맞춤(상한)"}
+_STRAIGHT_START_NOTE = ("> 직선 묶음: 명목 시작점은 첫 프레임 정답 자세에 가정한 시작 오차를 더한 것이다. "
+                        "판정에 쓰지 않는다.")
+
+
+def _report_items(results: dict) -> list[dict]:
+    """Every rung (run, ladder) or cell (sweep) of `results`, bundles in order."""
+    if results["kind"] == "sweep":
+        return [cell for run in results["runs"] for cell in run["cells"]]
+    return [rung for run in results["runs"] for rung in run["rungs"].values()]
+
+
+def _align_text(mode: str | list[str]) -> str:
+    """`align.mode` as the head shows it: listed methods joined by `+`."""
+    if isinstance(mode, list):
+        return "+".join(mode)
+    return _ALIGN_TEXT.get(mode, mode)
+
+
+def _pose_label(item: dict) -> str:
+    """The pose source of one rung or cell, from its `pose` entry, joined by ` · `.
+
+    The configuration, the pose source (with the drift model when it ran), the rig and its
+    reference pitch, the fusion, the anchor, the alignment and the tracker prediction, then the
+    σ_t/σ_r/b pose noise when there is any. An item without `pose` gets `"정답 자세"` or that noise.
+    """
+    triple = _pose_triple(item)
+    pose = item.get("pose")
+    if pose is None:
+        return "정답 자세" if triple == _NO_POSE_NOISE else _pose_values_text(triple)
+    source = "자세 정답" if pose["source"] == "truth" else f"자세 {pose['source']}"
+    if pose["drift"]:
+        source += " + 표류 모형"
+    parts = [f"구성 {pose['config'] or '-'}", source,
+             f"리그 켬(기준 {_g(pose['rig_ref'])}°)" if pose["rig"] else "리그 끔",
+             f"결합 {pose['fuse']}", f"시작점 {pose['anchor']}", f"정합 {_align_text(pose['align'])}",
+             f"예측 {pose['predict']}"]
+    if triple != _NO_POSE_NOISE:
+        parts.append(_pose_values_text(triple))
+    return " · ".join(parts)
+
+
+def _pose_labels(results: dict) -> set[str] | None:
+    """The `_pose_label`s of every rung or cell when one of them has `pose`, else None."""
+    items = _report_items(results)
+    if not any(item.get("pose") is not None for item in items):
+        return None
+    return {_pose_label(item) for item in items}
+
+
 def _pose_text(results: dict) -> str:
     """The report head's second line, before the `kind` branch so it reads `runs[*].rungs` or `runs[*].cells`.
 
+    With a `pose` entry in any rung or cell: their one `_pose_label`, or, when they differ, a
+    pointer to the per-rung lines (ladder/run) or to `sweep.csv`'s base and patch columns (sweep).
+    Otherwise:
     `"정답 자세"` with no pose noise anywhere; the exact σ_t/σ_r/b when every rung or cell shares the
     same pose noise (one noisy item, or several sharing a base rung's noise); otherwise `"있음"`
     (ladder/run: per rung). A sweep whose cells vary only by `cell["base"]` (the base rung carries the
@@ -363,6 +419,14 @@ def _pose_text(results: dict) -> str:
     base-aware phrase instead of the per-point one, since `sweep.csv`'s patch column holds no noise key
     to point readers at; the per-point phrase is kept only when a base's own points still differ.
     """
+    labels = _pose_labels(results)
+    if labels is not None:
+        if len(labels) == 1:
+            (label,) = labels
+            return label
+        if results["kind"] == "sweep":
+            return "자세 출처 점 있음(sweep.csv의 base·patch 열)"
+        return "자세 출처 칸 있음(칸마다 적음)"
     if results["kind"] == "sweep":
         cells = [cell for run in results["runs"] for cell in run["cells"]]
         triples = {_pose_triple(cell) for cell in cells}
@@ -401,6 +465,63 @@ def _noise_line(res: dict) -> str:
            f"σ_r {_g(n['pose_rot_sigma_deg'])}°, b {_g(n['pass_bias_m'] * 100)} cm, "
            f"σ_rel {_noise_pct(n['depth_rel_sigma'])}, 결측 {_noise_pct(n['depth_dropout'])}, "
            f"{_det_noise_text(n['detector'])}")
+
+
+def _pose_noise_line(res: dict) -> str | None:
+    """The pose-model noise keys of a noisy rung or cell that have a value, in `POSE_NOISE_KEYS` order;
+    None without any."""
+    n = res["noise"]
+    values = [f"{key} {_g(n[key])}" for key in POSE_NOISE_KEYS if n.get(key) is not None]
+    return "- 자세 모형 잡음: " + ", ".join(values) if values else None
+
+
+def _cm(x) -> str:
+    return "-" if x is None else f"{x * 100:.2f}"
+
+
+def _deg(x) -> str:
+    return "-" if x is None else f"{x:.3f}"
+
+
+def _percent(x) -> str:
+    return "-" if x is None else f"{x * 100:.2f}"
+
+
+_RPE_HEADERS = ["RPE", "p50", "p90", "최대"]
+_END_ERROR_HEADERS = ["끝 오차(패스 중앙값, 절댓값)", "위치 cm", "위치 %", "회전 °", "진행 cm", "옆 cm", "높이 cm",
+                      "요 °", "기울기 °"]
+_END_ERROR_ROWS = (("패스 안 표류", "in_pass"), ("패스 안 표류(카메라 틀, 보조)", "in_pass_cam"),
+                   ("시작 오차", "start"), ("월드 끝 오차", "world_end"))
+_INTERPASS_HEADERS = ["패스 사이 어긋남", "짝 수", "p50 cm", "p90 cm"]
+_RIG_FRAME_NOTE = "> 패스 안 표류와 RPE는 기준 카메라 틀이다(리그 보정을 믿는 값으로 옮김)."
+
+
+def _pose_quality_lines(pq: dict, pose: dict) -> list[str]:
+    """The pose quality of one rung (`pose_quality`, its `pose` settings): RPE, the end errors and the
+    misalignment between passes, then the dedup and gate values to set them against."""
+    rpe = pq["rpe"]
+    lines = ["**자세 품질**"]
+    lines += _table(_RPE_HEADERS, [["이동 (cm)", *(_cm(rpe["trans_m"][k]) for k in ("p50", "p90", "max"))],
+                                   ["회전 (°)", *(_deg(rpe["rot_deg"][k]) for k in ("p50", "p90", "max"))]])
+    lines.append("")
+    rows = []
+    for label, key in _END_ERROR_ROWS:
+        e = pq["summary"][key]
+        rows.append([label, _cm(e["pos_m"]), _percent(e["pos_frac"]) if "pos_frac" in e else "-",
+                     _deg(e["rot_deg"]), _cm(e["along_m"]), _cm(e["side_m"]), _cm(e["height_m"]),
+                     _deg(e["yaw_deg"]), _deg(e["tilt_deg"])])
+    lines += _table(_END_ERROR_HEADERS, rows)
+    if pose["rig"]:
+        lines.append(_RIG_FRAME_NOTE)
+    lines.append("")
+    ip = pq["interpass"]
+    lines += _table(_INTERPASS_HEADERS, [[label, _count(ip[key]["n"]), _cm(ip[key]["p50_m"]), _cm(ip[key]["p90_m"])]
+                                         for label, key in (("같은 면", "same_side"), ("양면", "both_sides"))])
+    lines.append(f"> 견줄 값: 중복 제거 {pose['dedup']} 반경 {_g(pose['dedup_radius_m'] * 100)} cm, "
+                 f"band {_g(pose['dedup_band_m'] * 100)} cm, 화면 게이트 {_g(pose['gate_px_frac'])}"
+                 "(0.5 ≈ 사과 과실 ±2.5 cm, 배 봉지 ±10 cm)")
+    lines.append("")
+    return lines
 
 
 _NOISE_SEED_HEADERS = ["시드", "e1 중앙값", "e1 최대", "U", "G6", "e_pipe", "e_pipe 절댓값", "그루 MAE÷평균"]
@@ -466,7 +587,7 @@ def _judged_pitches_text(crop: str) -> str:
 
 
 def _contrib_table(chain: list[str], rungs: dict, crop: str | None = None) -> list[str]:
-    """The contribution table, one row per `contrib_pairs(chain, rungs)` pair.
+    """The contribution table, one row per `ladder_pairs(chain, rungs)` pair.
 
     With `crop`, on a ladder with a `PITCH_JUDGED_RUNGS` rung, the two Y1 columns are the change of
     each rung's `pool_rung([rung], JUDGED_PITCHES[crop])` y1 (a noisy rung's seed mean, the budget's
@@ -484,7 +605,7 @@ def _contrib_table(chain: list[str], rungs: dict, crop: str | None = None) -> li
         def y1_of(rung: dict) -> dict:
             return rung["y1"]["summary"]
     rows = []
-    for a, b in contrib_pairs(chain, rungs):
+    for a, b in ladder_pairs(chain, rungs):
         ra, rb = rungs[a], rungs[b]
         ya, yb = y1_of(ra), y1_of(rb)
         d_e1, d_e1_max = _delta(ya["e1_median"], yb["e1_median"]), _delta(ya["e1_max"], yb["e1_max"])
@@ -772,8 +893,29 @@ def _sweep_collapse_lines(points: list[dict], bases: list[str], cells: list[dict
     return lines
 
 
+_SWEEP_POSE_HEADERS = ["점", "바탕", "RPE 이동 p90 cm", "RPE 회전 p90 °", "패스 안 끝 위치 %", "시작 위치 cm",
+                       "같은 면 p90 cm", "양면 p90 cm"]
+
+
+def _sweep_pose_lines(cells: list[dict]) -> list[str]:
+    """The pose quality of every cell that has one, one row per cell; `[]` when none has."""
+    rows = []
+    for cell in cells:
+        pq = cell.get("pose_quality")
+        if pq is None:
+            continue
+        rows.append([cell["point"], cell["base"] or "-", _cm(pq["rpe"]["trans_m"]["p90"]),
+                     _deg(pq["rpe"]["rot_deg"]["p90"]), _percent(pq["summary"]["in_pass"]["pos_frac"]),
+                     _cm(pq["summary"]["start"]["pos_m"]), _cm(pq["interpass"]["same_side"]["p90_m"]),
+                     _cm(pq["interpass"]["both_sides"]["p90_m"])])
+    if not rows:
+        return []
+    return ["**자세 품질(점마다)**", *_table(_SWEEP_POSE_HEADERS, rows), ""]
+
+
 def _sweep_body(results: dict, criteria: Mapping | None) -> list[str]:
-    """The sweep head line, per-run point table and collapse section (after the bundle-info table)."""
+    """The sweep head line, per-run point table, pose quality table (cells with `pose_quality`) and
+    collapse section (after the bundle-info table)."""
     sweep, crop = results["sweep"], results["crop"]
     points, bases = sweep["points"], sweep["bases"]
     head = f"**sweep** — {sweep['grid']}: 점 {len(points)}개 × 칸 {max(1, len(bases))}개"
@@ -787,6 +929,7 @@ def _sweep_body(results: dict, criteria: Mapping | None) -> list[str]:
             lines.append("")
         lines += _sweep_points_table(run["cells"], criteria, crop)
         lines.append("")
+        lines += _sweep_pose_lines(run["cells"])
         collapse = _sweep_collapse_lines(points, bases, run["cells"])
         if collapse:
             lines += collapse
@@ -822,11 +965,19 @@ def render_report(results: dict, *, criteria: Mapping | None) -> str:
     result with a `budget` (a ladder with rung L5) gets the budget tables (`_budget_lines`) and, with
     `detection`, the detection table and the table of false positives that became tracks. A
     non-sweep result whose `split` is `"test"` and carries `verdicts` ends with `_verdict_lines`'s
-    table. When a rung or sweep cell ran on cached detections, the head's third line names the
-    detector (`_detector_line` of `_first_cache`).
+    table. When a rung or sweep cell ran on cached detections, a head line names the detector
+    (`_detector_line` of `_first_cache`).
+
+    With a pose section the head's second line names the pose source (`_pose_text`); when a rung
+    or cell started from the nominal start (`pose.start` `nominal_from_first_frame`), the next head
+    line says so. When the rungs' pose sources differ, each rung's heading is followed by its
+    `> 자세:` line. A noisy rung with pose-model noise keys gets `_pose_noise_line` under its noise
+    line, and a rung with `pose_quality` gets `_pose_quality_lines` after its Y6 section.
     """
     lines = [f"# Y1·Y6 합성 채점 — {results['run_name']} ({results['experiment_id']})",
              f"> 합성 렌더 · {_pose_text(results)} · 보정 전(U). 실제 정확도가 아니다."]
+    if any((item.get("pose") or {}).get("start") == "nominal_from_first_frame" for item in _report_items(results)):
+        lines.append(_STRAIGHT_START_NOTE)
     cache = _first_cache(results)
     if cache is not None:
         lines.append(_detector_line(cache))
@@ -844,6 +995,8 @@ def render_report(results: dict, *, criteria: Mapping | None) -> str:
         return "\n".join(lines) + "\n"
 
     crop = results["crop"]
+    labels = _pose_labels(results)
+    per_rung_pose = labels is not None and len(labels) > 1
     for run in results["runs"]:
         multi = len(results["runs"]) > 1
         if multi:
@@ -851,9 +1004,15 @@ def render_report(results: dict, *, criteria: Mapping | None) -> str:
         for rung_name, rung in run["rungs"].items():
             lines.append(f"### {rung_name}" if not multi else f"#### {rung_name}")
             lines.append("")
+            if per_rung_pose:
+                lines.append(f"> 자세: {_pose_label(rung)}")
+                lines.append("")
             noisy = rung.get("noisy")
             if noisy:
                 lines.append(_noise_line(rung))
+                pose_noise = _pose_noise_line(rung)
+                if pose_noise is not None:
+                    lines.append(pose_noise)
                 lines.append("")
             lines.append("**Y1**")
             lines += _table(_Y1_HEADERS, _y1_rows(rung["y1"]["passes"]))
@@ -872,6 +1031,8 @@ def render_report(results: dict, *, criteria: Mapping | None) -> str:
                 lines += _ledger_table(y6["ledger"], y6["ledger_any"])
                 lines.append(_metrics_line(y6["metrics"]))
                 lines.append("")
+            if rung.get("pose_quality") is not None:
+                lines += _pose_quality_lines(rung["pose_quality"], rung["pose"])
             if noisy:
                 lines.append(f"**잡음 시드별 ({rung_name})**")
                 lines += _table(_NOISE_SEED_HEADERS, _noise_seed_rows(rung))
@@ -881,9 +1042,10 @@ def render_report(results: dict, *, criteria: Mapping | None) -> str:
                 lines += _table(_SUBSET_HEADERS, _subset_rows(rung["subsets"]))
                 lines.append("")
 
-        if len(run.get("chain") or []) >= 2 or _has_dd(run["rungs"]):
+        chain = run.get("chain") or []
+        if (len(chain) >= 2 or _has_dd(run["rungs"])) and ladder_pairs(chain, run["rungs"]):
             lines.append("**기여**")
-            lines += _contrib_table(run["chain"], run["rungs"], crop=crop)
+            lines += _contrib_table(chain, run["rungs"], crop=crop)
             lines.append("")
 
         if run.get("interaction_2x2") is not None:

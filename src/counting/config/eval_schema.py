@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import re
-from typing import Literal
+from typing import Annotated, Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, NonNegativeInt, field_validator, model_validator
 
@@ -103,8 +103,30 @@ class LiftConfig(BaseModel):
         return self.center_offset_m.get(key, 0.0)
 
 
+# Pose-model noise keys of `noise`, in the order the reports list them. Drift keys shape the body odometry
+# flow, the start, rig and time errors and the depth noise; IMU level keys set the noise of the simulated
+# IMU; IMU belief keys are errors the fusion believes; GPS keys set the row-end fixes.
+DRIFT_KEYS = ("drift_step_trans_mm", "drift_step_rot_deg", "drift_scale_sigma", "drift_rate_deg_per_m",
+              "pass_side_trans_m", "pass_side_rot_deg", "pass_pitch_trans_m", "pass_pitch_rot_deg",
+              "rig_extr_trans_mm", "rig_extr_rot_deg", "drift_time_offset_s", "depth_k")
+IMU_LEVEL_KEYS = ("imu_gyro_n", "imu_acc_n", "imu_gyro_w", "imu_acc_w", "imu_gyro_b0_dps", "imu_acc_b0_mg",
+                  "imu_temp_k", "imu_vib_acc_ms2", "imu_vib_gyro_dps")
+IMU_BELIEF_KEYS = ("imu_time_offset_ms", "imu_extr_trans_mm", "imu_extr_rot_deg")
+GPS_KEYS = ("gps_end_h_m", "gps_end_v_m")
+POSE_NOISE_KEYS = DRIFT_KEYS + IMU_LEVEL_KEYS + IMU_BELIEF_KEYS + GPS_KEYS
+
+
+def _factor() -> Any:
+    """A pose-model noise factor: unset (None) is no factor and stays out of the dump and the config hash."""
+    return Field(default=None, ge=0, exclude_if=_unset)
+
+
 class NoiseConfig(BaseModel):
-    """Pose and depth noise, and the noise seeds; factors must be finite."""
+    """Pose and depth noise, and the noise seeds; factors must be finite.
+
+    The pose-model keys (`POSE_NOISE_KEYS`) are unset by default. A key set to 0 is present (it is in
+    `pose_keys`) but adds no noise (`is_zero` still holds).
+    """
 
     model_config = ConfigDict(extra="forbid", allow_inf_nan=False)
     pose_trans_sigma_m: float = Field(default=0.0, ge=0)
@@ -113,6 +135,48 @@ class NoiseConfig(BaseModel):
     depth_rel_sigma: float = Field(default=0.0, ge=0)
     depth_dropout: float = Field(default=0.0, ge=0, le=1)
     seeds: list[NonNegativeInt] = Field(default_factory=lambda: [0], min_length=1)
+    # Body odometry flow, per base step (0.15 m) per axis: translation (mm) and rotation (deg) noise.
+    drift_step_trans_mm: float | None = _factor()
+    drift_step_rot_deg: float | None = _factor()
+    # Body odometry flow, drawn once per flow: scale error (ratio) and rotation drift rate per axis (deg/m).
+    drift_scale_sigma: float | None = _factor()
+    drift_rate_deg_per_m: float | None = _factor()
+    # Rigid start error of each side's drive (m, deg).
+    pass_side_trans_m: float | None = _factor()
+    pass_side_rot_deg: float | None = _factor()
+    # Extra rigid start error of each pitch pass when one camera passes each pitch (m, deg).
+    pass_pitch_trans_m: float | None = _factor()
+    pass_pitch_rot_deg: float | None = _factor()
+    # Rig extrinsic error of each camera other than the reference one (mm, deg).
+    rig_extr_trans_mm: float | None = _factor()
+    rig_extr_rot_deg: float | None = _factor()
+    # Frame time offset of each pass (s).
+    drift_time_offset_s: float | None = _factor()
+    # Range-dependent depth noise, sigma = k * z^2 (m).
+    depth_k: float | None = _factor()
+    # IMU white noise densities: gyro (rad/s/sqrt(Hz)), accelerometer (m/s^2/sqrt(Hz)).
+    imu_gyro_n: float | None = _factor()
+    imu_acc_n: float | None = _factor()
+    # IMU bias random walks: gyro (rad/s^2/sqrt(Hz)), accelerometer (m/s^3/sqrt(Hz)).
+    imu_gyro_w: float | None = _factor()
+    imu_acc_w: float | None = _factor()
+    # IMU turn-on bias sigma, drawn once per session: gyro (deg/s), accelerometer (mg).
+    imu_gyro_b0_dps: float | None = _factor()
+    imu_acc_b0_mg: float | None = _factor()
+    # Temperature rise over a drive (K).
+    imu_temp_k: float | None = _factor()
+    # Band vibration RMS per axis: accelerometer (m/s^2), gyro (deg/s).
+    imu_vib_acc_ms2: float | None = _factor()
+    imu_vib_gyro_dps: float | None = _factor()
+    # Camera-IMU time offset (ms): a fixed offset the fusion believes; no draw.
+    imu_time_offset_ms: float | None = _factor()
+    # Camera-IMU extrinsic error (mm, deg).
+    imu_extr_trans_mm: float | None = _factor()
+    imu_extr_rot_deg: float | None = _factor()
+    # Row-end GPS fixes (m): a fix at the first and the last frame of each flow; horizontal sigma per axis.
+    gps_end_h_m: float | None = _factor()
+    # Row-end GPS fixes (m): a fix at the first and the last frame of each flow; vertical sigma.
+    gps_end_v_m: float | None = _factor()
 
     @field_validator("seeds")
     @classmethod
@@ -128,7 +192,121 @@ class NoiseConfig(BaseModel):
             and self.pass_bias_m == 0
             and self.depth_rel_sigma == 0
             and self.depth_dropout == 0
+            and all(self.factor(key) == 0 for key in POSE_NOISE_KEYS)
         )
+
+    def factor(self, name: str) -> float:
+        """The value of noise factor `name`; 0.0 for an unset pose-model key."""
+        value = getattr(self, name)
+        return 0.0 if value is None else value
+
+    def pose_keys(self) -> list[str]:
+        """The pose-model noise keys that are set (a key set to 0 included), in `POSE_NOISE_KEYS` order."""
+        return [key for key in POSE_NOISE_KEYS if getattr(self, key) is not None]
+
+
+class PoseFiles(BaseModel):
+    """A folder of pose or IMU files and the content digest of each bundle's file, keyed by run."""
+
+    model_config = ConfigDict(extra="forbid")
+    dir: str
+    digests: dict[str, str] = Field(default_factory=dict)
+
+    @field_validator("digests")
+    @classmethod
+    def _check_digest_format(cls, v: dict[str, str]) -> dict[str, str]:
+        for key, value in v.items():
+            if not re.fullmatch(r"[0-9a-f]{64}", value):
+                raise ValueError(f"digests[{key}] must be a 64-character lowercase hex digest")
+        return v
+
+
+class VioConfig(BaseModel):
+    """Settings of the fusion graph; unset keys stay out of the dump and the config hash."""
+
+    model_config = ConfigDict(extra="forbid", allow_inf_nan=False)
+    # Sigma of the odometry factors of a file source (mm, deg).
+    vo_sigma_trans_mm: float | None = Field(default=None, gt=0, exclude_if=_unset)
+    vo_sigma_rot_deg: float | None = Field(default=None, gt=0, exclude_if=_unset)
+    # Standstill before the start (s), held by zero-velocity factors.
+    stop_s: float | None = Field(default=None, ge=0, exclude_if=_unset)
+    # IMU noise values the estimator assumes: the fixed lab values or the generating profile's.
+    estimator_imu: Literal["lab", "generator"] | None = Field(default=None, exclude_if=_unset)
+
+
+class PoseConfig(BaseModel):
+    """Where the camera poses come from and how they are built.
+
+    `source: truth` builds poses from the true poses (with the drift model when drift keys are set);
+    `source: file` reads the pose files named by `cache`. With `rig: true` the cameras of one side ride one
+    body, and `rig_ref` is the pitch of the reference camera. `fuse` picks the fusion graph.
+    """
+
+    model_config = ConfigDict(extra="forbid", allow_inf_nan=False)
+    source: Literal["truth", "file"] = "truth"
+    cache: str | None = Field(default=None, exclude_if=_unset)
+    caches: dict[str, PoseFiles] | None = Field(default=None, exclude_if=_unset)
+    anchor: Literal["nominal", "first_truth"] = "nominal"
+    rig: bool = False
+    rig_ref: float | None = Field(default=None, exclude_if=_unset)
+    fuse: Literal["none", "vo", "imu"] = "none"
+    imu: str | None = Field(default=None, exclude_if=_unset)
+    imu_files: dict[str, PoseFiles] | None = Field(default=None, exclude_if=_unset)
+    vio: VioConfig | None = Field(default=None, exclude_if=_unset)
+    # Name of the camera configuration (for example c2 or c1), shown in results and reports.
+    config_label: str | None = Field(default=None, pattern=r"^[a-z0-9_]+$", exclude_if=_unset)
+
+    @model_validator(mode="after")
+    def _check_source_and_fusion(self) -> PoseConfig:
+        if self.source == "file" and (self.cache is None or self.cache not in (self.caches or {})):
+            raise ValueError("pose.source=file needs pose.cache, one of pose.caches")
+        if self.cache is not None and self.source == "truth":
+            raise ValueError("pose.cache needs pose.source=file")
+        if self.source == "file" and self.fuse == "imu" and self.imu is None:
+            raise ValueError("pose.source=file with pose.fuse=imu needs pose.imu")
+        if self.imu is not None and not (
+            self.source == "file" and self.fuse == "imu" and self.imu in (self.imu_files or {})
+        ):
+            raise ValueError("pose.imu needs pose.source=file, pose.fuse=imu and a name of pose.imu_files")
+        if self.source == "truth" and self.fuse == "vo":
+            raise ValueError("pose.fuse=vo needs pose.source=file; a truth source has one body odometry flow")
+        if self.vio is not None and self.fuse == "none":
+            raise ValueError("pose.vio needs pose.fuse=vo or imu")
+        if self.vio is not None and self.source == "truth":
+            for key in ("vo_sigma_trans_mm", "vo_sigma_rot_deg"):
+                if getattr(self.vio, key) is not None:
+                    raise ValueError(f"pose.vio.{key} needs pose.source=file; a truth source takes its factor "
+                                     "sigmas from its drift keys")
+        return self
+
+
+AlignMethod = Literal["tracks", "row_plane"]
+
+
+class AlignConfig(BaseModel):
+    """Alignment between passes and between aisles.
+
+    `mode` is one method name, or a list of the methods that run in order. The stress keys degrade a listed
+    method: `stress_row_bias_m` adds a bias (m, any sign) to the row centre plane `row_plane` estimates, and
+    `stress_pair_keep` is the share of the track pairs seen from both sides that `tracks` keeps.
+    """
+
+    model_config = ConfigDict(extra="forbid", allow_inf_nan=False)
+    mode: (Literal["none", "fit_truth_pass", "fit_truth_segment", "oracle_struct"]
+           | Annotated[list[AlignMethod], Field(min_length=1)]) = "none"
+    stress_row_bias_m: float | None = Field(default=None, exclude_if=_unset)
+    stress_pair_keep: float | None = Field(default=None, gt=0, le=1, exclude_if=_unset)
+
+    @model_validator(mode="after")
+    def _check_methods(self) -> AlignConfig:
+        methods = self.mode if isinstance(self.mode, list) else []
+        if len(set(methods)) != len(methods):
+            raise ValueError("align.mode repeats a method")
+        if self.stress_row_bias_m is not None and "row_plane" not in methods:
+            raise ValueError("align.stress_row_bias_m needs row_plane in align.mode")
+        if self.stress_pair_keep is not None and "tracks" not in methods:
+            raise ValueError("align.stress_pair_keep needs tracks in align.mode")
+        return self
 
 
 class TrackerConfig(BaseModel):
@@ -179,6 +357,9 @@ class EvalAppConfig(BaseModel):
     noise: NoiseConfig = Field(default_factory=NoiseConfig)
     tracker: TrackerConfig = Field(default_factory=TrackerConfig)
     dedup: DedupConfig = Field(default_factory=DedupConfig)
+    # Pose source and alignment; without a pose section the config runs on the true camera poses.
+    pose: PoseConfig | None = Field(default=None, exclude_if=_unset)
+    align: AlignConfig | None = Field(default=None, exclude_if=_unset)
     seed: int = 0
     stop_after: Literal["y1", "y6"] = "y6"
     output_dir: str = "runs/eval"
@@ -202,6 +383,54 @@ class EvalAppConfig(BaseModel):
             raise ValueError("detector.digests needs detector.cache")
         if self.split == "test" and self.tuning:
             raise ValueError("split=test requires tuning=false")
+        return self
+
+    @model_validator(mode="after")
+    def _check_pose_settings(self) -> EvalAppConfig:
+        """Refuse pose-model keys a config would not use, and pose settings that contradict each other."""
+        nz, pose = self.noise, self.pose
+        present = nz.pose_keys()
+
+        def first(keys: tuple[str, ...]) -> str | None:
+            return next((key for key in present if key in keys), None)
+
+        if pose is None:
+            if present:
+                raise ValueError(f"noise.{present[0]} needs a pose section")
+            if self.align is not None:
+                raise ValueError("align needs a pose section")
+            return self
+        aligned = self.align is not None and self.align.mode != "none"
+        if (pose.rig or aligned) and pose.rig_ref is None:
+            raise ValueError("pose.rig and an align mode need pose.rig_ref (the reference camera's pitch)")
+        pitches = self.passes.pitches
+        if pose.rig_ref is not None and pitches is not None and not any(
+            abs(pose.rig_ref - p) <= 1e-6 for p in pitches
+        ):
+            shown = "[" + ", ".join(f"{p:g}" for p in pitches) + "]"
+            raise ValueError(f"pose.rig_ref={pose.rig_ref:g} is not one of passes.pitches {shown}")
+        if pose.fuse != "imu" and (key := first(IMU_LEVEL_KEYS + IMU_BELIEF_KEYS + GPS_KEYS)):
+            raise ValueError(f"noise.{key} needs pose.fuse=imu")
+        if pose.source == "file" and (key := first(IMU_LEVEL_KEYS)):
+            raise ValueError(f"noise.{key} needs pose.source=truth; a file source takes its IMU noise from the "
+                             "IMU file")
+        if pose.source == "file" and (key := first(GPS_KEYS)):
+            raise ValueError(f"noise.{key} needs pose.source=truth; a file source has no GPS fixes")
+        if pose.anchor == "first_truth" and (key := first(GPS_KEYS)):
+            raise ValueError(f"noise.{key} needs pose.anchor=nominal")
+        gps = [key for key in GPS_KEYS if key in present]
+        if len(gps) == 1:
+            raise ValueError("noise.gps_end_h_m and noise.gps_end_v_m go together")
+        if key := next((key for key in gps if nz.factor(key) == 0), None):
+            raise ValueError(f"noise.{key} must be > 0; a zero-noise fix is the truth")
+        if not pose.rig and (key := first(("rig_extr_trans_mm", "rig_extr_rot_deg"))):
+            raise ValueError(f"noise.{key} needs pose.rig=true")
+        if pose.rig and (key := first(("pass_pitch_trans_m", "pass_pitch_rot_deg"))):
+            raise ValueError(f"noise.{key} needs pose.rig=false (one camera passing each pitch)")
+        start_keys = ("pass_side_trans_m", "pass_side_rot_deg", "pass_pitch_trans_m", "pass_pitch_rot_deg")
+        if pose.anchor == "first_truth" and (key := first(start_keys)):
+            raise ValueError(f"noise.{key} is a start error of pose.anchor=nominal; pose.anchor=first_truth "
+                             "starts at the truth")
         return self
 
     def is_noisy(self) -> bool:

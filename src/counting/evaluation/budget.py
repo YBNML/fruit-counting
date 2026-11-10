@@ -6,6 +6,9 @@ than following each other, so `L3→L5` is the detector's share. The report-only
 and `L5→L5_L4base` come last. `path_pairs` is the part of those pairs that leads to `L5`; its
 rows add up to `L5`'s error minus the first rung's.
 
+A ladder with a pose rung (`POSE_ONLY_RUNGS`) takes instead the `POSE_PAIRS` whose two rungs both
+ran (`ladder_pairs`).
+
 `budget_rows` gives one row per pair and bundle, then a `pooled` row over the bundles. A row's
 `d_e` is the change of (U - G) / G between the two rungs, and each ledger term of `TERMS` is its
 change in counts over the truth count G, with sign -1 for the `miss_*` terms, so that the terms
@@ -13,8 +16,8 @@ add up to `d_e` (`residual` is what is left). The pooled row sums the counts bef
 (Σ counts / Σ truth), rather than averaging the bundles' values. The Y6 rows read the row ledger
 and the row's U and G6; the Y1 rows sum the pass ledgers and U1 and G1 of the passes at the given
 pitches. `check_budget` adds the terms up again and refuses a row where they miss `d_e`.
-`ladder_budget` builds the budget of a ladder with rung `L5`: the Y6 rows, then the Y1 rows per
-pitch, over the judged pitches and over every pass, all checked.
+`ladder_budget` builds the budget of a ladder with rung `L5` over its `ladder_pairs`: the Y6 rows,
+then the Y1 rows per pitch, over the judged pitches and over every pass, all checked.
 """
 
 from __future__ import annotations
@@ -26,6 +29,13 @@ from counting.evaluation.verdict import JUDGED_PITCHES, pool_rung
 
 # Rungs that branch off L3 instead of following each other on the main chain.
 BRANCH_RUNGS = ("L4_base", "L5")
+# The (from, to) rung pairs of a ladder with pose rungs, in table order.
+POSE_PAIRS = (("L3", "L4_drift"), ("L3", "LVI"), ("L5", "L5VI"), ("LVI", "L5VI"), ("L4_drift_noimu", "L4_drift"),
+              ("LV", "LVI"), ("LV_ref", "LV"), ("L4_drift_know", "L4_drift"), ("L4_drift_noal", "L4_drift"),
+              ("LVI_first", "LVI"), ("LVI_fits", "LVI"), ("L4_drift_c1x", "L4_drift"), ("LVI_c1x", "LVI"),
+              ("LVI_dd", "LVI"), ("L3", "L3_al"))
+# The rungs that only a pose ladder has; any of them in a ladder's rungs selects `POSE_PAIRS`.
+POSE_ONLY_RUNGS = frozenset(n for pair in POSE_PAIRS for n in pair) - {"L3", "L5"}
 # The ledger terms of a budget row; `n_pred - n_truth` is their sum with `_SIGN`.
 TERMS = ("fp_bg", "fp_off", "boundary", "dup_track", "dup_cross", "miss_det", "miss_drop", "miss_merge")
 _SIGN = {t: -1 if t.startswith("miss_") else 1 for t in TERMS}
@@ -51,6 +61,20 @@ def contrib_pairs(chain: Sequence[str], rungs: Mapping[str, object]) -> list[tup
         if a in rungs and b in rungs:
             pairs.append((a, b))
     return pairs
+
+
+def pose_pairs(rungs: Mapping[str, object]) -> list[tuple[str, str]]:
+    """The `POSE_PAIRS` whose two rungs both ran (keys of `rungs`), in `POSE_PAIRS` order."""
+    return [(a, b) for a, b in POSE_PAIRS if a in rungs and b in rungs]
+
+
+def ladder_pairs(chain: Sequence[str], rungs: Mapping[str, object]) -> list[tuple[str, str]]:
+    """The pairs of a ladder's contribution table and budget: `pose_pairs(rungs)` when a name of
+    `rungs` is one of `POSE_ONLY_RUNGS`, else `contrib_pairs(chain, rungs)`. Only the names count,
+    not the rungs' results."""
+    if any(name in POSE_ONLY_RUNGS for name in rungs):
+        return pose_pairs(rungs)
+    return contrib_pairs(chain, rungs)
 
 
 def path_pairs(chain: Sequence[str]) -> list[tuple[str, str]]:
@@ -155,7 +179,7 @@ def ladder_budget(run_entries: Sequence[Mapping], crop: str) -> list[dict] | Non
     `JUDGED_PITCHES[crop]` passes (`group="judged"`) and over every pass (`group="all"`).
     """
     chain, rungs = run_entries[0]["chain"], run_entries[0]["rungs"]
-    pairs = contrib_pairs(chain, rungs)
+    pairs = ladder_pairs(chain, rungs)
     if "L5" not in chain or not pairs:
         return None
     names = {name for pair in pairs for name in pair}

@@ -1,0 +1,15 @@
+# In-pass drift (rotation drift rate, scale error, per-step translation and rotation noise) on base B_drift_fitp.
+bases: [B_drift_fitp]
+common:
+  noise: {drift_scale_sigma: 0.0045, drift_rate_deg_per_m: 0.045, drift_step_trans_mm: 2.1, drift_step_rot_deg: 0.039,
+          pass_side_trans_m: 0.05, pass_side_rot_deg: 0.5,
+          rig_extr_trans_mm: 14.0, rig_extr_rot_deg: 0.4,
+          depth_rel_sigma: 0.02, depth_dropout: 0.05,
+          imu_gyro_n: 1.16e-3, imu_acc_n: 4.97e-3, imu_gyro_w: 1.82e-5, imu_acc_w: 4.75e-4, imu_gyro_b0_dps: 1.0,
+          imu_acc_b0_mg: 4.0, imu_temp_k: 1.0,
+          imu_time_offset_ms: 0.0, imu_extr_trans_mm: 10.0, imu_extr_rot_deg: 0.3}
+factors:
+  noise.drift_rate_deg_per_m: [0.0, 0.015, 0.1, 0.2, 0.5]
+  noise.drift_scale_sigma: [0.0, 0.01, 0.03]
+  noise.drift_step_trans_mm: [0.0, 5.0, 10.0]
+  noise.drift_step_rot_deg: [0.0, 0.1, 0.2]

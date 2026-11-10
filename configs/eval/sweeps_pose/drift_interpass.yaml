@@ -1,0 +1,13 @@
+# Between-pass errors (side start error, rig extrinsic error) on base B_pass.
+bases: [B_pass]
+common:
+  noise: {pass_side_trans_m: 0.05, pass_side_rot_deg: 0.5,
+          rig_extr_trans_mm: 14.0, rig_extr_rot_deg: 0.4,
+          imu_gyro_n: 1.16e-3, imu_acc_n: 4.97e-3, imu_gyro_w: 1.82e-5, imu_acc_w: 4.75e-4, imu_gyro_b0_dps: 1.0,
+          imu_acc_b0_mg: 4.0, imu_temp_k: 1.0,
+          imu_time_offset_ms: 0.0, imu_extr_trans_mm: 10.0, imu_extr_rot_deg: 0.3}
+factors:
+  noise.pass_side_trans_m: [0.02, 0.05, 0.1, 0.2]
+  noise.pass_side_rot_deg: [0.25, 0.5, 1.0]
+  noise.rig_extr_trans_mm: [2.0, 5.0, 30.0, 80.0]
+  noise.rig_extr_rot_deg: [0.1, 0.2, 0.8, 1.6]

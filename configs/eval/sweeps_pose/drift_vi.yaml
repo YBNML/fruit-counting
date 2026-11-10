@@ -1,0 +1,11 @@
+# Camera-IMU time offset and extrinsic error on base B_vi.
+bases: [B_vi]
+common:
+  noise: {pass_side_trans_m: 0.05, pass_side_rot_deg: 0.5,
+          rig_extr_trans_mm: 14.0, rig_extr_rot_deg: 0.4,
+          depth_rel_sigma: 0.02, depth_dropout: 0.05,
+          imu_time_offset_ms: 0.0, imu_extr_trans_mm: 10.0, imu_extr_rot_deg: 0.3}
+factors:
+  noise.imu_time_offset_ms: [2.5, 5.0, 50.0, 111.0]
+  noise.imu_extr_trans_mm: [2.0, 5.0, 60.0]
+  noise.imu_extr_rot_deg: [0.1, 0.6, 1.0]

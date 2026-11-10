@@ -13,9 +13,10 @@ A grid file is a YAML mapping with only these keys:
       tight: {dedup: {radius_m: 0.03}}
 
 A `factors`/`product` key is a dot path whose first part is a stage setting
-section (truth, passes, stages, detector, lift, noise, tracker, dedup); a
-`common` or `combo` key is checked by the top-level keys of its mapping, which
-must equal one of those sections exactly (a nested mapping, never a dot path).
+section (truth, passes, stages, detector, lift, noise, tracker, dedup, pose,
+align); a `common` or `combo` key is checked by the top-level keys of its
+mapping, which must equal one of those sections exactly (a nested mapping,
+never a dot path).
 
 Points, in order: `baseline` (no patch; the name is reserved); `factors` in
 file order and value order, named `key=<value>`; `product` by
@@ -31,8 +32,11 @@ point's own patch, the point's values winning).
 Cells: points are the outer loop and `bases` the inner one (without `bases`,
 one cell per point with base None). A cell's config is the point patch merged
 into the config first, in the same place as `--set`, and then the base's rung
-patch (`rung_config`) on top. So a key the rung sets keeps the rung's value,
-and a key the rung leaves alone keeps the point's value. Merging is deep: a
+patch (the one `rung_config` merges) on top. So a key the rung sets keeps the
+rung's value, and a key the rung leaves alone keeps the point's value. The
+config is validated once, after both merges, so a point key that needs a
+setting of the rung (an IMU key under the rung's `pose.fuse`, a `rig_extr_*`
+key under its `pose.rig`) is checked against it. Merging is deep: a
 mapping value in a point merges into the config's mapping
 (`lift.center_offset_m: [{fruit: 0.015}]` keeps `bag`), while
 `--set key={...}` replaces the whole mapping.
@@ -51,7 +55,9 @@ context at a time; a pose or depth noise seed needs no separate `prepare` and
 runs on its cell's own group. Each cell keeps the Y1 summary, each pass's
 counts and ledger, and the Y6 mode, row, ledger and metrics; only the
 baseline point keeps the per-tree Y6 table. A noisy cell also keeps `noisy`,
-`seeds`, `noise`, `spread` and `per_seed`, same as a noisy ladder rung.
+`seeds`, `noise`, `spread` and `per_seed`, same as a noisy ladder rung. A cell
+with a pose section keeps `pose` and `pose_quality` (and each seed's
+`pose_quality` in `per_seed`).
 """
 
 from __future__ import annotations
@@ -68,14 +74,14 @@ import yaml
 
 from counting.config.eval_schema import EvalAppConfig, SplitsConfig
 from counting.data.formats.orchard_synth import SynthRun, select_frames
+from counting.evaluation.posesource import check_pose_supported
 from counting.evaluation.runner import (
     _merge, _patched, _prepared_settings, check_ladder_request, describe_run, evaluate, evaluate_seeds, prepare,
-    rung_config,
 )
 from counting.evaluation.seeds import combine_seeds
 
 _GRID_KEYS = ("bases", "common", "factors", "product", "combos")
-_STAGE_SECTIONS = ("truth", "passes", "stages", "detector", "lift", "noise", "tracker", "dedup")
+_STAGE_SECTIONS = ("truth", "passes", "stages", "detector", "lift", "noise", "tracker", "dedup", "pose", "align")
 _PASS_KEYS = ("pitch", "side", "aisle", "n_frames", "U1", "G1", "e1", "ledger")
 _Y6_KEYS = ("mode", "n_landmarks", "row", "ledger", "metrics")
 
@@ -245,8 +251,8 @@ def sweep_cells(cfg: EvalAppConfig, grid: Grid, ladder: Mapping | None) -> list[
     With `bases`, `ladder` must be given (`ValueError` naming the grid file),
     and the ladder request is checked next (`check_ladder_request`, its errors
     as they are). A cell's config is `cfg` with the point patch and then the
-    rung patch merged in. A config error (`ValueError`, pydantic's included)
-    names the grid file, the point and the base.
+    rung patch merged in, validated once after both merges. A config error
+    (`ValueError`, pydantic's included) names the grid file, the point and the base.
     """
     if grid.bases and ladder is None:
         raise ValueError(f"{grid.path}: bases need a ladder")
@@ -258,9 +264,11 @@ def sweep_cells(cfg: EvalAppConfig, grid: Grid, ladder: Mapping | None) -> list[
         for base in grid.bases or (None,):
             where = f"{grid.path}: point {point.name!r}" + ("" if base is None else f" on {base}")
             try:
-                c = _patched(cfg, point.patch)
-                if base is not None:
-                    c = rung_config(c, ladder, base)
+                if base is None:
+                    c = _patched(cfg, point.patch)
+                else:
+                    c = EvalAppConfig.model_validate(
+                        _merge(_merge(cfg.model_dump(), point.patch), _rung_patch(ladder, base)))
             except ValueError as e:
                 raise ValueError(f"{where}: {e}") from e
             overridden: tuple[str, ...] = ()
@@ -313,13 +321,18 @@ def _kept(cell: SweepCell, res: dict) -> dict:
     """The part of `evaluate`'s or `evaluate_seeds`'s result a sweep keeps for `cell`.
 
     A noisy `res` also keeps `noisy`, `seeds`, `noise`, `spread` and a `per_seed` trimmed the same way.
-    A cached cell's `cache` (noisy or not) is kept as it is.
+    `pose` and `pose_quality` (a config with a pose section) are kept as they are, and so is each
+    `per_seed` item's `pose_quality`. A cached cell's `cache` (noisy or not) is kept as it is.
     """
     out = {"point": cell.point.name, "base": cell.base, "overridden": list(cell.overridden),
            "stages": res["stages"], "lift_depth": res["lift_depth"], **_kept_view(cell, res["y1"], res["y6"])}
+    for key in ("pose", "pose_quality"):
+        if key in res:
+            out[key] = res[key]
     if res.get("noisy"):
         out.update(noisy=True, seeds=res["seeds"], noise=res["noise"], spread=res["spread"],
-                   per_seed=[{"noise_seed": p["noise_seed"], **_kept_view(cell, p["y1"], p["y6"])}
+                   per_seed=[{"noise_seed": p["noise_seed"], **_kept_view(cell, p["y1"], p["y6"]),
+                              **({"pose_quality": p["pose_quality"]} if "pose_quality" in p else {})}
                              for p in res["per_seed"]])
     if "cache" in res:
         out["cache"] = res["cache"]
@@ -333,10 +346,13 @@ def run_sweep(
 
     A cell under `stages.det=oracle_noisy` belongs to one group per noise seed;
     pose and depth noise cells run all their seeds on their group's context.
+    Every cell's pose settings are checked (`check_pose_supported`) before the first `prepare`.
     Every `prepare` gets `allow_test`.
     Returns `{"meta": describe_run(first group's context), "cells": [kept result per cell, in input order]}`
     and the seconds spent, `{"prepare": ..., "evaluate": ...}`.
     """
+    for cell in cells:
+        check_pose_supported(cell.cfg)
     check_frame_selection(run, cells)
     groups: dict[str, list[tuple[int, int | None]]] = {}
     for i, cell in enumerate(cells):

@@ -58,6 +58,11 @@ def combine_seeds(cfg: EvalAppConfig, per_seed: Sequence[tuple[int, dict]]) -> d
     `stages` and `lift_depth` are the first result's. `spread` is the [min, max]
     of `y1.summary`, `y6.row` and `y6.metrics` over the seeds, and `per_seed` keeps
     each seed's `y1` and `y6`.
+
+    When the first result has `pose` (a config with a pose section), the combined
+    result also has that `pose` and the seeds' mean `pose_quality`; `spread` then
+    has `pose_quality` (`rpe`, `summary` and `interpass`) and `per_seed` keeps each
+    seed's `pose_quality`.
     """
     results = [r for _, r in per_seed]
     y1 = _mean([r["y1"] for r in results])
@@ -66,6 +71,14 @@ def combine_seeds(cfg: EvalAppConfig, per_seed: Sequence[tuple[int, dict]]) -> d
     if y6 is not None:
         spread["y6"] = {k: _range([r["y6"][k] for r in results]) for k in ("row", "metrics")}
     first = results[0]
-    return {"stages": first["stages"], "lift_depth": first["lift_depth"], "y1": y1, "y6": y6,
-            "noisy": True, "seeds": [s for s, _ in per_seed], "noise": noise_settings(cfg), "spread": spread,
-            "per_seed": [{"noise_seed": s, "y1": r["y1"], "y6": r["y6"]} for s, r in per_seed]}
+    out = {"stages": first["stages"], "lift_depth": first["lift_depth"], "y1": y1, "y6": y6,
+           "noisy": True, "seeds": [s for s, _ in per_seed], "noise": noise_settings(cfg), "spread": spread,
+           "per_seed": [{"noise_seed": s, "y1": r["y1"], "y6": r["y6"]} for s, r in per_seed]}
+    if "pose" in first:
+        out["pose"] = first["pose"]
+        out["pose_quality"] = _mean([r["pose_quality"] for r in results])
+        spread["pose_quality"] = {k: _range([r["pose_quality"][k] for r in results])
+                                  for k in ("rpe", "summary", "interpass")}
+        for item, r in zip(out["per_seed"], results):
+            item["pose_quality"] = r["pose_quality"]
+    return out
