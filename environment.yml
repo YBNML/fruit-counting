@@ -12,6 +12,7 @@ dependencies:
   - scipy
   - scikit-learn
   - opencv=5.0.*
+  - gtsam=4.3.*   # conda-forge build; the PyPI wheel requires pytest at runtime
   - pytorch=2.14.*
   - torchvision=0.29.*
   - tensorboard

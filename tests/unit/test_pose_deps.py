@@ -3,6 +3,9 @@
 OpenCV is pinned to one minor version in both conda environment files and in pyproject.toml, so every
 machine installs the same OpenCV release. The CPU environment takes every conda package from conda-forge,
 torch included, so the environment loads one OpenMP runtime.
+
+GTSAM comes from conda-forge through the environment files only: the PyPI wheel lists pytest among its
+runtime requirements.
 """
 
 import re
@@ -55,3 +58,11 @@ def test_pose_marker_is_registered():
     ini = _pyproject()["tool"]["pytest"]["ini_options"]
     assert [m.split(":")[0] for m in ini["markers"]] == ["slow", "synth", "pose"]
     assert ini["addopts"] == "-q -m 'not synth'"   # pose tests stay in the default run
+
+
+def test_gtsam_comes_from_the_conda_environments_only():
+    for name in ENV_FILES:
+        assert [d for d in _conda_specs(name) if d.split("=")[0] == "gtsam"] == ["gtsam=4.3.*"], name
+    project = _pyproject()["project"]
+    specs = [*project["dependencies"], *(s for group in project["optional-dependencies"].values() for s in group)]
+    assert not [s for s in specs if "gtsam" in s]
