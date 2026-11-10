@@ -19,7 +19,7 @@ dependencies = [
   "tqdm",
   "scipy",
   "scikit-learn",
-  "opencv-python",
+  "opencv-python>=5.0,<5.1",
   "torch>=2.2",
   "torchvision",
   "timm",
@@ -41,5 +41,6 @@ testpaths = ["tests"]
 markers = [
   "slow: model-loading integration tests and end-to-end determinism runs (kept in the full run)",
   "synth: reads real orchard_synth renders (excluded by default)",
+  "pose: pose-path tests, timed apart from the eval tests",
 ]
 addopts = "-q -m 'not synth'"

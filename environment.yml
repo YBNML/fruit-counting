@@ -1,6 +1,5 @@
 name: counting-env
 channels:
-  - pytorch
   - conda-forge
 dependencies:
   - python=3.11
@@ -12,9 +11,9 @@ dependencies:
   - tqdm
   - scipy
   - scikit-learn
-  - opencv
-  - pytorch=2.3.*
-  - torchvision=0.18.*
+  - opencv=5.0.*
+  - pytorch=2.14.*
+  - torchvision=0.29.*
   - tensorboard
   - pytest
   - pytest-cov

@@ -12,7 +12,7 @@ dependencies:
   - tqdm
   - scipy
   - scikit-learn
-  - opencv
+  - opencv=5.0.*
   - tensorboard
   - pytest
   - pytest-cov
