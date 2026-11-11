@@ -133,7 +133,8 @@ def test_pose_section_adds_pose_entries(apple_run, ctx_of):
     res = evaluate(ctx, fake_cfg(apple_run, "apple", "pose.rig_ref=30"))
     assert res["pose"] == {"config": None, "source": "truth", "drift": False, "anchor": "nominal", "start": None,
                            "rig": False, "rig_ref": 30.0, "fuse": "none", "align": "none", "predict": "pose",
-                           "dedup": "merge", "dedup_radius_m": 0.04, "dedup_band_m": 0.1, "gate_px_frac": 0.5}
+                           "dedup": "merge", "dedup_radius_m": 0.04, "dedup_band_m": 0.1, "gate_px_frac": 0.5,
+                           "cache": None}
     assert set(res["pose_quality"]) == {"rpe", "passes", "summary", "interpass"}
     drift = evaluate(ctx, fake_cfg(apple_run, "apple", "pose.rig_ref=30", *D_EXT_VO), noise_seed=0)["pose"]
     assert drift["drift"] is True and drift["start"] == "nominal_from_first_frame"

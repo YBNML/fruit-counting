@@ -114,6 +114,9 @@ IMU_LEVEL_KEYS = ("imu_gyro_n", "imu_acc_n", "imu_gyro_w", "imu_acc_w", "imu_gyr
 IMU_BELIEF_KEYS = ("imu_time_offset_ms", "imu_extr_trans_mm", "imu_extr_rot_deg")
 GPS_KEYS = ("gps_end_h_m", "gps_end_v_m")
 POSE_NOISE_KEYS = DRIFT_KEYS + IMU_LEVEL_KEYS + IMU_BELIEF_KEYS + GPS_KEYS
+# The drift keys of the body odometry flow (walk, scale and heading rate). A file source reads its flow from the
+# pose file, so its config does not set them.
+FLOW_KEYS = ("drift_step_trans_mm", "drift_step_rot_deg", "drift_scale_sigma", "drift_rate_deg_per_m")
 
 
 def _factor() -> Any:
@@ -416,6 +419,9 @@ class EvalAppConfig(BaseModel):
                              "IMU file")
         if pose.source == "file" and (key := first(GPS_KEYS)):
             raise ValueError(f"noise.{key} needs pose.source=truth; a file source has no GPS fixes")
+        if pose.source == "file" and (key := first(FLOW_KEYS)):
+            raise ValueError(f"noise.{key} needs pose.source=truth; a file source takes its odometry from the "
+                             "pose file")
         if pose.anchor == "first_truth" and (key := first(GPS_KEYS)):
             raise ValueError(f"noise.{key} needs pose.anchor=nominal")
         gps = [key for key in GPS_KEYS if key in present]

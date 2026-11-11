@@ -1,0 +1,25 @@
+# Frame-to-frame RGB-D visual odometry (counting pose vo): caches go to <output_dir>/<config hash>/<run id>.npz.
+n_features: 6000          # ORB keypoints per frame
+orb_scale: 1.2            # ORB pyramid scale factor between levels
+orb_levels: 8             # ORB pyramid levels
+fast_threshold: 7         # FAST corner threshold of the ORB detector (grey levels)
+clahe_clip: 3.0           # CLAHE clip limit of the grey image
+clahe_tile: 8             # CLAHE tiles per image side (tile x tile grid)
+match_ratio: 0.8          # ratio test of the global descriptor matching
+ransac_px: 3.0            # reprojection error of the first EPnP RANSAC fit (px)
+final_px: 2.0             # reprojection error of the final EPnP RANSAC fit (px)
+ransac_iters: 300         # RANSAC iterations of each fit
+ransac_confidence: 0.999  # RANSAC confidence of each fit
+min_inliers: 30           # fewest inliers (and matches) a fit needs for its pose to be taken
+guided_radius_px: 12.0    # guided matching radius around points projected with the first fit's pose (px)
+prior_radius_px: 60.0     # guided matching radius around points projected with the motion prior (px)
+guided_max_hamming: 64    # largest Hamming distance of a guided match (bits of 256)
+guided_ratio: 0.9         # ratio test of the guided matching
+depth_max_m: 10.0         # deepest keypoint depth used (m)
+depth_nb: 2               # keypoint depth = nearest depth in (2r+1) x (2r+1) pixels, r = depth_nb (0: the pixel)
+depth_k: 0.0036           # keypoint depth noise: Gaussian sigma depth_k * z^2 (m), 0 for none
+noise_seed: 0             # seed of the keypoint depth noise
+seed: 0                   # OpenCV global generator seed per pass; solvePnPRansac ignores it (hash only)
+threads: 1                # OpenCV threads
+step_m: null              # spacing of the frames the odometry runs on (m); null for every frame
+output_dir: runs/pose     # root folder of the caches (left out of the config hash)

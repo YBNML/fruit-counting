@@ -241,6 +241,15 @@ app.add_typer(_train_app, name="train")
 from counting.evaluation.cli import eval_app  # noqa: E402
 app.add_typer(eval_app, name="eval")
 
+pose_app = typer.Typer(help="Pose files of render bundles", no_args_is_help=True)
+app.add_typer(pose_app, name="pose")
+
+
+# Suppresses Typer's single-command auto-promotion; keep even when other commands are added.
+@pose_app.callback()
+def _pose() -> None:
+    """Pose files of render bundles."""
+
 
 @_train_app.command("detector")
 def train_detector_cli(
@@ -423,6 +432,103 @@ def detect(
             if summary["saturated"]:
                 typer.echo(f"warning: {m.run_id}: {len(summary['saturated'])} frame(s) reached "
                            f"max_dets={cfg.model.max_dets}; detections past the cap are not in the cache")
+    except (CheckFailed, FileExistsError) as e:
+        typer.echo(f"error: {e}")
+        raise typer.Exit(code=1)
+    except (ValueError, FileNotFoundError) as e:
+        typer.echo(f"error: {e}")
+        raise typer.Exit(code=2)
+
+
+@pose_app.command("vo")
+def pose_vo(
+    config: str = typer.Option(..., "--config", help="Visual odometry YAML"),
+    run_: list[str] = typer.Option(..., "--run", help="A bundle to run the odometry on (repeat for more)"),
+    set_: list[str] = typer.Option(None, "--set", help="Dot-path override: key.path=value", show_default=False),
+    splits_path: str = typer.Option(
+        "configs/eval/splits_pose.yaml", "--splits",
+        help="Splits YAML (every bundle's seed must be in a split other than test)",
+    ),
+) -> None:
+    """Run the frame-to-frame RGB-D visual odometry over bundles and write one pose cache per bundle.
+
+    Each cache goes to `<output_dir>/<VO config hash>/<run_id>.npz`, with a `.json` summary next to it,
+    and is written once: an existing cache or summary stops the command before the odometry runs.
+    With `step_m` set, the odometry runs on the thinned frames only. The cache meta names the bundle
+    (run id, fingerprint, sha256 of all its RGB and depth images), the settings and their hash, the
+    OpenCV and numpy versions, the code state, the splits file's sha256 and the image size; the time
+    taken goes to the summary only. Every bundle must be a sequence bundle with its seed in a split
+    other than test: this command makes no pose cache of a test bundle.
+
+    Exit code 0 is success, 1 is a check failure (a seed in no split or in the test split, an existing
+    cache or summary), 2 is an input error (missing bundle or image, a bundle that is not a sequence,
+    a bad config or `--set`).
+    """
+    from pathlib import Path
+
+    import cv2
+    import numpy as np
+
+    from counting.config.eval_schema import SplitsConfig
+    from counting.config.hashing import config_hash
+    from counting.config.loader import load_yaml_model
+    from counting.config.pose_schema import VoConfig
+    from counting.data.formats.orchard_synth import SynthRun, select_frames
+    from counting.detection.cached import file_sha256, rgb_fingerprint
+    from counting.evaluation.posesource import vo_inputs
+    from counting.evaluation.record import git_state
+    from counting.evaluation.runner import CheckFailed
+    from counting.odometry.cache import pose_cache_path
+    from counting.odometry.vo import vo_to_cache
+
+    try:
+        try:
+            cfg = load_yaml_model(config, VoConfig, overrides=set_)
+        except KeyError as e:  # a --set path that cannot be descended
+            raise ValueError(f"--set: {e.args[0]}") from e
+        splits = load_yaml_model(splits_path, SplitsConfig)
+
+        bundles = [SynthRun.open(path) for path in run_]
+        for bundle in bundles:
+            seed = bundle.meta.seed
+            split = splits.split_of(seed)
+            if split is None:
+                raise CheckFailed(f"{bundle.root}: seed {seed} is in no split")
+            if split == "test":
+                raise CheckFailed(f"{bundle.root}: seed {seed} is a test seed; this command makes no pose cache "
+                                  "of a test bundle")
+            if not bundle.meta.is_sequence:
+                raise ValueError(f"{bundle.root}: not a sequence bundle (max_frames or irregular step)")
+        bundles.sort(key=lambda b: (b.meta.fingerprint, b.meta.run_id))
+
+        chash = config_hash(cfg)
+        paths = [pose_cache_path(Path(cfg.output_dir).expanduser() / chash, b.meta.run_id) for b in bundles]
+        for path in paths:
+            for p in (path, path.with_suffix(".json")):
+                if p.exists():
+                    raise CheckFailed(f"{p}: pose cache exists; remove it first to make it again")
+        # Every bundle's frames and fingerprints come before the first odometry run, so a bad bundle
+        # stops the command before any cache is written.
+        inputs = [vo_inputs(select_frames(b.frames, base_step_m=b.meta.base_step_m, step_m=cfg.step_m))
+                  for b in bundles]
+        rgb_shas = [rgb_fingerprint(b.frames) for b in bundles]
+        depth_shas = [b.depth_fingerprint() for b in bundles]
+
+        code = git_state()
+        common = {"vo": {k: v for k, v in cfg.model_dump(mode="json").items() if k != "output_dir"},
+                  "vo_config_hash": chash, "opencv": cv2.__version__, "numpy": np.__version__,
+                  "counting_commit": code["commit"], "counting_dirty": code["dirty"],
+                  "splits_sha256": file_sha256(Path(splits_path).expanduser())}
+        for bundle, frames, rgb_sha, depth_sha, path in zip(bundles, inputs, rgb_shas, depth_shas, paths):
+            m, cam = bundle.meta, bundle.frames[0].camera
+            meta = {"run_id": m.run_id, "fingerprint": m.fingerprint, "rgb_sha256": rgb_sha,
+                    "depth_sha256": depth_sha, **common, "image_size": [cam.width, cam.height]}
+            summary = vo_to_cache(frames, cfg, path, meta=meta)
+            passes = summary["passes"]
+            typer.echo(str(path))
+            typer.echo(f"{m.run_id}: frames {summary['n_frames']}, pairs {sum(p['pairs'] for p in passes)}, "
+                       f"failed {sum(p['failed'] for p in passes)}, prior {sum(p['prior'] for p in passes)}, "
+                       f"digest {summary['digest'][:16]}, {summary['seconds']:.1f} s")
     except (CheckFailed, FileExistsError) as e:
         typer.echo(f"error: {e}")
         raise typer.Exit(code=1)

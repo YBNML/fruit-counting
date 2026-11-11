@@ -144,7 +144,7 @@ def test_eval_run_with_noise_writes_seed_rows(leaf_runs, tmp_path):
     (d,) = (tmp_path / "out" / "apple_dev").iterdir()
     res = json.loads((d / "results.json").read_text(encoding="utf-8"))
     rung = res["runs"][0]["rungs"]["run"]
-    assert res["schema_version"] == 7 and rung["noisy"] and rung["seeds"] == [0, 1]
+    assert res["schema_version"] == 8 and rung["noisy"] and rung["seeds"] == [0, 1]
     assert rung["noise"]["detector"]["miss_p"] == 0.1 and rung["noise"]["depth_dropout"] == 0.05
     line = next(line for line in r.output.splitlines() if line.startswith("run: row U="))
     assert line.endswith(" (mean over noise seeds 0,1)")

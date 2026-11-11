@@ -23,7 +23,7 @@ from counting.config.eval_schema import POSE_NOISE_KEYS, EvalAppConfig
 from counting.evaluation.budget import TERMS, ladder_pairs, path_pairs
 from counting.evaluation.verdict import JUDGED_PITCHES, PITCH_JUDGED_RUNGS, judged_y1, pool_rung, verdict_counts
 
-SCHEMA_VERSION = 7
+SCHEMA_VERSION = 8
 
 
 class ReproducibilityError(RuntimeError):
@@ -378,15 +378,22 @@ def _align_text(mode: str | list[str]) -> str:
 def _pose_label(item: dict) -> str:
     """The pose source of one rung or cell, from its `pose` entry, joined by ` · `.
 
-    The configuration, the pose source (with the drift model when it ran), the rig and its
-    reference pitch, the fusion, the anchor, the alignment and the tracker prediction, then the
-    σ_t/σ_r/b pose noise when there is any. An item without `pose` gets `"정답 자세"` or that noise.
+    The configuration, the pose source (a file source with the name of the pose cache it read, and
+    the drift model when it ran), the rig and its reference pitch, the fusion, the anchor, the
+    alignment and the tracker prediction, then the σ_t/σ_r/b pose noise when there is any. An item
+    without `pose` gets `"정답 자세"` or that noise.
     """
     triple = _pose_triple(item)
     pose = item.get("pose")
     if pose is None:
         return "정답 자세" if triple == _NO_POSE_NOISE else _pose_values_text(triple)
-    source = "자세 정답" if pose["source"] == "truth" else f"자세 {pose['source']}"
+    cache = pose.get("cache")
+    if pose["source"] == "truth":
+        source = "자세 정답"
+    elif pose["source"] == "file" and cache is not None:
+        source = f"자세 file({cache['name']})"
+    else:
+        source = f"자세 {pose['source']}"
     if pose["drift"]:
         source += " + 표류 모형"
     parts = [f"구성 {pose['config'] or '-'}", source,
@@ -956,6 +963,21 @@ def _detector_line(cache: dict) -> str:
     return line
 
 
+def _first_pose_cache(results: dict) -> dict | None:
+    """The first `pose.cache` of a rung (run, ladder) or cell (sweep) in `_report_items` order, else None."""
+    for item in _report_items(results):
+        cache = (item.get("pose") or {}).get("cache")
+        if cache is not None:
+            return cache
+    return None
+
+
+def _pose_cache_line(cache: dict) -> str:
+    """The head line naming the pose cache a file pose source read: its name, VO config hash, OpenCV and digest."""
+    return (f"> 자세 캐시: {cache['name']} · VO 설정 {cache['vo_config_hash'] or '-'} · "
+            f"OpenCV {cache['opencv'] or '-'} · digest {cache['digest'][:16]}")
+
+
 def render_report(results: dict, *, criteria: Mapping | None) -> str:
     """Build the human-readable `report.md` for one experiment.
 
@@ -966,7 +988,8 @@ def render_report(results: dict, *, criteria: Mapping | None) -> str:
     `detection`, the detection table and the table of false positives that became tracks. A
     non-sweep result whose `split` is `"test"` and carries `verdicts` ends with `_verdict_lines`'s
     table. When a rung or sweep cell ran on cached detections, a head line names the detector
-    (`_detector_line` of `_first_cache`).
+    (`_detector_line` of `_first_cache`); when one read a pose cache, the next head line names that
+    cache (`_pose_cache_line` of `_first_pose_cache`).
 
     With a pose section the head's second line names the pose source (`_pose_text`); when a rung
     or cell started from the nominal start (`pose.start` `nominal_from_first_frame`), the next head
@@ -981,6 +1004,9 @@ def render_report(results: dict, *, criteria: Mapping | None) -> str:
     cache = _first_cache(results)
     if cache is not None:
         lines.append(_detector_line(cache))
+    pose_cache = _first_pose_cache(results)
+    if pose_cache is not None:
+        lines.append(_pose_cache_line(pose_cache))
     if results["split"] == "dev":
         lines.append("> dev 묶음: 개발용 수치다. 판정에 쓰지 않는다.")
     lines.append("")

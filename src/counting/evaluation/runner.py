@@ -37,7 +37,9 @@ from counting.evaluation.oracle_stages import (
     oracle_dedup, oracle_tracks, truth_centers, truth_row_mask, truth_trees,
 )
 from counting.evaluation.posequality import apply_rigid, fit_truth_rigid, pose_quality
-from counting.evaluation.posesource import check_pose_supported, model_cameras, pose_settings, rig_errors
+from counting.evaluation.posesource import (
+    check_pose_supported, model_cameras, pose_cache_entry, pose_settings, rig_errors,
+)
 from counting.evaluation.seeds import combine_seeds
 from counting.evaluation.truth import (
     SummaryMismatch, TruthTables, check_summary, is_positive, pass_subsets, truth_sets,
@@ -47,9 +49,11 @@ from counting.geometry.noise import (
     STEP_BIAS, STEP_DEPTH, STEP_DEPTH_K, STEP_DET, STEP_POSE, depth_k_noise, noise_rng, pass_bias, pass_key_code,
     perturb_depth,
 )
+from counting.geometry.posefile import PoseFile
 from counting.multiview.assign import assign_trees, in_target_row
 from counting.multiview.dedup import dedup, repair_pass
 from counting.multiview.lift import box_far_depth, box_median_depth, lift_points
+from counting.odometry.cache import pose_cache_path
 from counting.tracking.landmark import PassTracks, track_pass
 
 VARIANTS = ("count1", "any", "strict")
@@ -74,6 +78,7 @@ class RunContext:
     `cache` identifies the detection cache under `stages.det=cached`
     (`file`, `digest`, and the cache meta's `weights_sha256` and `pretrained`,
     None when the meta has none); it is None otherwise.
+    `_pose_files` holds the pose caches `open_pose_file` opened, by (path, pinned digest or None).
     """
 
     run: SynthRun
@@ -87,6 +92,7 @@ class RunContext:
     cache: dict | None = None
     _frame_of: dict[int, FrameInput] = field(init=False, repr=False)
     _box_depth: dict[tuple, np.ndarray] = field(default_factory=dict, init=False, repr=False)
+    _pose_files: dict[tuple[str, str | None], PoseFile] = field(default_factory=dict, init=False, repr=False)
 
     def __post_init__(self) -> None:
         self._frame_of = {f.idx: f for frames in self.passes.values() for f in frames}
@@ -183,6 +189,31 @@ def open_cache(run: SynthRun, cfg: EvalAppConfig) -> CachedDetector:
         raise ValueError(f"{run.root}: detector.digests pins no cache for run {run_id}")
     return CachedDetector(path, fingerprint=run.meta.fingerprint, digest=None if digests is None else digests[run_id],
                           **cfg.detector.post_settings().model_dump())
+
+
+def open_pose_file(ctx: RunContext, cfg: EvalAppConfig) -> PoseFile | None:
+    """The pose cache of `ctx`'s bundle under `pose.source=file`, opened once per context; None otherwise.
+
+    The folder is `pose.caches[pose.cache].dir` and the file `pose_cache_path(dir, run_id)`; a
+    missing one raises `FileNotFoundError`, and with that cache's `digests` set a run it does not
+    pin raises `ValueError`, both before the file is read. `PoseFile` then checks the bundle
+    fingerprint, the run id and, with `digests`, the pinned content digest (`ValueError` naming the
+    cache path). The opened file is kept in the context by (path, pinned digest or None).
+    """
+    if cfg.pose is None or cfg.pose.source != "file":
+        return None
+    run, name = ctx.run, cfg.pose.cache
+    files, run_id = cfg.pose.caches[name], run.meta.run_id
+    path = pose_cache_path(Path(files.dir).expanduser(), run_id)
+    if not path.is_file():
+        raise FileNotFoundError(f"{path}: no pose cache for this bundle")
+    if files.digests and run_id not in files.digests:
+        raise ValueError(f"{run.root}: pose.caches.{name}.digests pins no cache for run {run_id}")
+    pin = files.digests.get(run_id)
+    key = (str(path), pin)
+    if key not in ctx._pose_files:
+        ctx._pose_files[key] = PoseFile(path, fingerprint=run.meta.fingerprint, run_id=run_id, digest=pin)
+    return ctx._pose_files[key]
 
 
 def _match_by_score(dets, recs, score_hi, prefer):
@@ -351,15 +382,17 @@ def _track_passes(ctx: RunContext, cfg: EvalAppConfig, noise_seed: int | None) -
     """Lift and track every pass of `ctx`, in `ctx.passes` order (the first stage of `evaluate`).
 
     Each frame starts from the camera of the pose source (`model_cameras`: the rig and the drift
-    model under `cfg.pose`), or from its true camera when that gives None. With `noise_seed`, a
-    pass's bias is drawn before its frames, and each frame's camera then gets `Camera.perturbed`,
-    then its chosen depth `perturb_depth` (after the depth error is taken) and, with
-    `noise.depth_k` set, `depth_k_noise` on the depth before noise. The lift and the tracker use
-    these cameras; `track_pass` runs once per pass on the frames that carry them.
+    model under `cfg.pose`, or the pose cache of `open_pose_file` under `pose.source=file`), or
+    from its true camera when that gives None. With `noise_seed`, a pass's bias is drawn before
+    its frames, and each frame's camera then gets `Camera.perturbed`, then its chosen depth
+    `perturb_depth` (after the depth error is taken) and, with `noise.depth_k` set,
+    `depth_k_noise` on the depth before noise. The lift and the tracker use these cameras;
+    `track_pass` runs once per pass on the frames that carry them.
     """
     st, scene, nz = cfg.stages, ctx.run.meta.seed, cfg.noise
     cams = model_cameras(ctx.run.frames, ctx.passes, cfg, noise_seed, scene=scene,
-                         base_step_m=ctx.run.meta.base_step_m, plans=ctx.run.plans())
+                         base_step_m=ctx.run.meta.base_step_m, plans=ctx.run.plans(),
+                         pose_file=open_pose_file(ctx, cfg))
     out: list[_PassTrack] = []
     for key, frames in ctx.passes.items():
         bias = None if noise_seed is None else pass_bias(
@@ -479,13 +512,15 @@ def evaluate(ctx: RunContext, cfg: EvalAppConfig, *, subsets: bool = False, nois
     Each pass's and the summary's `depth_err` is `depth_error_stats` of box depth
     minus detection depth (`None` under `lift.depth=det_depth`, without detector
     depth, or with no detections).
-    The tracker and the lift use the cameras of the pose source (`model_cameras`:
-    the rig and the drift model under `cfg.pose`, else the true cameras). With
-    `noise_seed`, every such camera gets `Camera.perturbed`, and every chosen depth
-    gets `perturb_depth` (and, with `noise.depth_k`, `depth_k_noise`) after
-    `depth_err` is taken; scoring always uses the truth.
-    With a pose section the result also has `pose` (`pose_settings`) and
-    `pose_quality` (`pose_quality` of the cameras the lift and the tracker used
+    The tracker and the lift use the cameras of the pose source, `model_cameras`:
+    the rig and the drift model under `cfg.pose` (under `pose.source=file`, the
+    pose cache that `open_pose_file` opens once per context), else the true
+    cameras. With `noise_seed`, every such camera gets `Camera.perturbed`, and
+    every chosen depth gets `perturb_depth` (and, with `noise.depth_k`,
+    `depth_k_noise`) after `depth_err` is taken; scoring always uses the truth.
+    With a pose section the result also has `pose` (`pose_settings`; its `cache`
+    is `pose_cache_entry` of the pose cache read, None under `pose.source=truth`)
+    and `pose_quality` (`pose_quality` of the cameras the lift and the tracker used
     against the true cameras, with the alignment transforms; under `pose.rig`
     the in-pass drift and RPE are measured in the frame of the reference camera
     `pose.rig_ref`, with the rig calibration errors of the passes' pitches).
@@ -529,7 +564,8 @@ def evaluate(ctx: RunContext, cfg: EvalAppConfig, *, subsets: bool = False, nois
         y6 = _y6(ctx, cfg, stages, ctx.tables)
     out = {"stages": st.model_dump(), "lift_depth": cfg.lift.depth, "y1": y1, "y6": y6}
     if cfg.pose is not None:
-        out["pose"] = pose_settings(cfg, noise_seed, planned=ctx.run.meta.shake)
+        out["pose"] = pose_settings(cfg, noise_seed, planned=ctx.run.meta.shake,
+                                    cache=pose_cache_entry(cfg, open_pose_file(ctx, cfg)))
         out["pose_quality"] = pose_quality(
             [(p.key, [f.camera for f in p.frames], [p.cameras[f.idx] for f in p.frames]) for p in staged],
             ctx.layout, transforms, ref_pitch=cfg.pose.rig_ref if cfg.pose.rig else None,

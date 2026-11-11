@@ -19,8 +19,11 @@ its side) when a `pass_side_*` key is set and, without the rig, each pass draws 
 `pass_pitch_*` key is set. With a pose section, `pose.rig`, a `rig_extr_*` key set and a noise seed,
 each pitch other than the reference draws 7. With a noise seed and `noise.depth_k` set, each frame
 draws 9, drift camera key or not. Step 8 is not drawn: a time offset above 0 stops the run. Steps 10,
-11 and 14 have keys here and no draws. A key set to 0 draws like any other value, so configs that
-set the same keys share their draws.
+11 and 14 have keys here and no draws. Under pose.source=file the flows come from the pose file, so
+steps 5 and 12 are not drawn; each flow draws 6 (keyed by its side) under pose.anchor=nominal with a
+noise seed and a `pass_side_*` key set, each pass draws 13 without the rig with a noise seed and a
+`pass_pitch_*` key set, and 7 and 9 are drawn as above. A key set to 0 draws like any other value, so
+configs that set the same keys share their draws.
 """
 
 from __future__ import annotations

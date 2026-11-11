@@ -267,6 +267,24 @@ def _cache_identities(run_entries: list[dict]) -> list[dict]:
     return [found[key] for key in sorted(found)]
 
 
+def _pose_cache_identities(run_entries: list[dict]) -> list[dict]:
+    """The pose caches the results read, from the `pose.cache` of every rung and sweep cell.
+
+    One `{run_id, name, file, digest, vo_config_hash, opencv}` per (run_id, digest), in that order.
+    A result with no `pose` entry, or a `pose` entry with no `cache`, adds none.
+    """
+    found: dict[tuple[str, str], dict] = {}
+    for entry in run_entries:
+        run_id = entry["meta"]["run_id"]
+        for res in _cell_results(entry):
+            cache = (res.get("pose") or {}).get("cache")
+            if cache is not None:
+                found.setdefault((run_id, cache["digest"]), {
+                    "run_id": run_id, "name": cache["name"], "file": cache["file"], "digest": cache["digest"],
+                    "vo_config_hash": cache["vo_config_hash"], "opencv": cache["opencv"]})
+    return [found[key] for key in sorted(found)]
+
+
 def _same(values: list):
     """The value every entry of `values` shares, else None."""
     return values[0] if values and all(v == values[0] for v in values) else None
@@ -307,8 +325,9 @@ def _run_eval(
        `verdicts` (a ladder with criteria, plus the L5 `detection` rows and, with
        `cfg.verdict_subsets`, the `L5[<name>]` rows of `subset_verdicts`) and, for a ladder with
        rung L5, the checked error `budget` (`ladder_budget`), and write the experiment folder; the
-       digests of the detection caches the results name (`_cache_identities`) join the bundle
-       fingerprints, and the record lists them;
+       digests of the detection caches (`_cache_identities`) and of the pose caches
+       (`_pose_cache_identities`) the results name join the bundle fingerprints, and the record
+       lists them;
     8. under split=test, add a `test_log.csv` row, and warn when the log already lists a run
        with the same config hash and request (`extra`).
     Under `stages.det=oracle_noisy`, `eval run` prepares the bundle once per noise seed. A ladder
@@ -491,6 +510,12 @@ def _run_eval(
                         "weights_sha256": _same([c["weights_sha256"] for c in identities]),
                         "cache_sha256": identities[0]["digest"] if len(identities) == 1 else None,
                         "caches": identities, "pretrained": _same(pretrained)}
+        pose_ids = _pose_cache_identities(run_entries)
+        fingerprints += [c["digest"] for c in pose_ids]
+        for i, d in enumerate(data):
+            digests = [c["digest"] for c in pose_ids if c["run_id"] == d["run_id"]]
+            if digests:
+                data[i] = {**d, "pose_cache_digests": digests}
 
         code = protected.code if protected is not None else git_state()
         chash = config_hash(cfg)
@@ -532,7 +557,8 @@ def _run_eval(
                             "criteria_sha256": criteria_sha256}
         record = build_record(cfg=cfg, runs=data, code=code,
                               timings={"prepare": round(t_prepare, 3), "evaluate": round(t_score, 3)},
-                              started=started, finished=finished, extra=record_extra, detector=detector)
+                              started=started, finished=finished, extra=record_extra, detector=detector,
+                              pose_caches=pose_ids or None)
         out_root = Path(cfg.output_dir).expanduser()
         folder, reproduced = write_experiment(out_root, cfg=cfg, results=results, record=record, criteria=criteria)
 

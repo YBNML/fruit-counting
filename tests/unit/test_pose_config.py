@@ -95,6 +95,8 @@ CONTRADICTIONS = [
      "noise.gps_end_h_m and noise.gps_end_v_m go together"),
     ({"pose": {"rig_ref": 10, "fuse": "imu"}, "noise": {"gps_end_h_m": 0.0, "gps_end_v_m": 0.03}},
      "noise.gps_end_h_m must be > 0"),
+    ({"pose": {"source": "file", "cache": "vo", "caches": FILES}, "noise": {**VO}},
+     "noise.drift_step_trans_mm needs pose.source=truth; a file source takes its odometry from the pose file"),
 ]
 
 
@@ -117,6 +119,8 @@ SUPPORTED = [
                                          "stress_pair_keep": 0.5}}, False),
     ({"pose": {"rig": True, "rig_ref": 10, "fuse": "imu"}, "align": {"mode": ["tracks", "row_plane"]},
       "noise": {**VO, **START, **RIG, **IMU, **BELIEF, "gps_end_h_m": 0.02, "gps_end_v_m": 0.03}}, True),
+    ({"pose": {"source": "file", "cache": "vo", "caches": FILES},
+      "noise": {**START, "pass_pitch_trans_m": 0.02, "pass_pitch_rot_deg": 0.25, "depth_k": 0.0036}}, True),
 ]
 
 
