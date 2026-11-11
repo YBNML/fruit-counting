@@ -11,16 +11,24 @@ standstill (zero velocity at its two nodes, one pose held between them, and IMU 
 its end and from its end to the first frame node); for each camera and each of its pairs in order, the
 odometry of a used pair moved into the body through the believed camera-to-body extrinsic, X M X^-1
 (`body_motions`); with an IMU stream, a combined IMU factor between each two neighbouring frame nodes,
-preintegrating the measured samples over the pieces of `sample_spans`; and GPS fixes of body positions.
+preintegrating the measured samples over the pieces of `sample_spans` at a bias of the node the window
+starts from (below); and GPS fixes of body positions.
 
 Inputs. A drive holds node times, each camera's odometry and believed extrinsic, the measured IMU stream
 with the noise densities and bias sigmas the estimator assumes, the start pose prior with its sigmas, the
 start velocity prior and the GPS fixes. None of its fields holds a true pose, a frame position number or
 the position step.
 
+Solve. A Levenberg-Marquardt run with default parameters, from initial values that follow the cameras. With
+an IMU stream every window is first preintegrated from zero bias, and GTSAM moves a preintegration to
+another bias to first order only: a gyro turn-on bias of about 1 deg/s over a standstill of seconds is far
+outside that and tilts the start. So while the estimated bias of the start node of any window lies more
+than `REPREINTEGRATE_TOL` from the bias that window was preintegrated at, every window is preintegrated
+again at the estimated bias of its start node and the graph solved again from the last result, at most
+`REPREINTEGRATE_ROUNDS` times.
+
 gtsam is imported only inside `build_graph` and `fuse_drive`, so importing this module loads numpy and the
-standard library alone. One Levenberg-Marquardt run with default parameters, from initial values that
-follow the cameras, gives the same bytes for the same drive.
+standard library alone. The same drive gives the same bytes.
 """
 
 from __future__ import annotations
@@ -34,6 +42,9 @@ from counting.odometry.imufile import GRAVITY, ImuStream, sample_spans
 STILL_VELOCITY_SIGMA = 1e-3   # zero-velocity prior of a standstill node (m/s)
 STILL_POSE_SIGMA = 1e-4       # the pose held between the two standstill nodes (rad, m)
 INTEGRATION_SIGMA2 = 1e-8     # integration covariance of the IMU preintegration
+REPREINTEGRATE_ROUNDS = 3     # solves again at most, each with the IMU windows preintegrated at the estimate
+REPREINTEGRATE_TOL = (1e-3, 1e-4)   # bias move from a window's linearization point that solves again
+                                    # (accelerometer m/s^2, gyro rad/s)
 
 
 @dataclass(frozen=True, eq=False)
@@ -175,15 +186,26 @@ def _check(drive: VioDrive) -> list[list[tuple[int, float]]]:
     return []
 
 
-def build_graph(drive: VioDrive) -> tuple[gtsam.NonlinearFactorGraph, gtsam.Values, dict]:
+def _window_starts(drive: VioDrive) -> list[int]:
+    """The node at the start of each IMU window, in `_windows` order: the standstill nodes n and n + 1 when
+    there is a standstill, then the frame nodes 0 ... n - 2."""
+    n = len(drive.times)
+    return ([n, n + 1] if drive.standstill is not None else []) + list(range(n - 1))
+
+
+def build_graph(drive: VioDrive,
+                biases: dict | None = None) -> tuple[gtsam.NonlinearFactorGraph, gtsam.Values, dict]:
     """The factor graph, initial values and keys of `drive` (module docstring): checks, then factors, then
     initial values. The keys are {"poses": the keys X(0) ... X(n - 1), "standstill": the standstill node
-    numbers (n, n + 1), or None}.
+    numbers (n, n + 1), or None}. `biases` maps a node number to a GTSAM `ConstantBias`: each IMU window is
+    preintegrated at the bias of its start node (`_window_starts`); None preintegrates every window from
+    zero bias.
 
     Initial values: X(0) is `start`; X(k) is X(k - 1) times the body motion of the first camera that uses
     the pair (k - 1, k), else X(k - 1) times the motion before it (X(k - 2)^-1 X(k - 1)), and X(1) is X(0)
     when there is none. With an IMU stream, V(0) is `start_velocity`, V(k) the move from X(k - 1) to X(k)
-    over their time, every bias zero, and the standstill nodes take `start` and zero velocity.
+    over their time, every bias zero (whatever `biases` holds), and the standstill nodes take `start` and
+    zero velocity.
     """
     spans = _check(drive)
     import gtsam
@@ -203,7 +225,9 @@ def build_graph(drive: VioDrive) -> tuple[gtsam.NonlinearFactorGraph, gtsam.Valu
     graph.add(gtsam.PriorFactorPose3(X(0), gtsam.Pose3(start),
                                      Diagonal.Sigmas(np.asarray(drive.start_sigma, dtype=np.float64))))
     if imu is not None:
-        pims = [_preintegrate(gtsam, _imu_params(gtsam, imu), imu.stream, s) for s in spans]
+        params = _imu_params(gtsam, imu)
+        at = [None if biases is None else biases[k] for k in _window_starts(drive)]
+        pims = [_preintegrate(gtsam, params, imu.stream, s, b) for s, b in zip(spans, at)]
         bias_noise = Diagonal.Sigmas(np.array([imu.acc_b0] * 3 + [imu.gyro_b0] * 3, dtype=np.float64))
         graph.add(gtsam.PriorFactorConstantBias(B(n) if still else B(0), gtsam.imuBias.ConstantBias(), bias_noise))
         if not still:
@@ -273,22 +297,39 @@ def _imu_params(gtsam, imu: VioImu):
     return params
 
 
-def _preintegrate(gtsam, params, stream: ImuStream, spans: list[tuple[int, float]]):
-    """The combined preintegration from zero bias of the samples of `stream` over `spans`."""
-    pim = gtsam.PreintegratedCombinedMeasurements(params, gtsam.imuBias.ConstantBias())
+def _preintegrate(gtsam, params, stream: ImuStream, spans: list[tuple[int, float]], bias=None):
+    """The combined preintegration of the samples of `stream` over `spans`, linearized at `bias` (a GTSAM
+    `ConstantBias`; None is zero bias)."""
+    pim = gtsam.PreintegratedCombinedMeasurements(params, gtsam.imuBias.ConstantBias() if bias is None else bias)
     for j, h in spans:
         pim.integrateMeasurement(stream.acc[j], stream.gyro[j], h)
     return pim
 
 
 def fuse_drive(drive: VioDrive) -> np.ndarray:
-    """The fused body-to-world poses (n, 4, 4) float64 of the nodes of `drive`: one Levenberg-Marquardt run
-    with default parameters over `build_graph`. A gtsam failure raises `ValueError`."""
+    """The fused body-to-world poses (n, 4, 4) float64 of the nodes of `drive`: a Levenberg-Marquardt run
+    with default parameters over `build_graph`; with an IMU stream, while the estimated bias of any window's
+    start node moved more than `REPREINTEGRATE_TOL` (accelerometer, gyro; per axis) from the bias its window
+    was preintegrated at, one more run from the last result over the graph preintegrated at the estimated
+    biases, at most `REPREINTEGRATE_ROUNDS` more runs. A gtsam failure raises `ValueError`."""
     graph, values, keys = build_graph(drive)
     import gtsam
 
     try:
         result = gtsam.LevenbergMarquardtOptimizer(graph, values, gtsam.LevenbergMarquardtParams()).optimize()
+        if drive.imu is not None:
+            from gtsam.symbol_shorthand import B
+
+            nodes = _window_starts(drive)
+            at = {k: np.zeros(6) for k in nodes}   # the bias each window was preintegrated at (acc, then gyro)
+            for _ in range(REPREINTEGRATE_ROUNDS):
+                estimate = {k: result.atConstantBias(B(k)) for k in nodes}
+                moved = np.array([np.abs(estimate[k].vector() - at[k]) for k in nodes])
+                if moved[:, :3].max() <= REPREINTEGRATE_TOL[0] and moved[:, 3:].max() <= REPREINTEGRATE_TOL[1]:
+                    break
+                graph, _, keys = build_graph(drive, estimate)
+                result = gtsam.LevenbergMarquardtOptimizer(graph, result, gtsam.LevenbergMarquardtParams()).optimize()
+                at = {k: estimate[k].vector() for k in nodes}
     except RuntimeError as e:
         raise ValueError(f"the fusion graph of the drive is singular: {e}") from e
     return np.ascontiguousarray(np.stack([result.atPose3(key).matrix() for key in keys["poses"]]),

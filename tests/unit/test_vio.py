@@ -223,6 +223,25 @@ def test_standstill_window_adds_still_nodes():
             fuse_drive(_drive([cam], imu, start=line[0], times=tf, standstill=window))
 
 
+def test_standstill_gyro_turn_on_bias_does_not_tilt_the_start():
+    line = np.repeat(np.eye(4)[None], 31, axis=0)
+    line[:, 0, 3] = 0.15 * np.arange(31)
+    t, body, tf = straight_drive(line, AssumedMotion())
+    d = Drive(layout="rig", side="A", aisle=1, pitch_deg=None, t=t, body=body, source="straight_assumed")
+    cam = _camera(X10, bodies=line)
+    profile = ImuProfile(gyro_b0_dps=1.0)            # the gyro turn-on bias alone, drawn with 1 deg/s per axis
+    errors = {}
+    for seed in (0, 1, 2):
+        (stream,) = imu_session([d], profile, ImuSampling(), imu_seed=0, noise_seed=seed, scene=5)
+        imu = VioImu(stream=stream, **ESTIMATOR, gyro_b0=np.radians(1.0), acc_b0=4e-3 * GRAVITY)
+        for standstill in (None, (stream.t[0], stream.t[0] + 5.0)):
+            out = fuse_drive(_drive([cam], imu, start=line[0], start_sigma=NOMINAL, sigma=(2.1e-3, np.radians(0.039)),
+                                    times=tf, standstill=standstill))
+            errors[seed, standstill is not None] = (_tilt(out[0], line[0]), abs(out[-1, 2, 3] - line[-1, 2, 3]))
+    assert max(tilt for tilt, _ in errors.values()) < 0.05, errors      # deg, start tilt
+    assert max(height for _, height in errors.values()) < 0.01, errors  # m, end height
+
+
 def test_drive_inputs_are_checked():
     cam = _camera(X10)
     far = VioCamera(extrinsic=X10, pairs=np.array([[0, 37]]), motions=np.eye(4)[None], use=np.ones(1, bool))
