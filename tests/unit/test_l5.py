@@ -225,7 +225,7 @@ def test_eval_ladder_with_L5_records_the_cache(leaf_runs, caches, tmp_path):
     assert rec["detector"]["caches"] == [{"run_id": rid, "file": f"{rid}.npz", "digest": digest, "weights_sha256": None}]
     assert rec["data"][0]["cache_digests"] == [digest] and rec["extra"]["detectors"] == ["cached", "oracle"]
     assert "L5: row U=28 G6=12" in r.output
-    assert res["schema_version"] == 8 and res["detection"]["rung"] == "L5"
+    assert res["schema_version"] == 9 and res["detection"]["rung"] == "L5"
     assert res["detection"]["thresholds"] == {"operating": 0.5, "low": 0.1}
     assert res["detection"]["postprocess"] == {"nms_iou": 0.5, "edge_snap_px": 2.0, "min_short_px": 0.0}
     det_rows = res["verdicts"]["detection"]

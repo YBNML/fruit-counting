@@ -9,12 +9,14 @@ The cache holds every pass's poses relative to the pass's first cached frame. Th
 pass's start comes from the caller; this module reads no truth, frame pose or planned pose. A pass's
 camera-to-world pose of frame idx is `start @ rel_c2w[row of idx]`, so the anchor frame (the first
 cached frame of the pass) gets `start` itself. A frame missing from the cache raises `ValueError`
-naming the cache path, the frame idx and the pass; no other pose stands in for it.
+naming the cache path, the frame idx and the pass; no other pose stands in for it. `odometry` hands
+over a pass's rows as they are (frame idx, relative poses and the pair flags), as read-only copies.
 """
 
 from __future__ import annotations
 
 from collections.abc import Sequence
+from dataclasses import fields
 from pathlib import Path
 
 import numpy as np
@@ -60,6 +62,17 @@ class PoseFile:
     def anchor(self, code: tuple[int, int, int]) -> int:
         """The frame idx of the pass's first cached frame, whose pose is the start."""
         return int(self._pass(code).idx[0])
+
+    def odometry(self, code: tuple[int, int, int]) -> PassOdometry:
+        """The pass's rows as cached: frame idx ascending, the relative poses and the pair values `inliers`,
+        `failed` and `prior`; every array a read-only copy."""
+        p = self._pass(code)
+        arrays = {}
+        for f in fields(PassOdometry):
+            arr = getattr(p, f.name).copy()
+            arr.flags.writeable = False
+            arrays[f.name] = arr
+        return PassOdometry(**arrays)
 
     def idxs(self, code: tuple[int, int, int]) -> np.ndarray:
         """The pass's cached frame idx, ascending (a copy)."""

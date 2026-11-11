@@ -293,6 +293,37 @@ def _pose_cache_identities(run_entries: list[dict]) -> list[dict]:
     return [found[key] for key in sorted(found)]
 
 
+def _imu_file_identities(run_entries: list[dict]) -> list[dict]:
+    """The IMU files the results read, from the `pose.imu` of every rung and sweep cell whose `source` is
+    `file`.
+
+    One `{run_id, name, file, digest, profile}` per (run_id, digest), in that order. A result with no
+    `pose` entry, or with IMU streams made in memory or none, adds none.
+    """
+    found: dict[tuple[str, str], dict] = {}
+    for entry in run_entries:
+        run_id = entry["meta"]["run_id"]
+        for res in _cell_results(entry):
+            imu = (res.get("pose") or {}).get("imu")
+            if imu is not None and imu["source"] == "file":
+                found.setdefault((run_id, imu["digest"]), {
+                    "run_id": run_id, "name": imu["name"], "file": imu["file"], "digest": imu["digest"],
+                    "profile": imu["profile"]})
+    return [found[key] for key in sorted(found)]
+
+
+def _fusion_identity(run_entries: list[dict]) -> dict | None:
+    """The fusion the results ran, from the `pose.fusion` of every rung and sweep cell, or None when none
+    was fused: `{gtsam, fuse_fixed_sha256}`, the gtsam version they share (None when they differ) and the
+    sorted distinct sha256s of the fixed fusion settings."""
+    fusions = [f for entry in run_entries for res in _cell_results(entry)
+               if (f := (res.get("pose") or {}).get("fusion")) is not None]
+    if not fusions:
+        return None
+    return {"gtsam": _same([f["gtsam"] for f in fusions]),
+            "fuse_fixed_sha256": sorted({f["fuse_fixed_sha256"] for f in fusions})}
+
+
 def _same(values: list):
     """The value every entry of `values` shares, else None."""
     return values[0] if values and all(v == values[0] for v in values) else None
@@ -333,15 +364,18 @@ def _run_eval(
        `verdicts` (a ladder with criteria, plus the L5 `detection` rows and, with
        `cfg.verdict_subsets`, the `L5[<name>]` rows of `subset_verdicts`) and, for a ladder with
        rung L5, the checked error `budget` (`ladder_budget`), and write the experiment folder; the
-       digests of the detection caches (`_cache_identities`) and of the pose caches
-       (`_pose_cache_identities`) the results name join the bundle fingerprints, and the record
-       lists them;
+       digests of the detection caches (`_cache_identities`), of the pose caches
+       (`_pose_cache_identities`) and of the IMU files (`_imu_file_identities`) the results name,
+       and the sha256 of each fixed fusion settings file they ran with (`_fusion_identity`), join
+       the bundle fingerprints, and the record lists them (`fusion` with the gtsam version and the
+       CPU count);
     8. under split=test, add a `test_log.csv` row, and warn when the log already lists a run
        with the same config hash and request (`extra`).
     Under `stages.det=oracle_noisy`, `eval run` prepares the bundle once per noise seed. A ladder
     prepares a second context for the rungs that change the detections (`run_ladder`'s `context_for`).
     """
     import hashlib
+    import os
     import time
     from datetime import datetime, timezone
     from pathlib import Path
@@ -524,6 +558,18 @@ def _run_eval(
             digests = [c["digest"] for c in pose_ids if c["run_id"] == d["run_id"]]
             if digests:
                 data[i] = {**d, "pose_cache_digests": digests}
+        imu_ids = _imu_file_identities(run_entries)
+        fingerprints += [c["digest"] for c in imu_ids]
+        for i, d in enumerate(data):
+            digests = [c["digest"] for c in imu_ids if c["run_id"] == d["run_id"]]
+            if digests:
+                data[i] = {**d, "imu_file_digests": digests}
+        fusion = None
+        identity = _fusion_identity(run_entries)
+        if identity is not None:
+            fingerprints += identity["fuse_fixed_sha256"]
+            fusion = {"gtsam": identity["gtsam"], "cpus": os.cpu_count(),
+                      "fuse_fixed_sha256": identity["fuse_fixed_sha256"]}
 
         code = protected.code if protected is not None else git_state()
         chash = config_hash(cfg)
@@ -566,7 +612,7 @@ def _run_eval(
         record = build_record(cfg=cfg, runs=data, code=code,
                               timings={"prepare": round(t_prepare, 3), "evaluate": round(t_score, 3)},
                               started=started, finished=finished, extra=record_extra, detector=detector,
-                              pose_caches=pose_ids or None)
+                              pose_caches=pose_ids or None, imu_files=imu_ids or None, fusion=fusion)
         out_root = Path(cfg.output_dir).expanduser()
         folder, reproduced = write_experiment(out_root, cfg=cfg, results=results, record=record, criteria=criteria)
 

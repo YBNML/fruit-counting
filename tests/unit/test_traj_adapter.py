@@ -16,8 +16,8 @@ from counting.evaluation.cli import eval_app
 from counting.evaluation.posesource import model_cameras, pose_settings
 from counting.evaluation.runner import evaluate, prepare
 from counting.evaluation.truth import check_rig, check_trajectory
-from counting.geometry.noise import STEP_START, seeded_rigid, side_code
-from counting.geometry.rig import body_from_reference, pitch_extrinsic, pose_matrix
+from counting.geometry.noise import STEP_START, STEP_TIME, pass_key_code, seeded_rigid, side_code, time_offset
+from counting.geometry.rig import body_from_reference, interpolate_pose, pitch_extrinsic, pose_matrix
 from tests.unit.synthfake import fake_cfg, load_splits, robot_matrix, write_run
 from tests.unit.test_drift import D_EXT_VO, ZERO_DRIFT, _passes
 from tests.unit.test_leak import ALLOWED
@@ -316,8 +316,22 @@ def test_pose_settings_name_the_planned_start(shake_run, shake_ctx):
     assert min(p["start"]["pos_m"] for p in res["pose_quality"]["passes"]) > 1e-3
 
 
-def test_time_offset_still_stops_on_shake_bundles(shake_run):
+def test_time_offset_shifts_the_flow_on_shake_bundles(shake_run):
     run = SynthRun.open(shake_run)
-    cfg = fake_cfg(shake_run, "apple", "pose.rig_ref=30", *D_EXT_VO, "noise.drift_time_offset_s=0.01")
-    with pytest.raises(ValueError, match="noise.drift_time_offset_s > 0 is not supported"):
-        model_cameras(run.frames, _passes(run, cfg), cfg, 0, scene=5, base_step_m=0.15, plans=run.plans())
+    plans = run.plans()
+    sets = ("pose.rig=true", "pose.rig_ref=30", "pose.anchor=first_truth")
+    cfg = fake_cfg(shake_run, "apple", *sets, "noise.drift_time_offset_s=0.1")
+    cams = model_cameras(run.frames, _passes(run, cfg), cfg, 0, scene=5, base_step_m=0.15, plans=plans)
+    for side in "AB":
+        refs = sorted((f for f in run.frames if f.pass_key.side == side and f.pass_key.pitch_deg == 30.0),
+                      key=lambda f: f.idx)
+        t = np.array([plans[f.idx].t for f in refs])
+        body = np.stack([_body(f.camera, 30.0) for f in refs])
+        dt = time_offset((0, 0, STEP_TIME, 5, *pass_key_code(refs[0].pass_key)), 0.1)
+        for k, f in enumerate(refs):
+            want = interpolate_pose(t, body, t[k] + dt) @ pitch_extrinsic(30.0)
+            np.testing.assert_allclose(pose_matrix(cams[f.pass_key][f.idx]), want, rtol=0, atol=1e-9)
+    zero = fake_cfg(shake_run, "apple", "pose.rig_ref=30", "pose.anchor=first_truth", "noise.drift_time_offset_s=0",
+                    "noise.depth_rel_sigma=0.02")                       # without the rig a flat flow keeps the frames' cameras
+    flat = model_cameras(run.frames, _passes(run, zero), zero, 0, scene=5, base_step_m=0.15, plans=plans)
+    assert all(flat[key][f.idx] is f.camera for key, frames in _passes(run, zero).items() for f in frames)

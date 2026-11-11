@@ -99,6 +99,17 @@ counting eval detmetrics --config configs/eval/apple_val.yaml --cache runs/detec
 counting eval ladder --config configs/eval/apple_val.yaml --ladder configs/eval/sweeps/ladder_l5.yaml --set detector.cache=runs/detect/<가중치 sha256 앞 16자>
 ```
 
+자세 출처를 바꿔 끼우는 실험(평가 설정의 `pose` 절)에 쓰는 파일은 다음 두 명령으로 만든다. 둘 다 묶음마다 한 번만 쓰고(파일이 이미 있으면 멈춘다) test 분할 묶음은 받지 않는다.
+
+```bash
+counting pose vo --config configs/pose/vo.yaml --run <bundle> [--run <bundle> ...]
+counting pose imu --config <IMU 프로필 YAML> --run <bundle> [--run <bundle> ...]
+```
+
+- `pose vo`는 렌더 RGB-D 위 프레임 대 프레임 시각 주행거리로 묶음마다 자세 캐시를 `<output_dir>/<설정 해시 앞 16자>/<run_id>.npz`에 쓴다.
+- `pose imu`는 흔들림 렌더 묶음의 기록된 몸체 궤적(그 밖의 묶음은 가정한 등속 직선)에서 잡음 섞인 200 Hz 모의 IMU를 만들어 같은 꼴의 폴더에 IMU 파일로 쓴다. 흰 잡음이나 켤 때 치우침이 0인 프로필은 받지 않는다.
+- 평가 설정의 `pose.fuse: imu`(시각 주행거리와 IMU를 주행마다 한 그래프로 푸는 결합)와 `pose.fuse: vo`는 conda-forge `gtsam`(환경 파일에 들어 있음)과 결합 고정값 파일 `configs/pose/fuse_fixed.yaml`이 있어야 돈다.
+
 test 분할은 `configs/eval/frozen/`에 커밋된 설정으로만 돈다. `--set`·`--run`을 받지 않고, 작업 트리가 깨끗해야 하며, 캐시를 쓰는 칸은 고정 설정에 캐시 digest가 박혀 있어야 하고 그 digest가 `counting detect`의 기록과 맞아야 한다(캐시 칸의 검출기·추적기 설정도 고정 설정 그대로다). 한 번 돌 때마다 `runs/eval/test_log.csv`에 한 줄이 남는다.
 
 결과는 `<output_dir>/<run_name>/<experiment_id>/` 폴더에 `results.json`, `config.yaml`, `record.json`, `report.md`, `per_pass.csv`, `per_tree.csv`(사다리나 단일 실행)·`sweep.csv`(격자), 그리고 학습 검출기 칸을 채점한 사다리라면 `budget.csv`가 함께 생긴다. 같은 실험 id를 다시 돌리면 `results.json`이 바이트 단위로 같아야 하고, 다르면 거부되며 아무 파일도 덮어쓰지 않는다.

@@ -258,7 +258,8 @@ def test_file_source_start_rig_and_pitch_errors(apple_run, tmp_path, monkeypatch
 def test_file_source_stops_before_running(apple_run, tmp_path):
     base = ("pose.source=file", "pose.cache=vo", f"pose.caches.vo.dir={tmp_path}")
     check_pose_supported(fake_cfg(apple_run, "apple", *base))
-    for sets, message in ((("pose.fuse=vo",), "pose.fuse=vo is not supported"),
+    for sets, message in ((("pose.fuse=vo", "split=test", "tuning=false"),
+                           "pose.fuse=vo with split=test is not supported"),
                           (("noise.drift_time_offset_s=0.01",),
                            "noise.drift_time_offset_s > 0 with pose.source=file is not supported"),
                           (("split=test", "tuning=false"), "pose.source=file with split=test is not supported")):
@@ -350,7 +351,7 @@ def test_eval_run_names_the_pose_cache(leaf_runs, tmp_path):
     res = json.loads((d / "results.json").read_text(encoding="utf-8"))
     rec = json.loads((d / "record.json").read_text(encoding="utf-8"))
     entry = {"name": "truth", "file": path.name, "digest": digest, "vo_config_hash": None, "opencv": None}
-    assert res["schema_version"] == 8 and res["runs"][0]["rungs"]["run"]["pose"]["cache"] == entry
+    assert res["schema_version"] == 9 and res["runs"][0]["rungs"]["run"]["pose"]["cache"] == entry
     assert rec["pose_caches"] == [{"run_id": run.meta.run_id, **entry}]
     assert rec["data"][0]["pose_cache_digests"] == [digest]
     lines = (d / "report.md").read_text(encoding="utf-8").splitlines()

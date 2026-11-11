@@ -40,6 +40,9 @@ RMS sqrt(2 / VIB_SINES), and a gyro axis also takes `VIB_G_SENSITIVITY_DPS_PER_G
 of the same accelerometer axis in g. A measurement is the truth plus bias, temperature drift, white
 noise and vibration, added in that order, with the specific force clipped to the accelerometer range.
 
+GPS (`gps_end_fixes`). A row-end fix is a true body position plus one unit normal per axis from the
+generator of its end's key, times the horizontal sigma on x and y and the vertical sigma on z.
+
 The formulas are public ones: central differences here, the Kalibr discretization for noise densities.
 """
 
@@ -219,29 +222,48 @@ def _straight_side(run: SynthRun, side: str, motion: AssumedMotion):
     return pitch, frames, straight_drive(bodies, motion)
 
 
-def session_drives(run: SynthRun, layout: str, motion: AssumedMotion) -> list[Drive]:
-    """The drives of the session of `run` in `layout` order: per side (A, B) for `rig`, per pitch of the
-    bundle (ascending) and then side for `pass`. A shake bundle rides its recorded trajectories, a
-    straight bundle the assumed drive of each side (`straight_drive` under `motion`)."""
+def drive_keys(run: SynthRun, layout: str) -> list[tuple[str, int, float | None]]:
+    """The (side, aisle, pitch) of every drive of the session of `run`, in `session_drives` order: per side
+    (A, B) with pitch None for `rig`, per pitch of the bundle (ascending) and then side for `pass`. Reads
+    no trajectory."""
     if layout not in imufile.LAYOUTS:
         raise ValueError(f"unknown IMU layout {layout!r}")
-    rides = {}   # side -> (aisle, t, body, source)
-    for side, aisle in _side_aisles(run).items():
-        if run.meta.shake:
-            trajectory = run.trajectory(side)
-            rides[side] = (aisle, trajectory.t, trajectory.body_poses(), "recorded")
-        else:
-            _, _, (t, body, _) = _straight_side(run, side, motion)
-            rides[side] = (aisle, t, body, "straight_assumed")
+    aisles = _side_aisles(run)
     if layout == "rig":
-        return [Drive(layout="rig", side=side, aisle=aisle, pitch_deg=None, t=t, body=body, source=source)
-                for side, (aisle, t, body, source) in rides.items()]
+        return [(side, aisle, None) for side, aisle in aisles.items()]
     pitches: list[float] = []
     for q in sorted(f.pass_key.pitch_deg for f in run.frames):
         if not pitches or q - pitches[-1] > _PITCH_TOL_DEG:
             pitches.append(q)
-    return [Drive(layout="pass", side=side, aisle=aisle, pitch_deg=q, t=t, body=body, source=source)
-            for q in pitches for side, (aisle, t, body, source) in rides.items()]
+    return [(side, aisle, q) for q in pitches for side, aisle in aisles.items()]
+
+
+def session_drives(run: SynthRun, layout: str, motion: AssumedMotion) -> list[Drive]:
+    """The drives of the session of `run` in `layout` order (`drive_keys`). A shake bundle rides its
+    recorded trajectories, a straight bundle the assumed drive of each side (`straight_drive` under
+    `motion`); the drives of one side share its body."""
+    keys = drive_keys(run, layout)
+    rides = {}   # side -> (t, body, source)
+    for side in dict.fromkeys(side for side, _, _ in keys):
+        if run.meta.shake:
+            trajectory = run.trajectory(side)
+            rides[side] = (trajectory.t, trajectory.body_poses(), "recorded")
+        else:
+            _, _, (t, body, _) = _straight_side(run, side, motion)
+            rides[side] = (t, body, "straight_assumed")
+    return [Drive(layout=layout, side=side, aisle=aisle, pitch_deg=q, t=rides[side][0], body=rides[side][1],
+                  source=rides[side][2]) for side, aisle, q in keys]
+
+
+def gps_end_fixes(key: Sequence[int], first: np.ndarray, last: np.ndarray, sigma_h: float,
+                  sigma_v: float) -> tuple[np.ndarray, np.ndarray]:
+    """The row-end GPS fixes (3,) of the body positions `first` and `last` (world, m): end e (0 for the
+    first, 1 for the last) adds one unit normal per axis from `noise_rng(*key, e)` times (`sigma_h`,
+    `sigma_h`, `sigma_v`)."""
+    scale = np.array([sigma_h, sigma_h, sigma_v], dtype=np.float64)
+    fixes = [np.asarray(p, dtype=np.float64) + noise_rng(*key, e).standard_normal(3) * scale
+             for e, p in enumerate((first, last))]
+    return fixes[0], fixes[1]
 
 
 def frame_times(run: SynthRun, motion: AssumedMotion) -> dict[int, float]:

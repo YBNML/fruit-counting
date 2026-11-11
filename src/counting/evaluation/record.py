@@ -104,13 +104,16 @@ def request_extra(
 def build_record(
     *, cfg: EvalAppConfig, runs: Sequence[dict], code: dict, timings: dict, started: str, finished: str,
     extra: dict | None = None, detector: dict | None = None, pose_caches: Sequence[dict] | None = None,
+    imu_files: Sequence[dict] | None = None, fusion: dict | None = None,
 ) -> dict:
     """Assemble a `record.json` payload. Carries no machine name.
 
     `detector` (the CLI's account of the detection caches it scored) replaces the
     default `detector` entry, which names `cfg.stages.det` and its noise. `pose_caches`
     (the CLI's list of the pose caches the results read) adds a `pose_caches` entry;
-    without it the record has none.
+    without it the record has none. Likewise `imu_files` (the IMU files the results
+    read) adds an `imu_files` entry and `fusion` (the gtsam version, the CPU count and
+    the sha256 of each fixed fusion settings file the results ran with) a `fusion` entry.
     """
     if detector is None:
         detector = {"name": cfg.stages.det,
@@ -130,4 +133,8 @@ def build_record(
     }
     if pose_caches is not None:
         record["pose_caches"] = list(pose_caches)
+    if imu_files is not None:
+        record["imu_files"] = list(imu_files)
+    if fusion is not None:
+        record["fusion"] = fusion
     return record

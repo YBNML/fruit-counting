@@ -31,6 +31,8 @@ from counting.data.formats.orchard_synth import (
 from counting.detection.base import Detections
 from counting.detection.cached import CachedDetector, cache_path
 from counting.detection.oracle import OracleDetector
+from counting.evaluation import fusion as fusion_mod
+from counting.evaluation.fusion import FusionInputs
 from counting.evaluation.ledger import Ledger, UnitView, build_ledger, combine
 from counting.evaluation.match import match_frame, unit_majority
 from counting.evaluation.oracle_stages import (
@@ -38,7 +40,7 @@ from counting.evaluation.oracle_stages import (
 )
 from counting.evaluation.posequality import apply_rigid, fit_truth_rigid, pose_quality
 from counting.evaluation.posesource import (
-    check_pose_supported, model_cameras, pose_cache_entry, pose_settings, rig_errors,
+    check_pose_supported, drift_active, model_cameras, pose_cache_entry, pose_settings, rig_errors,
 )
 from counting.evaluation.seeds import combine_seeds
 from counting.evaluation.truth import (
@@ -54,6 +56,7 @@ from counting.multiview.assign import assign_trees, in_target_row
 from counting.multiview.dedup import dedup, repair_pass
 from counting.multiview.lift import box_far_depth, box_median_depth, lift_points
 from counting.odometry.cache import pose_cache_path
+from counting.odometry.imufile import ImuFile, imu_file_path
 from counting.tracking.landmark import PassTracks, track_pass
 
 VARIANTS = ("count1", "any", "strict")
@@ -79,6 +82,7 @@ class RunContext:
     (`file`, `digest`, and the cache meta's `weights_sha256` and `pretrained`,
     None when the meta has none); it is None otherwise.
     `_pose_files` holds the pose caches `open_pose_file` opened, by (path, pinned digest or None).
+    `_imu_files` holds the IMU files `open_imu_file` opened, by (path, pinned digest or None, config seed).
     """
 
     run: SynthRun
@@ -93,6 +97,7 @@ class RunContext:
     _frame_of: dict[int, FrameInput] = field(init=False, repr=False)
     _box_depth: dict[tuple, np.ndarray] = field(default_factory=dict, init=False, repr=False)
     _pose_files: dict[tuple[str, str | None], PoseFile] = field(default_factory=dict, init=False, repr=False)
+    _imu_files: dict[tuple[str, str | None, int], ImuFile] = field(default_factory=dict, init=False, repr=False)
 
     def __post_init__(self) -> None:
         self._frame_of = {f.idx: f for frames in self.passes.values() for f in frames}
@@ -214,6 +219,35 @@ def open_pose_file(ctx: RunContext, cfg: EvalAppConfig) -> PoseFile | None:
     if key not in ctx._pose_files:
         ctx._pose_files[key] = PoseFile(path, fingerprint=run.meta.fingerprint, run_id=run_id, digest=pin)
     return ctx._pose_files[key]
+
+
+def open_imu_file(ctx: RunContext, cfg: EvalAppConfig) -> ImuFile | None:
+    """The IMU file of `ctx`'s bundle under `pose.source=file` with `pose.fuse=imu`, opened once per context;
+    None otherwise.
+
+    The folder is `pose.imu_files[pose.imu].dir` and the file `imu_file_path(dir, run_id)`; a missing one
+    raises `FileNotFoundError`, and with that IMU file set's `digests` set a run it does not pin raises
+    `ValueError`, both before the file is read. `ImuFile` then checks the bundle fingerprint, the run id,
+    with `digests` the pinned content digest, the file's `imu_seed` against `cfg.seed` and the profile
+    (`ValueError` naming the file path). The opened file is kept in the context by (path, pinned digest or
+    None, `cfg.seed`).
+    """
+    pose = cfg.pose
+    if pose is None or pose.source != "file" or pose.fuse != "imu":
+        return None
+    run, name = ctx.run, pose.imu
+    files, run_id = pose.imu_files[name], run.meta.run_id
+    path = imu_file_path(Path(files.dir).expanduser(), run_id)
+    if not path.is_file():
+        raise FileNotFoundError(f"{path}: no IMU file for this bundle")
+    if files.digests and run_id not in files.digests:
+        raise ValueError(f"{run.root}: pose.imu_files.{name}.digests pins no IMU file for run {run_id}")
+    pin = files.digests.get(run_id)
+    key = (str(path), pin, cfg.seed)
+    if key not in ctx._imu_files:
+        ctx._imu_files[key] = ImuFile(path, fingerprint=run.meta.fingerprint, run_id=run_id, digest=pin,
+                                      imu_seed=cfg.seed)
+    return ctx._imu_files[key]
 
 
 def _match_by_score(dets, recs, score_hi, prefer):
@@ -378,21 +412,25 @@ class _PassTrack:
     depth_err: dict | None
 
 
-def _track_passes(ctx: RunContext, cfg: EvalAppConfig, noise_seed: int | None) -> list[_PassTrack]:
+def _track_passes(ctx: RunContext, cfg: EvalAppConfig, noise_seed: int | None, *,
+                  fusion: FusionInputs | None = None) -> list[_PassTrack]:
     """Lift and track every pass of `ctx`, in `ctx.passes` order (the first stage of `evaluate`).
 
-    Each frame starts from the camera of the pose source (`model_cameras`: the rig and the drift
-    model under `cfg.pose`, or the pose cache of `open_pose_file` under `pose.source=file`), or
-    from its true camera when that gives None. With `noise_seed`, a pass's bias is drawn before
-    its frames, and each frame's camera then gets `Camera.perturbed`, then its chosen depth
-    `perturb_depth` (after the depth error is taken) and, with `noise.depth_k` set,
-    `depth_k_noise` on the depth before noise. The lift and the tracker use these cameras;
-    `track_pass` runs once per pass on the frames that carry them.
+    Each frame starts from the camera of the pose source (`model_cameras`: the rig, the drift
+    model and the fusion under `cfg.pose`, or the pose cache of `open_pose_file` under
+    `pose.source=file`), or from its true camera when that gives None. The fusion takes `fusion`,
+    or without it the bundle's `fusion_inputs` (with the IMU file of `open_imu_file`; None without
+    fusion). With `noise_seed`, a pass's bias is drawn before its frames, and each frame's camera then
+    gets `Camera.perturbed`, then its chosen depth `perturb_depth` (after the depth error is taken)
+    and, with `noise.depth_k` set, `depth_k_noise` on the depth before noise. The lift and the tracker
+    use these cameras; `track_pass` runs once per pass on the frames that carry them.
     """
     st, scene, nz = cfg.stages, ctx.run.meta.seed, cfg.noise
+    if fusion is None:
+        fusion = fusion_mod.fusion_inputs(ctx.run, cfg, noise_seed, imu_file=open_imu_file(ctx, cfg))
     cams = model_cameras(ctx.run.frames, ctx.passes, cfg, noise_seed, scene=scene,
                          base_step_m=ctx.run.meta.base_step_m, plans=ctx.run.plans(),
-                         pose_file=open_pose_file(ctx, cfg))
+                         pose_file=open_pose_file(ctx, cfg), fusion=fusion)
     out: list[_PassTrack] = []
     for key, frames in ctx.passes.items():
         bias = None if noise_seed is None else pass_bias(
@@ -515,12 +553,18 @@ def evaluate(ctx: RunContext, cfg: EvalAppConfig, *, subsets: bool = False, nois
     The tracker and the lift use the cameras of the pose source, `model_cameras`:
     the rig and the drift model under `cfg.pose` (under `pose.source=file`, the
     pose cache that `open_pose_file` opens once per context), else the true
-    cameras. With `noise_seed`, every such camera gets `Camera.perturbed`, and
+    cameras. The fusion inputs (`fusion_inputs`: the fixed settings, frame
+    times and IMU streams, under `pose.source=file` from the IMU file that
+    `open_imu_file` opens once per context; None without fusion) are made once
+    per call and handed to `_track_passes`. With `noise_seed`, every such camera gets `Camera.perturbed`, and
     every chosen depth gets `perturb_depth` (and, with `noise.depth_k`,
     `depth_k_noise`) after `depth_err` is taken; scoring always uses the truth.
     With a pose section the result also has `pose` (`pose_settings`; its `cache`
-    is `pose_cache_entry` of the pose cache read, None under `pose.source=truth`)
-    and `pose_quality` (`pose_quality` of the cameras the lift and the tracker used
+    is `pose_cache_entry` of the pose cache read, None under `pose.source=truth`,
+    its `imu` the fusion inputs' `imu` and its `fusion` `fusion_entry`, both None
+    without fusion; its start is planned on a bundle rendered with body shake
+    under a file source or the drift model) and `pose_quality` (`pose_quality`
+    of the cameras the lift and the tracker used
     against the true cameras, with the alignment transforms; under `pose.rig`
     the in-pass drift and RPE are measured in the frame of the reference camera
     `pose.rig_ref`, with the rig calibration errors of the passes' pitches).
@@ -538,7 +582,8 @@ def evaluate(ctx: RunContext, cfg: EvalAppConfig, *, subsets: bool = False, nois
     if subsets and cfg.stop_after == "y1":
         raise ValueError("--subsets needs stop_after=y6")
     st = cfg.stages
-    staged = _track_passes(ctx, cfg, noise_seed)
+    inputs = fusion_mod.fusion_inputs(ctx.run, cfg, noise_seed, imu_file=open_imu_file(ctx, cfg))
+    staged = _track_passes(ctx, cfg, noise_seed, fusion=inputs)
     aligned, transforms = _align_passes(ctx, cfg, staged)
     passes_out, ledgers = [], []
     stages: list[_PassStage] = []
@@ -564,8 +609,10 @@ def evaluate(ctx: RunContext, cfg: EvalAppConfig, *, subsets: bool = False, nois
         y6 = _y6(ctx, cfg, stages, ctx.tables)
     out = {"stages": st.model_dump(), "lift_depth": cfg.lift.depth, "y1": y1, "y6": y6}
     if cfg.pose is not None:
-        out["pose"] = pose_settings(cfg, noise_seed, planned=ctx.run.meta.shake,
-                                    cache=pose_cache_entry(cfg, open_pose_file(ctx, cfg)))
+        planned = ctx.run.meta.shake and (cfg.pose.source == "file" or drift_active(cfg, noise_seed))
+        out["pose"] = pose_settings(cfg, noise_seed, planned=planned,
+                                    cache=pose_cache_entry(cfg, open_pose_file(ctx, cfg)),
+                                    imu=inputs.imu if inputs else None, fusion=fusion_mod.fusion_entry(cfg, inputs))
         out["pose_quality"] = pose_quality(
             [(p.key, [f.camera for f in p.frames], [p.cameras[f.idx] for f in p.frames]) for p in staged],
             ctx.layout, transforms, ref_pitch=cfg.pose.rig_ref if cfg.pose.rig else None,

@@ -22,7 +22,7 @@ pytestmark = pytest.mark.pose
 
 SPLITS = str(Path(__file__).resolve().parents[2] / "configs" / "eval" / "splits.yaml")
 POSE_LADDER = {"rungs": {"L3": {"stages": {"track": "landmark", "center": "measured", "assign": "grid"}},
-                         "L4_drift": {"pose": {"rig": True, "fuse": "imu"}}}}
+                         "L4_drift": {"pose": {"rig": True, "fuse": "imu"}, "align": {"mode": ["tracks", "row_plane"]}}}}
 
 POSE_DEPTH = ("noise.pose_trans_sigma_m=0.02", "noise.pose_rot_sigma_deg=0.5", "noise.pass_bias_m=0.02",
               "noise.depth_rel_sigma=0.02", "noise.depth_dropout=0.05")
@@ -134,7 +134,7 @@ def test_pose_section_adds_pose_entries(apple_run, ctx_of):
     assert res["pose"] == {"config": None, "source": "truth", "drift": False, "anchor": "nominal", "start": None,
                            "rig": False, "rig_ref": 30.0, "fuse": "none", "align": "none", "predict": "pose",
                            "dedup": "merge", "dedup_radius_m": 0.04, "dedup_band_m": 0.1, "gate_px_frac": 0.5,
-                           "cache": None}
+                           "cache": None, "imu": None, "fusion": None}
     assert set(res["pose_quality"]) == {"rpe", "passes", "summary", "interpass"}
     drift = evaluate(ctx, fake_cfg(apple_run, "apple", "pose.rig_ref=30", *D_EXT_VO), noise_seed=0)["pose"]
     assert drift["drift"] is True and drift["start"] == "nominal_from_first_frame"
@@ -182,12 +182,13 @@ def test_fit_truth_pass_takes_out_start_errors(apple_run, ctx_of):
 def test_unsupported_pose_settings_stop_before_any_rung_runs(apple_run, ctx_of, monkeypatch):
     with pytest.raises(NotImplementedError, match="align.mode=tracks,row_plane is not supported"):
         evaluate(ctx_of["apple"], fake_cfg(apple_run, "apple", "pose.rig_ref=30", "align.mode=[tracks,row_plane]"))
-    with pytest.raises(NotImplementedError, match="pose.fuse=imu is not supported"):
-        evaluate(ctx_of["apple"], fake_cfg(apple_run, "apple", "pose.rig_ref=30", "pose.fuse=imu"))
+    with pytest.raises(NotImplementedError, match="pose.fuse=imu with split=test is not supported"):
+        evaluate(ctx_of["apple"], fake_cfg(apple_run, "apple", "pose.rig_ref=30", "pose.fuse=imu", "split=test",
+                                           "tuning=false"))
     calls = []
     monkeypatch.setattr(runner_module, "evaluate", lambda *args, **kwargs: calls.append(args))
     cfg = fake_cfg(apple_run, "apple", "pose.rig_ref=30")
-    with pytest.raises(NotImplementedError, match="pose.fuse=imu is not supported"):
+    with pytest.raises(NotImplementedError, match="align.mode=tracks,row_plane is not supported"):
         run_ladder(ctx_of["apple"], cfg, POSE_LADDER, ["L3", "L4_drift"])
     assert len(calls) == 0
 
@@ -212,5 +213,5 @@ def test_eval_refuses_unsupported_pose_rungs_before_opening_bundles(apple_run, t
     res = CliRunner().invoke(eval_app, ["ladder", "--config", str(cfg), "--ladder", str(ladder),
                                         "--rungs", "L3,L4_drift", "--splits", SPLITS])
     assert res.exit_code == 2, res.output
-    assert "error: pose.fuse=imu is not supported" in res.output
+    assert "error: align.mode=tracks,row_plane is not supported" in res.output
     assert opened == [] and not (tmp_path / "out").exists()

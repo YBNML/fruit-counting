@@ -176,7 +176,7 @@ def test_eval_ladder_runs_the_supported_pose_rungs(apple_run, tmp_path):
     (d,) = (tmp_path / "out" / "apple_dev_pose_c2").iterdir()
     res = json.loads((d / "results.json").read_text(encoding="utf-8"))
     rungs = res["runs"][0]["rungs"]
-    assert res["schema_version"] == 8 and list(rungs) == ["L3", "L4_base"]
+    assert res["schema_version"] == 9 and list(rungs) == ["L3", "L4_base"]
     for name, rung in rungs.items():
         assert rung["pose"]["config"] == "c2" and rung["pose_quality"] is not None, name
     report = (d / "report.md").read_text(encoding="utf-8")
@@ -188,7 +188,7 @@ def test_eval_refuses_unsupported_pose_rungs(apple_run, tmp_path):
     base = ["ladder", "--config", _pose_cfg_file(tmp_path, apple_run), "--ladder", str(POSE / "ladder_pose.yaml"),
             "--splits", SPLITS]
     r = runner.invoke(eval_app, [*base, "--rungs", "L4_drift"])
-    assert r.exit_code == 2 and "error: pose.fuse=imu is not supported" in r.output, r.output
+    assert r.exit_code == 2 and "error: align.mode=tracks,row_plane is not supported" in r.output, r.output
     assert not (tmp_path / "out").exists()
     r = runner.invoke(eval_app, [*base, "--rungs", "LVI"])     # the development config names no pose cache
     assert r.exit_code == 2 and "pose.source=file needs pose.cache, one of pose.caches" in r.output, r.output

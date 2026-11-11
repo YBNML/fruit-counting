@@ -16,14 +16,17 @@ one generator for the whole IMU stream, keyed `(10, IMU seed, noise seed, scene,
 Which of these steps a run draws. Under pose.source=truth, with a pose section, a noise seed and a
 drift camera key set (a key at 0 included): each flow draws 5 and 12, each flow draws 6 (keyed by
 its side) when a `pass_side_*` key is set and, without the rig, each pass draws 13 when a
-`pass_pitch_*` key is set. With a pose section, `pose.rig`, a `rig_extr_*` key set and a noise seed,
-each pitch other than the reference draws 7. With a noise seed and `noise.depth_k` set, each frame
-draws 9, drift camera key or not. Step 8 is not drawn: a time offset above 0 stops the run. Steps 10,
-11 and 14 have keys here and no draws. Under pose.source=file the flows come from the pose file, so
-steps 5 and 12 are not drawn; each flow draws 6 (keyed by its side) under pose.anchor=nominal with a
-noise seed and a `pass_side_*` key set, each pass draws 13 without the rig with a noise seed and a
-`pass_pitch_*` key set, and 7 and 9 are drawn as above. A key set to 0 draws like any other value, so
-configs that set the same keys share their draws.
+`pass_pitch_*` key is set; on a bundle with frame times each flow draws 8 (keyed by the pass code of
+its reference pass) when `drift_time_offset_s` is set. With a pose section, `pose.rig`, a
+`rig_extr_*` key set and a noise seed, each pitch other than the reference draws 7. With a noise
+seed and `noise.depth_k` set, each frame draws 9, drift camera key or not. Under pose.fuse=imu with
+a noise seed, each reference pitch draws 11 when an `imu_extr_*` key is set; a truth source then
+draws the IMU stream 10 once per bundle and layout and, with the GPS keys, each flow draws 14. Under
+pose.source=file the flows come from the pose file and the IMU stream from the IMU file, so steps 5,
+8, 10, 12 and 14 are not drawn; each flow draws 6 (keyed by its side) under pose.anchor=nominal with
+a noise seed and a `pass_side_*` key set, each pass draws 13 without the rig with a noise seed and a
+`pass_pitch_*` key set, and 7, 9 and 11 are drawn as above. A key set to 0 draws like any other
+value, so configs that set the same keys share their draws.
 """
 
 from __future__ import annotations

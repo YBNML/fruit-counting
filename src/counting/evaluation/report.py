@@ -23,7 +23,7 @@ from counting.config.eval_schema import POSE_NOISE_KEYS, EvalAppConfig
 from counting.evaluation.budget import TERMS, ladder_pairs, path_pairs
 from counting.evaluation.verdict import JUDGED_PITCHES, PITCH_JUDGED_RUNGS, judged_y1, pool_rung, verdict_counts
 
-SCHEMA_VERSION = 8
+SCHEMA_VERSION = 9
 
 
 class ReproducibilityError(RuntimeError):
@@ -379,8 +379,9 @@ def _pose_label(item: dict) -> str:
     """The pose source of one rung or cell, from its `pose` entry, joined by ` · `.
 
     The configuration, the pose source (a file source with the name of the pose cache it read, and
-    the drift model when it ran), the rig and its reference pitch, the fusion, the anchor, the
-    alignment and the tracker prediction, then the σ_t/σ_r/b pose noise when there is any. An item
+    the drift model when it ran), the rig and its reference pitch, the fusion (with the IMU it read:
+    `결합 imu(모의)` for streams made in memory, `결합 imu(파일 <name>)` for an IMU file), the anchor,
+    the alignment and the tracker prediction, then the σ_t/σ_r/b pose noise when there is any. An item
     without `pose` gets `"정답 자세"` or that noise.
     """
     triple = _pose_triple(item)
@@ -396,9 +397,16 @@ def _pose_label(item: dict) -> str:
         source = f"자세 {pose['source']}"
     if pose["drift"]:
         source += " + 표류 모형"
+    imu = pose.get("imu")
+    if imu is not None and imu["source"] == "memory":
+        fuse = "결합 imu(모의)"
+    elif imu is not None and imu["source"] == "file":
+        fuse = f"결합 imu(파일 {imu['name']})"
+    else:
+        fuse = f"결합 {pose['fuse']}"
     parts = [f"구성 {pose['config'] or '-'}", source,
              f"리그 켬(기준 {_g(pose['rig_ref'])}°)" if pose["rig"] else "리그 끔",
-             f"결합 {pose['fuse']}", f"시작점 {pose['anchor']}", f"정합 {_align_text(pose['align'])}",
+             fuse, f"시작점 {pose['anchor']}", f"정합 {_align_text(pose['align'])}",
              f"예측 {pose['predict']}"]
     if triple != _NO_POSE_NOISE:
         parts.append(_pose_values_text(triple))
@@ -978,6 +986,39 @@ def _pose_cache_line(cache: dict) -> str:
             f"OpenCV {cache['opencv'] or '-'} · digest {cache['digest'][:16]}")
 
 
+def _first_imu_file(results: dict) -> dict | None:
+    """The first `pose.imu` read from an IMU file (`source` file) of a rung or cell in `_report_items` order,
+    else None."""
+    for item in _report_items(results):
+        imu = (item.get("pose") or {}).get("imu")
+        if imu is not None and imu["source"] == "file":
+            return imu
+    return None
+
+
+def _imu_file_line(imu: dict) -> str:
+    """The head line naming the IMU file a fused file pose source read: its name, profile and digest."""
+    return f"> IMU 파일: {imu['name']} · 프로필 {imu['profile'] or '-'} · digest {imu['digest'][:16]}"
+
+
+def _first_fusion(results: dict) -> dict | None:
+    """The first `pose.fusion` of a rung or cell in `_report_items` order, else None."""
+    for item in _report_items(results):
+        fusion = (item.get("pose") or {}).get("fusion")
+        if fusion is not None:
+            return fusion
+    return None
+
+
+def _fusion_line(fusion: dict) -> str:
+    """The head line naming the fusion a rung or cell ran: the gtsam version, the fixed settings' sha256 and,
+    with an IMU, the estimator's IMU noise (`lab` or `generator`)."""
+    line = f"> 결합: gtsam {fusion['gtsam']} · 고정값 {fusion['fuse_fixed_sha256'][:16]}"
+    if fusion["estimator"] is not None:
+        line += f" · 추정기 {fusion['estimator']}"
+    return line
+
+
 def render_report(results: dict, *, criteria: Mapping | None) -> str:
     """Build the human-readable `report.md` for one experiment.
 
@@ -989,7 +1030,9 @@ def render_report(results: dict, *, criteria: Mapping | None) -> str:
     non-sweep result whose `split` is `"test"` and carries `verdicts` ends with `_verdict_lines`'s
     table. When a rung or sweep cell ran on cached detections, a head line names the detector
     (`_detector_line` of `_first_cache`); when one read a pose cache, the next head line names that
-    cache (`_pose_cache_line` of `_first_pose_cache`).
+    cache (`_pose_cache_line` of `_first_pose_cache`); when one read an IMU file, the next head line
+    names that file (`_imu_file_line` of `_first_imu_file`); and when one was fused, the next head line
+    names the fusion (`_fusion_line` of `_first_fusion`).
 
     With a pose section the head's second line names the pose source (`_pose_text`); when a rung
     or cell started from the nominal start (`pose.start` `nominal_from_first_frame`), the next head
@@ -1007,6 +1050,12 @@ def render_report(results: dict, *, criteria: Mapping | None) -> str:
     pose_cache = _first_pose_cache(results)
     if pose_cache is not None:
         lines.append(_pose_cache_line(pose_cache))
+    imu_file = _first_imu_file(results)
+    if imu_file is not None:
+        lines.append(_imu_file_line(imu_file))
+    fusion = _first_fusion(results)
+    if fusion is not None:
+        lines.append(_fusion_line(fusion))
     if results["split"] == "dev":
         lines.append("> dev 묶음: 개발용 수치다. 판정에 쓰지 않는다.")
     lines.append("")
