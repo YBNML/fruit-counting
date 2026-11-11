@@ -26,9 +26,13 @@ pass, of q otherwise), turns it to body axes once: e = M E_t gives `along_m` (tr
 Between passes. Every point of a grid on the target row (`interpass_points`) is checked in each
 pass at the frame whose true camera sees it nearest the principal point (z > 0 and inside the
 image; the earlier frame on a tie). The point in that true camera's coordinates is lifted back to
-the world with the used camera, then moved by the pass's alignment transform when there is one;
-delta = lifted point - point. Two passes that both see a point differ by |delta_p - delta_q|:
-`same_side` pairs share side and aisle, `both_sides` pairs are on different sides.
+the world with the used camera, then moved by the pass's alignment transform at the x of that frame's
+used camera when there is one; delta = lifted point - point. Two passes that both see a point differ by
+|delta_p - delta_q|: `same_side` pairs share side and aisle, `both_sides` pairs are on different sides.
+
+After the alignment. `world_end_aligned` is the world end error after the pass's alignment transform A at
+the x of the last frame's used camera: E = T_{n-1}^-1 A U_{n-1}, in the pass's own camera frame; every
+value is None for a pass without a transform.
 
 Every value of the result is a Python float, int, str or None.
 """
@@ -43,6 +47,7 @@ from scipy.spatial.transform import Rotation
 from counting.data.formats.orchard_synth import OrchardLayout, PassKey
 from counting.geometry.camera import Camera
 from counting.geometry.rig import pitch_extrinsic, pose_matrix, relative_extrinsic
+from counting.multiview.align import PassAlignment
 
 GRID_HALF_WIDTH_M = 0.4    # grid points at the row centre plane and this far to each side of it
 GRID_Z_M = (0.5, 3.5)      # lowest and highest grid height
@@ -145,9 +150,10 @@ def _near(errors: Mapping[float, np.ndarray], pitch: float) -> np.ndarray | None
 
 
 def _point_deltas(points: np.ndarray, truth: Sequence[Camera], used: Sequence[Camera],
-                  A: np.ndarray | None) -> tuple[np.ndarray, np.ndarray]:
+                  alignment: PassAlignment | None) -> tuple[np.ndarray, np.ndarray]:
     """(seen, delta) of one pass: which `points` a true camera sees, and for those the lifted point
-    minus the point (NaN rows elsewhere)."""
+    minus the point (NaN rows elsewhere). A lifted point moves by `alignment` at the x of the used
+    camera of its frame."""
     m = len(points)
     best, pick = np.full(m, np.inf), np.full(m, -1)
     for k, cam in enumerate(truth):
@@ -163,8 +169,8 @@ def _point_deltas(points: np.ndarray, truth: Sequence[Camera], used: Sequence[Ca
         sel = pick == k
         T, U = truth[k], used[k]
         lifted = ((points[sel] - T.C) @ T.R_c2w) @ U.R_c2w.T + U.C
-        if A is not None:
-            lifted = apply_rigid(A, lifted)
+        if alignment is not None:
+            lifted = alignment.move(lifted, np.full(len(lifted), float(U.C[0])))
         delta[sel] = lifted - points[sel]
     return seen, delta
 
@@ -193,7 +199,7 @@ def _summary(rows: Sequence[dict], name: str, keys: tuple[str, ...]) -> dict:
 def pose_quality(
     passes: Sequence[tuple[PassKey, Sequence[Camera], Sequence[Camera]]],
     layout: OrchardLayout,
-    transforms: Mapping[PassKey, np.ndarray] | None = None,
+    transforms: Mapping[PassKey, PassAlignment] | None = None,
     *,
     ref_pitch: float | None = None,
     rig_errors: Mapping[float, np.ndarray] | None = None,
@@ -201,15 +207,17 @@ def pose_quality(
     """Pose quality of `passes`, each (pass key, true cameras, used cameras) in frame order.
 
     `transforms` are the alignment transforms by pass key, applied to the lifted points between
-    passes. `ref_pitch` is the pitch of the reference camera that RPE and `in_pass` are measured
-    in, and `rig_errors` the rig calibration error by pitch (see the module docstring); with
-    both None every pass stays in its own camera frame.
+    passes at the x of the used camera of the frame that lifted them, and to the last used camera of
+    the pass for `world_end_aligned`. `ref_pitch` is the pitch of the reference camera that RPE and
+    `in_pass` are measured in, and `rig_errors` the rig calibration error by pitch (see the module
+    docstring); with both None every pass stays in its own camera frame.
 
     Returns `{"rpe": {"n", "trans_m": {"p50", "p90", "max"}, "rot_deg": {...}}, "passes": [...],
     "summary": {...}, "interpass": {"same_side": {"n", "p50_m", "p90_m"}, "both_sides": {...}}}`.
     A pass row has `pitch`, `side`, `aisle`, `n_frames`, `length_m`, `in_pass` and `in_pass_cam`
     (the error keys and `pos_frac`; every value None for a pass of one frame, `pos_frac` None for
-    a pass of zero length), `start` and `world_end`.
+    a pass of zero length), `start`, `world_end` and `world_end_aligned` (every value None for a pass
+    without a transform).
     `summary` holds, per entry and key, the median of the absolute values over the passes. An
     empty set gives None (and n 0).
     """
@@ -240,12 +248,17 @@ def pose_quality(
             rpe_trans.append(float(np.linalg.norm(E[:3, 3])))
             rpe_rot.append(_angle_deg(E[:3, :3]))
         length = float(np.linalg.norm(T[-1][:3, 3] - T[0][:3, 3]))
+        alignment = None if transforms is None else transforms.get(key)
+        end_aligned = dict.fromkeys(_E_KEYS)
+        if alignment is not None:
+            A = alignment.at([float(used[-1].C[0])])[0]
+            end_aligned = _components(_inverse(T[-1]) @ (A @ U[-1]), M_own)
         rows.append({"pitch": q, "side": key.side, "aisle": int(key.aisle), "n_frames": len(T), "length_m": length,
                      "in_pass": _in_pass(T_ref, U_ref, M_ref, length), "in_pass_cam": _in_pass(T, U, M_own, length),
                      "start": _components(_inverse(T[0]) @ U[0], M_own),
-                     "world_end": _components(_inverse(T[-1]) @ U[-1], M_own)})
-        A = None if transforms is None else transforms.get(key)
-        seen.append((key, *_point_deltas(points, truth, used, A)))
+                     "world_end": _components(_inverse(T[-1]) @ U[-1], M_own),
+                     "world_end_aligned": end_aligned})
+        seen.append((key, *_point_deltas(points, truth, used, alignment)))
 
     same_side: list[float] = []
     both_sides: list[float] = []
@@ -266,7 +279,8 @@ def pose_quality(
         "passes": rows,
         "summary": {"in_pass": _summary(rows, "in_pass", _DRIFT_KEYS),
                     "in_pass_cam": _summary(rows, "in_pass_cam", _DRIFT_KEYS),
-                    "start": _summary(rows, "start", _E_KEYS), "world_end": _summary(rows, "world_end", _E_KEYS)},
+                    "start": _summary(rows, "start", _E_KEYS), "world_end": _summary(rows, "world_end", _E_KEYS),
+                    "world_end_aligned": _summary(rows, "world_end_aligned", _E_KEYS)},
         "interpass": {name: {"n": len(values), **_stats(values, ("p50_m", "p90_m"))}
                       for name, values in (("same_side", same_side), ("both_sides", both_sides))},
     }

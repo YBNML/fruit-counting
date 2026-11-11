@@ -63,6 +63,11 @@ def combine_seeds(cfg: EvalAppConfig, per_seed: Sequence[tuple[int, dict]]) -> d
     result also has that `pose` and the seeds' mean `pose_quality`; `spread` then
     has `pose_quality` (`rpe`, `summary` and `interpass`) and `per_seed` keeps each
     seed's `pose_quality`.
+
+    When the first result has `alignment`, the combined result has it too: None when
+    the first result's is None, else the first result's `mode` and `settings` with
+    the seeds' mean `summary`. `spread` then has `alignment` (`summary`) and
+    `per_seed` keeps each seed's whole `alignment` entry, its stages included.
     """
     results = [r for _, r in per_seed]
     y1 = _mean([r["y1"] for r in results])
@@ -81,4 +86,13 @@ def combine_seeds(cfg: EvalAppConfig, per_seed: Sequence[tuple[int, dict]]) -> d
                                   for k in ("rpe", "summary", "interpass")}
         for item, r in zip(out["per_seed"], results):
             item["pose_quality"] = r["pose_quality"]
+    if "alignment" in first:
+        out["alignment"] = None
+        if first["alignment"] is not None:
+            summaries = [r["alignment"]["summary"] for r in results]
+            out["alignment"] = {"mode": first["alignment"]["mode"], "settings": first["alignment"]["settings"],
+                                "summary": _mean(summaries)}
+            spread["alignment"] = {"summary": _range(summaries)}
+            for item, r in zip(out["per_seed"], results):
+                item["alignment"] = r["alignment"]
     return out

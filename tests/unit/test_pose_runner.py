@@ -9,6 +9,7 @@ import pytest
 import yaml
 from typer.testing import CliRunner
 
+import counting.evaluation.fusion as fusion_module
 import counting.evaluation.runner as runner_module
 import counting.geometry.noise as noise_module
 from counting.data.formats.orchard_synth import SynthRun
@@ -77,8 +78,8 @@ def test_pass_stages_follow_ctx_passes(apple_run, ctx_of):
     staged = runner_module._track_passes(ctx, cfg, None)
     assert [p.key for p in staged] == list(ctx.passes)
     assert all(p.cameras[f.idx] is f.camera for p in staged for f in p.frames)
-    aligned, transforms = runner_module._align_passes(ctx, cfg, staged)
-    assert aligned is staged and transforms is None
+    aligned, transforms, entry = runner_module._align_passes(ctx, cfg, staged)
+    assert aligned is staged and transforms is None and entry is None
 
 
 def test_zero_drift_keys_match_l3_bytes(apple_run, ctx_of):
@@ -133,8 +134,8 @@ def test_pose_section_adds_pose_entries(apple_run, ctx_of):
     res = evaluate(ctx, fake_cfg(apple_run, "apple", "pose.rig_ref=30"))
     assert res["pose"] == {"config": None, "source": "truth", "drift": False, "anchor": "nominal", "start": None,
                            "rig": False, "rig_ref": 30.0, "fuse": "none", "align": "none", "predict": "pose",
-                           "dedup": "merge", "dedup_radius_m": 0.04, "dedup_band_m": 0.1, "gate_px_frac": 0.5,
-                           "cache": None, "imu": None, "fusion": None}
+                           "predict_window": None, "dedup": "merge", "dedup_radius_m": 0.04, "dedup_band_m": 0.1,
+                           "gate_px_frac": 0.5, "cache": None, "imu": None, "fusion": None, "flow": None}
     assert set(res["pose_quality"]) == {"rpe", "passes", "summary", "interpass"}
     drift = evaluate(ctx, fake_cfg(apple_run, "apple", "pose.rig_ref=30", *D_EXT_VO), noise_seed=0)["pose"]
     assert drift["drift"] is True and drift["start"] == "nominal_from_first_frame"
@@ -157,6 +158,8 @@ def test_fit_truth_pass_takes_out_start_errors(apple_run, ctx_of):
     assert plain["pose_quality"]["interpass"]["both_sides"]["p90_m"] > 0.01
     assert fitted["pose_quality"]["interpass"]["both_sides"]["p90_m"] <= 1e-9
     assert fitted["pose"]["align"] == "fit_truth_pass"
+    assert [(s["stage"], len(s["segments"]), s["segments"][0]["use"]) for s in fitted["alignment"]["stages"]] == [
+        ("truth_pass", 1, "own")] * 4
     # the fit moves the track centres, so the start errors no longer split fruits across passes
     assert fitted["y6"]["ledger"]["dup_cross"] < plain["y6"]["ledger"]["dup_cross"]
 
@@ -170,25 +173,25 @@ def test_fit_truth_pass_takes_out_start_errors(apple_run, ctx_of):
     no3d = staged[0].tracks.X.copy()
     no3d[0] = np.nan
     staged = [replace(staged[0], tracks=replace(staged[0].tracks, X=no3d)), *staged[1:]]
-    aligned, transforms = runner_module._align_passes(ctx, fit_cfg, staged)
+    aligned, transforms, _ = runner_module._align_passes(ctx, fit_cfg, staged)
     assert [p.key for p in aligned] == list(transforms) == [p.key for p in staged]
     for s, a in zip(staged, aligned):
-        assert not np.allclose(transforms[s.key], np.eye(4))
-        np.testing.assert_array_equal(a.tracks.X, apply_rigid(transforms[s.key], s.tracks.X))
+        assert transforms[s.key].segments.centres.tolist() == [0.0]
+        A = transforms[s.key].matrices[0]
+        assert not np.allclose(A, np.eye(4))
+        np.testing.assert_array_equal(a.tracks.X, apply_rigid(A, s.tracks.X))
         np.testing.assert_array_equal(np.isnan(a.tracks.X), np.isnan(s.tracks.X))
     assert np.isnan(aligned[0].tracks.X[0]).all()
 
 
 def test_unsupported_pose_settings_stop_before_any_rung_runs(apple_run, ctx_of, monkeypatch):
-    with pytest.raises(NotImplementedError, match="align.mode=tracks,row_plane is not supported"):
-        evaluate(ctx_of["apple"], fake_cfg(apple_run, "apple", "pose.rig_ref=30", "align.mode=[tracks,row_plane]"))
     with pytest.raises(NotImplementedError, match="pose.fuse=imu with split=test is not supported"):
         evaluate(ctx_of["apple"], fake_cfg(apple_run, "apple", "pose.rig_ref=30", "pose.fuse=imu", "split=test",
                                            "tuning=false"))
     calls = []
     monkeypatch.setattr(runner_module, "evaluate", lambda *args, **kwargs: calls.append(args))
-    cfg = fake_cfg(apple_run, "apple", "pose.rig_ref=30")
-    with pytest.raises(NotImplementedError, match="align.mode=tracks,row_plane is not supported"):
+    cfg = fake_cfg(apple_run, "apple", "pose.rig_ref=30", "split=test", "tuning=false")
+    with pytest.raises(NotImplementedError, match="pose.fuse=imu with split=test is not supported"):
         run_ladder(ctx_of["apple"], cfg, POSE_LADDER, ["L3", "L4_drift"])
     assert len(calls) == 0
 
@@ -202,6 +205,8 @@ def test_ladder_base_config_takes_truth_without_rig(apple_run):
 
 
 def test_eval_refuses_unsupported_pose_rungs_before_opening_bundles(apple_run, tmp_path, monkeypatch):
+    monkeypatch.setattr(fusion_module, "FUSE_FIXED_PATH", tmp_path / "absent" / "fuse_fixed.yaml")
+    monkeypatch.setattr(fusion_module, "has_gtsam", lambda: True)
     ladder = tmp_path / "ladder.yaml"
     ladder.write_text(yaml.safe_dump(POSE_LADDER), encoding="utf-8")
     raw = yaml.safe_load((EVAL_CONFIGS / "apple_dev.yaml").read_text(encoding="utf-8"))
@@ -213,5 +218,5 @@ def test_eval_refuses_unsupported_pose_rungs_before_opening_bundles(apple_run, t
     res = CliRunner().invoke(eval_app, ["ladder", "--config", str(cfg), "--ladder", str(ladder),
                                         "--rungs", "L3,L4_drift", "--splits", SPLITS])
     assert res.exit_code == 2, res.output
-    assert "error: align.mode=tracks,row_plane is not supported" in res.output
+    assert "no fixed fusion settings; pose.fuse reads them" in res.output
     assert opened == [] and not (tmp_path / "out").exists()

@@ -32,13 +32,16 @@ from counting.detection.base import Detections
 from counting.detection.cached import CachedDetector, cache_path
 from counting.detection.oracle import OracleDetector
 from counting.evaluation import fusion as fusion_mod
+from counting.evaluation.alignment import (
+    ORACLE_SIGMA_M, align_settings, alignment_entry, oracle_alignment, structure_points, truth_alignment,
+)
 from counting.evaluation.fusion import FusionInputs
 from counting.evaluation.ledger import Ledger, UnitView, build_ledger, combine
 from counting.evaluation.match import match_frame, unit_majority
 from counting.evaluation.oracle_stages import (
     oracle_dedup, oracle_tracks, truth_centers, truth_row_mask, truth_trees,
 )
-from counting.evaluation.posequality import apply_rigid, fit_truth_rigid, pose_quality
+from counting.evaluation.posequality import pose_quality
 from counting.evaluation.posesource import (
     check_pose_supported, drift_active, model_cameras, pose_cache_entry, pose_settings, rig_errors,
 )
@@ -52,6 +55,7 @@ from counting.geometry.noise import (
     perturb_depth,
 )
 from counting.geometry.posefile import PoseFile
+from counting.multiview.align import AlignPass, AlignResult, PassAlignment, Segments, align_passes, track_x
 from counting.multiview.assign import assign_trees, in_target_row
 from counting.multiview.dedup import dedup, repair_pass
 from counting.multiview.lift import box_far_depth, box_median_depth, lift_points
@@ -466,28 +470,65 @@ def _track_passes(ctx: RunContext, cfg: EvalAppConfig, noise_seed: int | None, *
     return out
 
 
+def _align_inputs(passes: Sequence[_PassTrack]) -> list[AlignPass]:
+    """The tracks of each pass as the alignment reads them: centres, observation counts and positions along
+    the row (`track_x` over the x of the used camera centres of the frames that observed each track)."""
+    return [AlignPass(p.key, p.tracks.X, p.tracks.n_obs,
+                      track_x(p.tracks.frames, {i: float(c.C[0]) for i, c in p.cameras.items()}))
+            for p in passes]
+
+
 def _align_passes(
-    ctx: RunContext, cfg: EvalAppConfig, passes: list[_PassTrack],
-) -> tuple[list[_PassTrack], dict[PassKey, np.ndarray] | None]:
+    ctx: RunContext, cfg: EvalAppConfig, passes: Sequence[_PassTrack], *, noise_seed: int | None = None,
+) -> tuple[list[_PassTrack], dict[PassKey, PassAlignment] | None, dict | None]:
     """Align the tracked passes by `cfg.align.mode` (the second stage of `evaluate`).
 
-    Returns the passes in the same order, with their track centres moved, and the transform
-    applied to each pass by pass key. Without an `align` section, or with `align.mode=none`,
-    the passes come back unchanged with None. `fit_truth_pass` moves each pass's track centres by
-    the rigid transform that best takes its used cameras to its true cameras (`fit_truth_rigid`);
-    a centre without 3D stays NaN. Any other mode raises `NotImplementedError`.
+    Without an `align` section, or with `align.mode=none`, returns `(passes, None, None)` with the same
+    list. Otherwise returns the passes in the same order with their track centres moved, the transforms
+    of each pass by pass key (`PassAlignment`, one per segment) and the result's `alignment` entry
+    (`alignment_entry`), all under the settings of `align_settings`. Listed methods run `align_passes` on
+    the tracks of `_align_inputs`, its draws keyed by (`cfg.seed`, `noise_seed` or 0, scene).
+    `fit_truth_pass` and `fit_truth_segment` fit the used cameras of each pass to its true cameras
+    (`truth_alignment`), over the whole pass or by segments of `align.segment_m` along the trees.
+    `oracle_struct` fits the passes to the structures and tree trunks of the bundle (`oracle_alignment` on
+    the `structure_points` of `SynthRun.structures`) by segments of `align.segment_m`, with the noise
+    `align.oracle_sigma_m` (else `ORACLE_SIGMA_M`) keyed like the listed methods and the depth16 of each
+    frame, read once per call. A track centre moves by the transform of the segment of its position along
+    the row (`track_x`); one without 3D stays NaN, and the other fields of a pass stay as they are. Any
+    other mode raises `NotImplementedError`.
     """
-    if cfg.align is None or cfg.align.mode == "none":
-        return passes, None
-    if cfg.align.mode == "fit_truth_pass":
-        out, transforms = [], {}
-        for p in passes:
-            A = fit_truth_rigid([f.camera for f in p.frames], [p.cameras[f.idx] for f in p.frames])
-            out.append(replace(p, tracks=replace(p.tracks, X=apply_rigid(A, p.tracks.X))))
-            transforms[p.key] = A
-        return out, transforms
-    mode = ",".join(cfg.align.mode) if isinstance(cfg.align.mode, list) else cfg.align.mode
-    raise NotImplementedError(f"align.mode={mode} is not supported")
+    align = cfg.align
+    if align is None or align.mode == "none":
+        return passes, None, None
+    settings, inputs = align_settings(cfg), _align_inputs(passes)
+    result: AlignResult
+    if isinstance(align.mode, list):
+        result = align_passes(inputs, ctx.layout, align.mode, settings, rig=cfg.pose.rig, ref_pitch=cfg.pose.rig_ref,
+                              key=(cfg.seed, noise_seed or 0, ctx.run.meta.seed))
+    elif align.mode in ("fit_truth_pass", "fit_truth_segment", "oracle_struct"):
+        items = [(p.key, [f.camera for f in p.frames], [p.cameras[f.idx] for f in p.frames]) for p in passes]
+        if align.mode == "oracle_struct":
+            frames_of, depths = {p.key: p.frames for p in passes}, {}
+
+            def depth(key: PassKey, k: int) -> np.ndarray:
+                f = frames_of[key][k]
+                if f.idx not in depths:
+                    depths[f.idx] = read_depth_m(f.depth_path)
+                return depths[f.idx]
+
+            result = oracle_alignment(items, structure_points(ctx.run.structures(), ctx.layout),
+                                      Segments.along(ctx.layout.tree_x, settings.segment_m), rig=cfg.pose.rig,
+                                      key=(cfg.seed, noise_seed or 0, ctx.run.meta.seed),
+                                      sigma_m=align.oracle_sigma_m or ORACLE_SIGMA_M, depth=depth)
+        else:
+            segments = (Segments.whole() if align.mode == "fit_truth_pass"
+                        else Segments.along(ctx.layout.tree_x, settings.segment_m))
+            result = truth_alignment(items, segments)
+    else:
+        raise NotImplementedError(f"align.mode={align.mode} is not supported")
+    moved = [replace(p, tracks=replace(p.tracks, X=result.transforms[p.key].move(p.tracks.X, a.x)))
+             for p, a in zip(passes, inputs)]
+    return moved, result.transforms, alignment_entry(cfg, settings, result)
 
 
 def _score_pass(ctx: RunContext, cfg: EvalAppConfig, p: _PassTrack) -> tuple[dict, Ledger, _PassStage]:
@@ -544,7 +585,9 @@ def evaluate(ctx: RunContext, cfg: EvalAppConfig, *, subsets: bool = False, nois
     be given exactly when `cfg.is_noisy()` (`ValueError`).
     The passes go through three stages, each in `ctx.passes` order: every pass
     is lifted and tracked (`_track_passes`), the passes are aligned
-    (`_align_passes`), and each pass is scored (`_score_pass`).
+    (`_align_passes`: under `cfg.align.mode` each pass's track centres move by
+    the transform of their segment along the row, the draws keyed by
+    `noise_seed`), and each pass is scored (`_score_pass`).
     A track is kept with at least `cfg.tracker.min_obs_for(stages.det)`
     observations. A cached context's result also has `cache` (`ctx.cache`).
     Each pass's and the summary's `depth_err` is `depth_error_stats` of box depth
@@ -563,11 +606,12 @@ def evaluate(ctx: RunContext, cfg: EvalAppConfig, *, subsets: bool = False, nois
     is `pose_cache_entry` of the pose cache read, None under `pose.source=truth`,
     its `imu` the fusion inputs' `imu` and its `fusion` `fusion_entry`, both None
     without fusion; its start is planned on a bundle rendered with body shake
-    under a file source or the drift model) and `pose_quality` (`pose_quality`
+    under a file source or the drift model), `pose_quality` (`pose_quality`
     of the cameras the lift and the tracker used
     against the true cameras, with the alignment transforms; under `pose.rig`
     the in-pass drift and RPE are measured in the frame of the reference camera
-    `pose.rig_ref`, with the rig calibration errors of the passes' pitches).
+    `pose.rig_ref`, with the rig calibration errors of the passes' pitches) and
+    `alignment` (`alignment_entry` of the alignment that ran, None without one).
     With `subsets` (which needs `stop_after=y6`), the result also has `subsets`
     (`_score_subsets`): the passes' tracks are reused, and Y6 is scored again on
     each subset of `pass_subsets`.
@@ -584,7 +628,7 @@ def evaluate(ctx: RunContext, cfg: EvalAppConfig, *, subsets: bool = False, nois
     st = cfg.stages
     inputs = fusion_mod.fusion_inputs(ctx.run, cfg, noise_seed, imu_file=open_imu_file(ctx, cfg))
     staged = _track_passes(ctx, cfg, noise_seed, fusion=inputs)
-    aligned, transforms = _align_passes(ctx, cfg, staged)
+    aligned, transforms, alignment = _align_passes(ctx, cfg, staged, noise_seed=noise_seed)
     passes_out, ledgers = [], []
     stages: list[_PassStage] = []
     depth_errs_all: list[np.ndarray] = []
@@ -617,6 +661,7 @@ def evaluate(ctx: RunContext, cfg: EvalAppConfig, *, subsets: bool = False, nois
             [(p.key, [f.camera for f in p.frames], [p.cameras[f.idx] for f in p.frames]) for p in staged],
             ctx.layout, transforms, ref_pitch=cfg.pose.rig_ref if cfg.pose.rig else None,
             rig_errors=rig_errors(cfg, noise_seed, scene=ctx.run.meta.seed, pitches=[p.key.pitch_deg for p in staged]))
+        out["alignment"] = alignment
     if ctx.cache is not None:
         out["cache"] = _cache_result(ctx)
     if subsets:

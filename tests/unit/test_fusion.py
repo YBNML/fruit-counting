@@ -475,7 +475,7 @@ def test_fused_results_name_the_fusion_and_change_with_the_fixed_settings(small_
     results = json.loads((folder / "results.json").read_text(encoding="utf-8"))
     sha, version = hashlib.sha256(fixed.read_bytes()).hexdigest(), importlib.metadata.version("gtsam")
     pose = results["runs"][0]["rungs"]["run"]["pose"]
-    assert results["schema_version"] == 9 and pose["fuse"] == "imu" and pose["start"] == "nominal_from_first_frame"
+    assert results["schema_version"] == 10 and pose["fuse"] == "imu" and pose["start"] == "nominal_from_first_frame"
     assert pose["imu"] == {"source": "memory", "layout": "rig", "stream": "noiseless", "name": None, "file": None,
                            "digest": None, "profile": None}
     assert pose["fusion"] == {"gtsam": version, "fuse_fixed_sha256": sha, "estimator": "lab", "standstill_s": None}

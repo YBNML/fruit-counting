@@ -351,7 +351,7 @@ def test_eval_run_names_the_pose_cache(leaf_runs, tmp_path):
     res = json.loads((d / "results.json").read_text(encoding="utf-8"))
     rec = json.loads((d / "record.json").read_text(encoding="utf-8"))
     entry = {"name": "truth", "file": path.name, "digest": digest, "vo_config_hash": None, "opencv": None}
-    assert res["schema_version"] == 9 and res["runs"][0]["rungs"]["run"]["pose"]["cache"] == entry
+    assert res["schema_version"] == 10 and res["runs"][0]["rungs"]["run"]["pose"]["cache"] == entry
     assert rec["pose_caches"] == [{"run_id": run.meta.run_id, **entry}]
     assert rec["data"][0]["pose_cache_digests"] == [digest]
     lines = (d / "report.md").read_text(encoding="utf-8").splitlines()

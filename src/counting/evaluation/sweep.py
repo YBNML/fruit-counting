@@ -57,7 +57,8 @@ counts and ledger, and the Y6 mode, row, ledger and metrics; only the
 baseline point keeps the per-tree Y6 table. A noisy cell also keeps `noisy`,
 `seeds`, `noise`, `spread` and `per_seed`, same as a noisy ladder rung. A cell
 with a pose section keeps `pose` and `pose_quality` (and each seed's
-`pose_quality` in `per_seed`).
+`pose_quality` in `per_seed`), and the mode, settings and summary of its
+`alignment` (no stages, none per seed).
 """
 
 from __future__ import annotations
@@ -322,13 +323,18 @@ def _kept(cell: SweepCell, res: dict) -> dict:
 
     A noisy `res` also keeps `noisy`, `seeds`, `noise`, `spread` and a `per_seed` trimmed the same way.
     `pose` and `pose_quality` (a config with a pose section) are kept as they are, and so is each
-    `per_seed` item's `pose_quality`. A cached cell's `cache` (noisy or not) is kept as it is.
+    `per_seed` item's `pose_quality`. `alignment` keeps only its `mode`, `settings` and `summary` (None
+    stays None), and a `per_seed` item keeps no `alignment`. A cached cell's `cache` (noisy or not) is
+    kept as it is.
     """
     out = {"point": cell.point.name, "base": cell.base, "overridden": list(cell.overridden),
            "stages": res["stages"], "lift_depth": res["lift_depth"], **_kept_view(cell, res["y1"], res["y6"])}
     for key in ("pose", "pose_quality"):
         if key in res:
             out[key] = res[key]
+    if "alignment" in res:
+        entry = res["alignment"]
+        out["alignment"] = None if entry is None else {k: entry[k] for k in ("mode", "settings", "summary")}
     if res.get("noisy"):
         out.update(noisy=True, seeds=res["seeds"], noise=res["noise"], spread=res["spread"],
                    per_seed=[{"noise_seed": p["noise_seed"], **_kept_view(cell, p["y1"], p["y6"]),

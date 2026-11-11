@@ -3,7 +3,8 @@
 `SynthRun.open` reads only the bundle's JSON and PNG outputs. What the
 prediction path may see is in `FrameInput` (pose, intrinsics, image paths) and
 `OrchardLayout` (row and tree positions); records, fruit positions and tree
-totals stay in `SceneTruth`, which only scoring and oracle code should read.
+totals stay in `SceneTruth`, which only scoring and oracle code should read, and
+so do the structures and tree trunks of the orchard (`SynthRun.structures`).
 
 A bundle rendered with body shake (manifest args.shake) has shaken frame poses, and each frame also
 holds its time, its planned position and its planned pose; positions, the base step and the aisle
@@ -20,7 +21,7 @@ import json
 import zipfile
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Sequence
+from typing import Mapping, Sequence
 
 import numpy as np
 from PIL import Image
@@ -123,6 +124,16 @@ class RunMeta:
     synth_commit: str | None
     fingerprint: str
     shake: bool = False
+
+
+@dataclass(frozen=True, eq=False)
+class Structure:
+    """One structure of the orchard, truth side: an entry of the manifest's `spec.structures` (`kind` and its
+    `params` as written), or the trunk of one tree (kind `"trunk"`, params `tree` and `points`, the trunk
+    polyline as lists of three floats)."""
+
+    kind: str
+    params: Mapping[str, object]
 
 
 @dataclass(frozen=True, eq=False)
@@ -256,6 +267,18 @@ def _record(r: dict) -> GtRecord:
                     trunc=bool(r["trunc"]), depth_med=None if dmed is None else float(dmed))
 
 
+def _parse_structures(spec: dict) -> tuple[Structure, ...]:
+    """The entries of `spec.structures` in order, then, in tree order, the trunk of each tree with trunk
+    segments (`[p0, p1, r0, r1, kind]`): the p0 of its first trunk segment, then the p1 of each."""
+    out = [Structure(str(s["kind"]), dict(s["params"])) for s in spec.get("structures", [])]
+    for t in spec["trees"]:
+        trunk = [seg for seg in t.get("segments") or [] if seg[4] == "trunk"]
+        if trunk:
+            points = [[float(v) for v in p] for p in [trunk[0][0], *(seg[1] for seg in trunk)]]
+            out.append(Structure("trunk", {"tree": int(t["id"]), "points": points}))
+    return tuple(out)
+
+
 def _parse_layout(manifest: dict, mpath: Path) -> OrchardLayout:
     """The row and tree layout. `spec.row_ys` must hold at least 2 rows, ascending and evenly spaced."""
     args = manifest["args"]
@@ -365,7 +388,8 @@ class SynthRun:
     def __init__(self, root: Path, meta: RunMeta, layout: OrchardLayout, frames: tuple[FrameInput, ...],
                  *, records: dict[int, tuple[GtRecord, ...]], fruits: dict[int, FruitGt],
                  totals: dict[int, int], count1: tuple[float, int], summary: dict[int, dict] | None,
-                 plans: dict[int, FramePlan] | None = None, trajectory_files: frozenset[str] | None = None) -> None:
+                 plans: dict[int, FramePlan] | None = None, trajectory_files: frozenset[str] | None = None,
+                 structures: tuple[Structure, ...] = ()) -> None:
         self.root = root
         self.meta = meta
         self.layout = layout
@@ -378,6 +402,7 @@ class SynthRun:
         self._plans = plans
         self._trajectory_files = trajectory_files
         self._trajectories: dict[str, Trajectory] = {}
+        self._structures = tuple(structures)
         self._truth: SceneTruth | None = None
 
     @classmethod
@@ -417,6 +442,7 @@ class SynthRun:
                 raise ValueError(f"{mpath}: conventions.count1 is missing")
             count1 = (float(conventions["count1"]["visib_min"]), int(conventions["count1"]["px_min"]))
             fruits = _parse_fruits(manifest["spec"]["trees"], mpath)
+            structures = _parse_structures(manifest["spec"])
             cam_param = _parse_cam_param(args.get("cam_param"), mpath)
             layout = _parse_layout(manifest, mpath)
             totals = {int(t["id"]): int(t["total"]) for t in manifest["trees"]}
@@ -493,7 +519,8 @@ class SynthRun:
         records = {idx: recs for idx, _, _, _, recs, _ in parsed}
         plans = {idx: plan for idx, *_, plan in parsed} if shake else None
         return cls(root, meta, layout, frames, records=records, fruits=fruits, totals=totals, count1=count1,
-                   summary=summary, plans=plans, trajectory_files=frozenset(listed) if shake else None)
+                   summary=summary, plans=plans, trajectory_files=frozenset(listed) if shake else None,
+                   structures=structures)
 
     def passes(self) -> dict[PassKey, list[FrameInput]]:
         """Frames grouped by pass, passes in order of first appearance, frames in idx order."""
@@ -525,6 +552,11 @@ class SynthRun:
                 raise ValueError(f"{self.root}: no {name} in trajectory.json for side {side}")
             self._trajectories[side] = _load_trajectory(self.root / name, side)
         return self._trajectories[side]
+
+    def structures(self) -> tuple[Structure, ...]:
+        """The structures of the orchard (posts, arches, pipes, …) from the manifest, then the trunk axis of
+        every tree (kind "trunk", from its trunk segments); truth side, like `truth`."""
+        return self._structures
 
     def semantic_path(self, idx: int) -> Path:
         return self.root / f"{idx:06d}_semantic.png"

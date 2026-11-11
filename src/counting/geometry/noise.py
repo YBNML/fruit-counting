@@ -11,7 +11,11 @@ depth k 9 `(..., idx)` one value per depth; camera-to-IMU calibration 11
 `(..., round(pitch * 1000))` t(3) then r(3); flow scale and rate 12 `(..., *flow)` s then w(3);
 pitch-to-pitch rigid 13 `(..., *side, round(pitch * 1000))` t(3) then r(3); line-end GPS fix 14
 `(..., *flow, end)`, end 0 for the first frame and 1 for the last, x then y then z. The IMU 10 is
-one generator for the whole IMU stream, keyed `(10, IMU seed, noise seed, scene, layout)`.
+one generator for the whole IMU stream, keyed `(10, IMU seed, noise seed, scene, layout)`. The
+alignment of the tracked passes keys its draws with steps 15 (the RANSAC draws of a segment fit,
+`(..., stage, side, group pitch, segment)`), 16 (the stress thinning of the moving tracks,
+`(..., stage, side, group pitch)`) and 17 (the oracle noise of the structure points,
+`(..., *pass_key_code)`), with the noise seed, or 0 without one.
 
 Which of these steps a run draws. Under pose.source=truth, with a pose section, a noise seed and a
 drift camera key set (a key at 0 included): each flow draws 5 and 12, each flow draws 6 (keyed by
@@ -74,6 +78,7 @@ def perturb_depth(z: np.ndarray, rng: np.random.Generator, rel_sigma: float, dro
 
 STEP_WALK, STEP_START, STEP_RIG, STEP_TIME, STEP_DEPTH_K, STEP_IMU, STEP_IMU_EXTR, STEP_FLOW, STEP_PITCH, STEP_GPS = (
     5, 6, 7, 8, 9, 10, 11, 12, 13, 14)
+STEP_ALIGN, STEP_ALIGN_THIN, STEP_STRUCT = 15, 16, 17
 REF_STEP_M = 0.15  # the base step (m) the walk sigmas are given for
 
 

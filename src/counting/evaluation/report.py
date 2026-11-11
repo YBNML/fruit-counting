@@ -23,7 +23,7 @@ from counting.config.eval_schema import POSE_NOISE_KEYS, EvalAppConfig
 from counting.evaluation.budget import TERMS, ladder_pairs, path_pairs
 from counting.evaluation.verdict import JUDGED_PITCHES, PITCH_JUDGED_RUNGS, judged_y1, pool_rung, verdict_counts
 
-SCHEMA_VERSION = 9
+SCHEMA_VERSION = 10
 
 
 class ReproducibilityError(RuntimeError):
@@ -356,7 +356,8 @@ def _pose_values_text(triple: tuple[float, float, float]) -> str:
 
 
 _NO_POSE_NOISE = (0.0, 0.0, 0.0)
-_ALIGN_TEXT = {"none": "없음", "fit_truth_pass": "패스별 정답 맞춤(상한)"}
+_ALIGN_TEXT = {"none": "없음", "fit_truth_pass": "패스별 정답 맞춤(상한)", "fit_truth_segment": "구간별 정답 맞춤(상한)",
+               "oracle_struct": "오라클 시설 관측(보고)"}
 _STRAIGHT_START_NOTE = ("> 직선 묶음: 명목 시작점은 첫 프레임 정답 자세에 가정한 시작 오차를 더한 것이다. "
                         "판정에 쓰지 않는다.")
 
@@ -381,8 +382,9 @@ def _pose_label(item: dict) -> str:
     The configuration, the pose source (a file source with the name of the pose cache it read, and
     the drift model when it ran), the rig and its reference pitch, the fusion (with the IMU it read:
     `결합 imu(모의)` for streams made in memory, `결합 imu(파일 <name>)` for an IMU file), the anchor,
-    the alignment and the tracker prediction, then the σ_t/σ_r/b pose noise when there is any. An item
-    without `pose` gets `"정답 자세"` or that noise.
+    the alignment and the tracker prediction (with its window of recent observations when it has one,
+    `예측 pose_local(m 3)`), then the σ_t/σ_r/b pose noise when there is any. An item without `pose` gets
+    `"정답 자세"` or that noise.
     """
     triple = _pose_triple(item)
     pose = item.get("pose")
@@ -407,10 +409,16 @@ def _pose_label(item: dict) -> str:
     parts = [f"구성 {pose['config'] or '-'}", source,
              f"리그 켬(기준 {_g(pose['rig_ref'])}°)" if pose["rig"] else "리그 끔",
              fuse, f"시작점 {pose['anchor']}", f"정합 {_align_text(pose['align'])}",
-             f"예측 {pose['predict']}"]
+             _predict_text(pose)]
     if triple != _NO_POSE_NOISE:
         parts.append(_pose_values_text(triple))
     return " · ".join(parts)
+
+
+def _predict_text(pose: dict) -> str:
+    """The tracker prediction of a `pose` entry, with its window of recent observations when it has one."""
+    window = pose.get("predict_window")
+    return f"예측 {pose['predict']}" if window is None else f"예측 {pose['predict']}(m {window})"
 
 
 def _pose_labels(results: dict) -> set[str] | None:
@@ -506,7 +514,7 @@ _RPE_HEADERS = ["RPE", "p50", "p90", "최대"]
 _END_ERROR_HEADERS = ["끝 오차(패스 중앙값, 절댓값)", "위치 cm", "위치 %", "회전 °", "진행 cm", "옆 cm", "높이 cm",
                       "요 °", "기울기 °"]
 _END_ERROR_ROWS = (("패스 안 표류", "in_pass"), ("패스 안 표류(카메라 틀, 보조)", "in_pass_cam"),
-                   ("시작 오차", "start"), ("월드 끝 오차", "world_end"))
+                   ("시작 오차", "start"), ("월드 끝 오차", "world_end"), ("월드 끝 오차(정합 뒤)", "world_end_aligned"))
 _INTERPASS_HEADERS = ["패스 사이 어긋남", "짝 수", "p50 cm", "p90 cm"]
 _RIG_FRAME_NOTE = "> 패스 안 표류와 RPE는 기준 카메라 틀이다(리그 보정을 믿는 값으로 옮김)."
 
@@ -535,6 +543,67 @@ def _pose_quality_lines(pq: dict, pose: dict) -> list[str]:
     lines.append(f"> 견줄 값: 중복 제거 {pose['dedup']} 반경 {_g(pose['dedup_radius_m'] * 100)} cm, "
                  f"band {_g(pose['dedup_band_m'] * 100)} cm, 화면 게이트 {_g(pose['gate_px_frac'])}"
                  "(0.5 ≈ 사과 과실 ±2.5 cm, 배 봉지 ±10 cm)")
+    lines.append("")
+    return lines
+
+
+_ALIGN_STAGE_TEXT = {"same_side": "같은 면", "both_sides": "양면", "row_plane": "줄 중심면", "truth_pass": "패스별 정답",
+                     "truth_segment": "구간별 정답", "oracle_struct": "오라클 시설"}
+_ALIGN_USES = ("own", "nearest", "line", "group", "identity")
+_ALIGN_HEADERS = ["단계", "무리", "구간", "자기", "가까운", "직선", "무리 하나", "항등", "짝 중앙값", "잔차 중앙값 cm",
+                  "옆 이동 중앙값 cm"]
+
+
+def _with_unit(text: str, unit: str) -> str:
+    """`text` and its unit, or `-` alone."""
+    return text if text == "-" else text + unit
+
+
+def _setting(x, unit: str = "") -> str:
+    return "-" if x is None else _g(x) + unit
+
+
+def _median_or_none(values: list) -> float | None:
+    return float(np.median(values)) if values else None
+
+
+def _alignment_stage_row(stage: dict) -> list[str]:
+    """One stage record of an `alignment` entry as a table row: the counts of its segments by use, the
+    median count and residual of the segments with a fit of their own, and the median absolute move across
+    the row of every segment."""
+    rows = stage["segments"]
+    own = [r for r in rows if r["use"] == "own"]
+    return [_ALIGN_STAGE_TEXT.get(stage["stage"], stage["stage"]), stage["group"], str(len(rows)),
+            *(str(sum(r["use"] == use for r in rows)) for use in _ALIGN_USES),
+            _count(_median_or_none([r["n"] for r in own])),
+            _cm(_median_or_none([r["residual_m"] for r in own if r["residual_m"] is not None])),
+            _cm(_median_or_none([abs(r["move_m"][1]) for r in rows]))]
+
+
+def _alignment_lines(entry: dict) -> list[str]:
+    """The alignment of one rung (its `alignment` entry): the settings it ran with (a setting it did not use
+    is `-`; the stress keys and the oracle noise only when set), then a row per stage and group, or, for a
+    seed mean (which keeps no stages), its summary."""
+    st = entry["settings"]
+    line = (f"> 정합 설정: 구간 {_setting(st['segment_m'], ' m')} · 짝 반경 {_setting(st['pair_radius_m'], ' m')} · "
+            f"σ_rp {_setting(st['roll_pitch_sigma_deg'], '°')} · 짝 하한 {_setting(st['min_pairs'])}")
+    if st["stress_row_bias_m"] is not None:
+        line += f" · 줄 치우침 {_g(st['stress_row_bias_m'] * 100)} cm"
+    if st["stress_pair_keep"] is not None:
+        line += f" · 짝 남김 {_g(st['stress_pair_keep'])}"
+    if st["oracle_sigma_m"] is not None:
+        line += f" · 시설 잡음 {_g(st['oracle_sigma_m'] * 100)} cm"
+    lines = ["**정합**", line]
+    if "stages" in entry:
+        lines.append("")
+        lines += _table(_ALIGN_HEADERS, [_alignment_stage_row(stage) for stage in entry["stages"]])
+    else:
+        s = entry["summary"]
+        lines.append(f"> 정합 요약(시드 평균): 구간 {_count(s['segments'])} · 자기 {_count(s['own'])} · "
+                     f"가까운 {_count(s['nearest'])} · 직선 {_count(s['line'])} · 무리 하나 {_count(s['group'])} · "
+                     f"항등 {_count(s['identity'])} · 짝 중앙값 {_count(s['pairs_p50'])} · "
+                     f"잔차 중앙값 {_with_unit(_cm(s['residual_p50_m']), ' cm')} · "
+                     f"줄 이동 중앙값 {_with_unit(_cm(s['row_shift_p50_m']), ' cm')}")
     lines.append("")
     return lines
 
@@ -1039,6 +1108,15 @@ def render_report(results: dict, *, criteria: Mapping | None) -> str:
     line says so. When the rungs' pose sources differ, each rung's heading is followed by its
     `> 자세:` line. A noisy rung with pose-model noise keys gets `_pose_noise_line` under its noise
     line, and a rung with `pose_quality` gets `_pose_quality_lines` after its Y6 section.
+
+    A rung whose `alignment` is not None gets `_alignment_lines` after its pose quality: the settings
+    line (`> 정합 설정`: segment length, pair radius, roll and pitch prior and fewest pairs, `-` for a
+    setting the mode did not use, then the row bias, the pair share kept and the oracle noise when set) and
+    the alignment table, one row per stage and group: the stage (`같은 면`, `양면`, `줄 중심면`, `패스별 정답`,
+    `구간별 정답`, `오라클 시설`), the group, the segment count, the count of segments by use (`자기` own,
+    `가까운` nearest, `직선` line, `무리 하나` group, `항등` identity), the median count and residual of the
+    segments with a fit of their own and the median absolute move across the row of all its segments. A
+    seed mean keeps no stages, so it gets the `> 정합 요약(시드 평균)` line of its summary instead.
     """
     lines = [f"# Y1·Y6 합성 채점 — {results['run_name']} ({results['experiment_id']})",
              f"> 합성 렌더 · {_pose_text(results)} · 보정 전(U). 실제 정확도가 아니다."]
@@ -1108,6 +1186,8 @@ def render_report(results: dict, *, criteria: Mapping | None) -> str:
                 lines.append("")
             if rung.get("pose_quality") is not None:
                 lines += _pose_quality_lines(rung["pose_quality"], rung["pose"])
+            if rung.get("alignment") is not None:
+                lines += _alignment_lines(rung["alignment"])
             if noisy:
                 lines.append(f"**잡음 시드별 ({rung_name})**")
                 lines += _table(_NOISE_SEED_HEADERS, _noise_seed_rows(rung))

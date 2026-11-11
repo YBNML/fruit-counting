@@ -6,7 +6,11 @@ A detection cut by the image border is compared on its inner (uncut) edge,
 and a track ends only when its grown predicted box leaves the image. Tracks
 without 3D, and every track under `method="last_box"`, chain by IoU with the
 previous box instead. With `depth_gate="soft"` a depth-gate failure inside the
-screen gate costs `soft_cost` extra instead of being refused.
+screen gate costs `soft_cost` extra instead of being refused. Under
+`predict: pose_local` a landmark is predicted from the median of its last
+`predict_window` observations that define X, so drift since its older
+observations does not move the prediction; the track's X stays the median of
+every observation.
 """
 
 from __future__ import annotations
@@ -188,6 +192,22 @@ class _Track:
         self.box = box
         self.miss = 0
 
+    def recent_point(self, window: int) -> np.ndarray:
+        """Component-wise median of the last `window` observations that define X (`_x_rows`); X (NaN) without one."""
+        P, E = np.array(self._P, dtype=float).reshape(-1, 3), np.array(self._E, dtype=bool)
+        sel = _x_rows(P, E)
+        if not sel.any():
+            return self.X
+        return np.median(P[sel][-window:], axis=0)
+
+
+def _prediction(landmarks: Sequence[_Track], cfg: TrackerConfig) -> np.ndarray:
+    """The (n, 3) points `landmarks` are predicted from: each track's X under `predict: pose`, the median of its
+    last `predict_window` observations that define X under `predict: pose_local`."""
+    if cfg.predict == "pose_local":
+        return np.stack([t.recent_point(cfg.predict_window) for t in landmarks])
+    return np.stack([t.X for t in landmarks])
+
 
 def _cost_matrix(
     active: list[_Track], boxes: np.ndarray, touch: np.ndarray, zP: np.ndarray, cfg: TrackerConfig
@@ -273,7 +293,7 @@ def track_pass(
         landmarks = [t for t in active if method == "landmark" and np.isfinite(t.X).all()]
         if landmarks:
             uv, z, s, alive = predict_boxes(
-                cam, np.stack([t.X for t in landmarks]), np.array([t.S for t in landmarks]), cfg.gate_px_frac
+                cam, _prediction(landmarks, cfg), np.array([t.S for t in landmarks]), cfg.gate_px_frac
             )
             for k, t in enumerate(landmarks):
                 t.pred = (uv[k], float(s[k]), float(z[k]))

@@ -8,6 +8,7 @@ import pytest
 import yaml
 from typer.testing import CliRunner
 
+import counting.evaluation.fusion as fusion_module
 from counting.config.eval_schema import EvalAppConfig
 from counting.config.loader import load_yaml_model
 from counting.evaluation.cli import eval_app
@@ -170,25 +171,28 @@ def test_dev_pose_configs_follow_the_dev_configs_and_frozen_knobs():
 
 def test_eval_ladder_runs_the_supported_pose_rungs(apple_run, tmp_path):
     args = ["ladder", "--config", _pose_cfg_file(tmp_path, apple_run), "--ladder", str(POSE / "ladder_pose.yaml"),
-            "--rungs", "L3,L4_base", "--splits", SPLITS]
+            "--rungs", "L3,L3_al,L4_base", "--splits", SPLITS]
     r = runner.invoke(eval_app, args)
     assert r.exit_code == 0, r.output
     (d,) = (tmp_path / "out" / "apple_dev_pose_c2").iterdir()
     res = json.loads((d / "results.json").read_text(encoding="utf-8"))
     rungs = res["runs"][0]["rungs"]
-    assert res["schema_version"] == 9 and list(rungs) == ["L3", "L4_base"]
+    assert res["schema_version"] == 10 and list(rungs) == ["L3", "L3_al", "L4_base"]
+    assert rungs["L3_al"]["alignment"]["mode"] == ["tracks", "row_plane"] and rungs["L3"]["alignment"] is None
     for name, rung in rungs.items():
         assert rung["pose"]["config"] == "c2" and rung["pose_quality"] is not None, name
     report = (d / "report.md").read_text(encoding="utf-8")
     assert "자세 출처 칸 있음(칸마다 적음)" in report
-    assert report.splitlines().count("**자세 품질**") == 2
+    assert report.splitlines().count("**자세 품질**") == 3
 
 
-def test_eval_refuses_unsupported_pose_rungs(apple_run, tmp_path):
+def test_eval_refuses_unsupported_pose_rungs(apple_run, tmp_path, monkeypatch):
     base = ["ladder", "--config", _pose_cfg_file(tmp_path, apple_run), "--ladder", str(POSE / "ladder_pose.yaml"),
             "--splits", SPLITS]
+    monkeypatch.setattr(fusion_module, "FUSE_FIXED_PATH", tmp_path / "absent" / "fuse_fixed.yaml")
+    monkeypatch.setattr(fusion_module, "has_gtsam", lambda: True)
     r = runner.invoke(eval_app, [*base, "--rungs", "L4_drift"])
-    assert r.exit_code == 2 and "error: align.mode=tracks,row_plane is not supported" in r.output, r.output
+    assert r.exit_code == 2 and "no fixed fusion settings; pose.fuse reads them" in r.output, r.output
     assert not (tmp_path / "out").exists()
     r = runner.invoke(eval_app, [*base, "--rungs", "LVI"])     # the development config names no pose cache
     assert r.exit_code == 2 and "pose.source=file needs pose.cache, one of pose.caches" in r.output, r.output

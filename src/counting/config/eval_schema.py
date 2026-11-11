@@ -292,6 +292,12 @@ class AlignConfig(BaseModel):
     `mode` is one method name, or a list of the methods that run in order. The stress keys degrade a listed
     method: `stress_row_bias_m` adds a bias (m, any sign) to the row centre plane `row_plane` estimates, and
     `stress_pair_keep` is the share of the track pairs seen from both sides that `tracks` keeps.
+
+    The knobs set the segment length (m), the pair search radius (m), the roll and pitch prior of the rigid
+    fits (deg; it holds them under pose.fuse=imu only, and unset it takes its start value from the believed
+    turn-on accelerometer bias and camera-IMU rotation, whatever IMU noise the config generates), the least
+    number of track pairs a fit needs and the noise (m) of the oracle structure observations; an unset knob
+    takes its start value, and a mode that does not use a knob ignores it.
     """
 
     model_config = ConfigDict(extra="forbid", allow_inf_nan=False)
@@ -299,6 +305,11 @@ class AlignConfig(BaseModel):
            | Annotated[list[AlignMethod], Field(min_length=1)]) = "none"
     stress_row_bias_m: float | None = Field(default=None, exclude_if=_unset)
     stress_pair_keep: float | None = Field(default=None, gt=0, le=1, exclude_if=_unset)
+    segment_m: float | None = Field(default=None, gt=0, exclude_if=_unset)
+    pair_radius_m: float | None = Field(default=None, gt=0, exclude_if=_unset)
+    roll_pitch_sigma_deg: float | None = Field(default=None, gt=0, exclude_if=_unset)
+    min_pairs: int | None = Field(default=None, ge=3, exclude_if=_unset)
+    oracle_sigma_m: float | None = Field(default=None, gt=0, exclude_if=_unset)
 
     @model_validator(mode="after")
     def _check_methods(self) -> AlignConfig:
@@ -314,7 +325,9 @@ class AlignConfig(BaseModel):
 
 class TrackerConfig(BaseModel):
     model_config = ConfigDict(extra="forbid")
-    predict: Literal["pose"] = "pose"
+    predict: Literal["pose", "pose_local"] = "pose"
+    # predict=pose_local only: how many of a track's latest observations that define X its prediction takes.
+    predict_window: int | None = Field(default=None, ge=1, exclude_if=_unset)
     gate_px_frac: float = Field(default=0.5, gt=0)
     gate_m: float = Field(default=0.05, gt=0)
     depth_gate: Literal["hard", "soft"] = "hard"
@@ -331,6 +344,14 @@ class TrackerConfig(BaseModel):
     def _check_score_order(self) -> TrackerConfig:
         if self.score_lo > self.score_hi:
             raise ValueError("score_lo must be <= score_hi")
+        return self
+
+    @model_validator(mode="after")
+    def _check_predict_window(self) -> TrackerConfig:
+        if self.predict == "pose_local" and self.predict_window is None:
+            raise ValueError("tracker.predict=pose_local needs tracker.predict_window")
+        if self.predict_window is not None and self.predict != "pose_local":
+            raise ValueError("tracker.predict_window needs tracker.predict=pose_local")
         return self
 
     def min_obs_for(self, det: str) -> int:

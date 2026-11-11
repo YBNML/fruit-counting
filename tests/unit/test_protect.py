@@ -360,7 +360,7 @@ def test_eval_ladder_on_the_test_split_logs_every_run_and_warns_on_reruns(heldou
     res = json.loads((d1 / "results.json").read_text(encoding="utf-8"))
     rec = json.loads((d1 / "record.json").read_text(encoding="utf-8"))
     verdicts = res["verdicts"]["L1"]
-    assert res["split"] == "test" and res["schema_version"] == 9 and "warning:" not in out1
+    assert res["split"] == "test" and res["schema_version"] == 10 and "warning:" not in out1
     assert [v["metric"] for v in verdicts] == ["y1.e1_median", "y1.e1_max", "y1.dup_rate", "y1.miss_rate",
                                                "y1.merge_rate"] and res["pooled"]["L1"]["n_runs"] == 1
     assert "**판정 (test, 장면 시드 1개)**" in (d1 / "report.md").read_text(encoding="utf-8")

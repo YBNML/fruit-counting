@@ -74,12 +74,11 @@ there is no GPS fix. The IMU stream, the frame times and the standstill come fro
 through `fusion.fusion_inputs`, and the cameras from the fused body as above.
 
 Modes. `check_pose_supported` lets through `pose.source` truth or file, with or without the rig,
-fusion (`pose.fuse=imu` on either source, `pose.fuse=vo` on a file source), and `align.mode` none or
-fit_truth_pass. In this order it stops fusion on `split=test`, a file source on `split=test` or with
-`noise.drift_time_offset_s` above 0, and the other alignment modes with `NotImplementedError`; then
-fusion without gtsam (`NotImplementedError`) or without the fixed fusion settings
-(`FileNotFoundError`). `pose_settings` names the settings a result ran with, and `pose_cache_entry`
-the pose cache a file source read.
+fusion (`pose.fuse=imu` on either source, `pose.fuse=vo` on a file source), and every `align.mode`.
+In this order it stops fusion on `split=test` and a file source on `split=test` or with
+`noise.drift_time_offset_s` above 0 with `NotImplementedError`, then fusion without gtsam
+(`NotImplementedError`) or without the fixed fusion settings (`FileNotFoundError`). `pose_settings`
+names the settings a result ran with, and `pose_cache_entry` the pose cache a file source read.
 """
 
 from __future__ import annotations
@@ -110,7 +109,6 @@ from counting.odometry.vo import VoFrame
 
 # The drift keys that change the cameras (`depth_k` changes the depths only).
 DRIFT_CAMERA_KEYS = tuple(key for key in DRIFT_KEYS if key != "depth_k")
-SUPPORTED_ALIGN = ("none", "fit_truth_pass")
 _PITCH_TOL = 1e-6
 _SIDE_KEYS = ("pass_side_trans_m", "pass_side_rot_deg")
 _PITCH_KEYS = ("pass_pitch_trans_m", "pass_pitch_rot_deg")
@@ -119,13 +117,11 @@ _RIG_KEYS = ("rig_extr_trans_mm", "rig_extr_rot_deg")
 
 def check_pose_supported(cfg: EvalAppConfig) -> None:
     """Refuse the pose settings the runner does not run, in this order: fusion (`pose.fuse` vo or imu)
-    with `split=test`, `pose.source=file` with `split=test`,
-    `pose.source=file` with `noise.drift_time_offset_s` above 0, then an `align.mode` other than none or
-    fit_truth_pass (a list of methods shown joined by commas), each with `NotImplementedError`; then
-    fusion without gtsam (`NotImplementedError`, looked up with `importlib.util.find_spec` only) and
-    fusion without the fixed fusion settings `fusion.FUSE_FIXED_PATH` (`FileNotFoundError`). A config
-    without `pose` and `align` passes."""
-    pose, align = cfg.pose, cfg.align
+    with `split=test`, `pose.source=file` with `split=test`, then `pose.source=file` with
+    `noise.drift_time_offset_s` above 0, each with `NotImplementedError`; then fusion without gtsam
+    (`NotImplementedError`, looked up with `importlib.util.find_spec` only) and fusion without the fixed
+    fusion settings `fusion.FUSE_FIXED_PATH` (`FileNotFoundError`). A config without `pose` passes."""
+    pose = cfg.pose
     fused = pose is not None and pose.fuse != "none"
     if fused and cfg.split == "test":
         raise NotImplementedError(f"pose.fuse={pose.fuse} with split=test is not supported")
@@ -134,9 +130,6 @@ def check_pose_supported(cfg: EvalAppConfig) -> None:
     if pose is not None and pose.source == "file" and cfg.noise.factor("drift_time_offset_s") > 0:
         raise NotImplementedError("noise.drift_time_offset_s > 0 with pose.source=file is not supported; the "
                                   "camera-IMU time belief of a file source is noise.imu_time_offset_ms")
-    if align is not None and (isinstance(align.mode, list) or align.mode not in SUPPORTED_ALIGN):
-        mode = ",".join(align.mode) if isinstance(align.mode, list) else align.mode
-        raise NotImplementedError(f"align.mode={mode} is not supported")
     if fused and not fusion_mod.has_gtsam():
         raise NotImplementedError(f"pose.fuse={pose.fuse} needs gtsam (the conda-forge build in the environment files)")
     if fused and not fusion_mod.FUSE_FIXED_PATH.is_file():
@@ -169,9 +162,10 @@ def pose_settings(cfg: EvalAppConfig, noise_seed: int | None, *, planned: bool =
     pose of a bundle rendered with body shake, and `nominal_from_first_frame` otherwise;
     `pose.anchor=first_truth` gives `first_frame_truth`), the rig, fusion and `align.mode` ("none"
     without an align section, a list for listed methods), the tracker and dedup settings the pose
-    errors meet, `cache`: the pose cache a file source read (None for a truth source) and, last,
-    `imu`: the IMU streams a fused run read (`FusionInputs.imu`; None without them) and `fusion`: the
-    fusion it ran (`fusion.fusion_entry`; None without fusion)."""
+    errors meet, `cache`: the pose cache a file source read (None for a truth source), `imu`: the IMU
+    streams a fused run read (`FusionInputs.imu`; None without them), `fusion`: the fusion it ran
+    (`fusion.fusion_entry`; None without fusion) and, last, `flow`: the optical-flow cache the tracker
+    prediction read (None without one)."""
     pose, align = cfg.pose, cfg.align
     drift = drift_active(cfg, noise_seed)
     start = None
@@ -186,9 +180,9 @@ def pose_settings(cfg: EvalAppConfig, noise_seed: int | None, *, planned: bool =
         mode = list(align.mode) if isinstance(align.mode, list) else align.mode
     return {"config": pose.config_label, "source": pose.source, "drift": drift, "anchor": pose.anchor,
             "start": start, "rig": pose.rig, "rig_ref": pose.rig_ref, "fuse": pose.fuse, "align": mode,
-            "predict": cfg.tracker.predict, "dedup": cfg.stages.dedup, "dedup_radius_m": cfg.dedup.radius_m,
-            "dedup_band_m": cfg.dedup.band_m, "gate_px_frac": cfg.tracker.gate_px_frac, "cache": cache,
-            "imu": imu, "fusion": fusion}
+            "predict": cfg.tracker.predict, "predict_window": cfg.tracker.predict_window, "dedup": cfg.stages.dedup,
+            "dedup_radius_m": cfg.dedup.radius_m, "dedup_band_m": cfg.dedup.band_m,
+            "gate_px_frac": cfg.tracker.gate_px_frac, "cache": cache, "imu": imu, "fusion": fusion, "flow": None}
 
 
 def pose_cache_entry(cfg: EvalAppConfig, pose_file: PoseFile | None) -> dict | None:

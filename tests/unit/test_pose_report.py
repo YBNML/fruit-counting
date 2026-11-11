@@ -47,7 +47,7 @@ def _quality(rpe_p50: float, both_p50: float | None) -> dict:
 
 
 def _without_pose(res: dict) -> dict:
-    return {k: v for k, v in res.items() if k not in ("pose", "pose_quality")}
+    return {k: v for k, v in res.items() if k not in ("pose", "pose_quality", "alignment")}
 
 
 @pytest.fixture(scope="module")
@@ -167,5 +167,5 @@ def test_sweep_cells_check_pose_settings_after_the_rung(tmp_path):
                 assert config_hash(cell.cfg) == config_hash(twice), (name, crop, cell.point.name, cell.base)
 
 
-def test_schema_version_is_9():
-    assert SCHEMA_VERSION == 9
+def test_schema_version_is_10():
+    assert SCHEMA_VERSION == 10
