@@ -537,6 +537,131 @@ def pose_vo(
         raise typer.Exit(code=2)
 
 
+@pose_app.command("imu")
+def pose_imu(
+    config: str = typer.Option(..., "--config", help="Simulated IMU YAML"),
+    run_: list[str] = typer.Option(..., "--run", help="A bundle to make the IMU file of (repeat for more)"),
+    set_: list[str] = typer.Option(None, "--set", help="Dot-path override: key.path=value", show_default=False),
+    splits_path: str = typer.Option(
+        "configs/eval/splits_pose.yaml", "--splits",
+        help="Splits YAML (every bundle's seed must be in a split other than test)",
+    ),
+) -> None:
+    """Simulate the IMU of bundles and write one IMU file per bundle.
+
+    Each file goes to `<output_dir>/<IMU config hash>/<run_id>.npz`, with a `.json` summary next to it,
+    and is written once: an existing file or summary stops the command before any stream is made. A file
+    holds a measured stream for every drive of both layouts (`rig`: one drive per side; `pass`: one drive
+    per pass) under every noise seed of the config: the noiseless samples of the bundle's body motion (its
+    recorded trajectory, or the assumed straight drive of a bundle without one) plus the profile's noise,
+    drawn under the config `seed`, the noise seed and the bundle seed. Every bundle's drives are made
+    before the first file is written. The file meta names the bundle (run id, fingerprint), the profile
+    and its noise, the sampling, the assumed motion, the trajectory source, the settings hash, the numpy
+    and SciPy versions, the code state and the splits file's sha256; the time taken goes to the summary
+    only. Every bundle must be a sequence bundle with its seed in a split other than test: this command
+    makes no IMU file of a test bundle. A profile without white noise or turn-on bias is refused when the
+    config is read, since a noiseless IMU is the truth.
+
+    Exit code 0 is success, 1 is a check failure (a seed in no split or in the test split, an existing
+    file or summary), 2 is an input error (missing bundle, a bundle that is not a sequence, a bad config
+    or `--set`, a profile without white noise or turn-on bias).
+    """
+    import importlib.metadata
+    import json
+    import os
+    import time
+    from dataclasses import asdict
+    from pathlib import Path
+
+    import numpy as np
+
+    from counting.config.eval_schema import SplitsConfig
+    from counting.config.hashing import config_hash
+    from counting.config.loader import load_yaml_model
+    from counting.config.pose_schema import ImuConfig
+    from counting.data.formats.orchard_synth import SynthRun
+    from counting.detection.cached import file_sha256
+    from counting.evaluation.imusim import AssumedMotion, ImuProfile, ImuSampling, imu_session, session_drives
+    from counting.evaluation.record import git_state
+    from counting.evaluation.runner import CheckFailed
+    from counting.odometry.imufile import LAYOUTS, imu_file_path, write_imu_file
+
+    try:
+        try:
+            cfg = load_yaml_model(config, ImuConfig, overrides=set_)
+        except KeyError as e:  # a --set path that cannot be descended
+            raise ValueError(f"--set: {e.args[0]}") from e
+        splits = load_yaml_model(splits_path, SplitsConfig)
+
+        bundles = [SynthRun.open(path) for path in run_]
+        for bundle in bundles:
+            seed = bundle.meta.seed
+            split = splits.split_of(seed)
+            if split is None:
+                raise CheckFailed(f"{bundle.root}: seed {seed} is in no split")
+            if split == "test":
+                raise CheckFailed(f"{bundle.root}: seed {seed} is a test seed; this command makes no IMU file "
+                                  "of a test bundle")
+            if not bundle.meta.is_sequence:
+                raise ValueError(f"{bundle.root}: not a sequence bundle (max_frames or irregular step)")
+        bundles.sort(key=lambda b: (b.meta.fingerprint, b.meta.run_id))
+
+        chash = config_hash(cfg)
+        paths = [imu_file_path(Path(cfg.output_dir).expanduser() / chash, b.meta.run_id) for b in bundles]
+        for path in paths:
+            for p in (path, path.with_suffix(".json")):
+                if p.exists():
+                    raise CheckFailed(f"{p}: IMU file exists; remove it first to make it again")
+        # Every bundle's drives come before the first write, so a bad bundle stops the command before any
+        # file is written.
+        motion = AssumedMotion.of(cfg)
+        drives = [{layout: session_drives(b, layout, motion) for layout in LAYOUTS} for b in bundles]
+
+        profile, sampling = ImuProfile.from_config(cfg.noise), ImuSampling.of(cfg)
+        code = git_state()
+        common = {"imu_seed": cfg.seed, "noise_seeds": list(cfg.noise_seeds), "profile": cfg.profile,
+                  "noise": cfg.noise.model_dump(), "rate_hz": cfg.rate_hz, "acc_range_g": cfg.acc_range_g,
+                  "row_end_s": cfg.row_end_s, "motion": asdict(motion), "imu_config_hash": chash,
+                  "numpy": np.__version__, "scipy": importlib.metadata.version("scipy"),
+                  "counting_commit": code["commit"], "counting_dirty": code["dirty"],
+                  "splits_sha256": file_sha256(Path(splits_path).expanduser())}
+        for bundle, by_layout, path in zip(bundles, drives, paths):
+            m = bundle.meta
+            start = time.perf_counter()
+            streams, rows = {}, []   # keys in layout, noise seed, drive order
+            for layout in LAYOUTS:
+                for noise_seed in cfg.noise_seeds:
+                    measured = imu_session(by_layout[layout], profile, sampling, imu_seed=cfg.seed,
+                                           noise_seed=noise_seed, scene=m.seed)
+                    for d, stream in zip(by_layout[layout], measured):
+                        streams[d.stream_key(noise_seed)] = stream
+                        rows.append({"layout": layout, "noise_seed": noise_seed, "side": d.side, "aisle": d.aisle,
+                                     "pitch": d.pitch_deg, "samples": len(stream.t),
+                                     "t_first": float(stream.t[0]), "t_last": float(stream.t[-1])})
+            meta = {"run_id": m.run_id, "fingerprint": m.fingerprint, **common,
+                    "traj_source": by_layout["rig"][0].source}
+            digest = write_imu_file(path, streams, meta)
+            seconds = time.perf_counter() - start
+            summary = {"digest": digest, "file": path.name, "meta": meta, "streams": rows, "seconds": seconds}
+            sidecar = path.with_suffix(".json")
+            tmp = sidecar.with_name(sidecar.name + ".tmp")
+            with open(tmp, "w", encoding="utf-8") as fh:
+                fh.write(json.dumps(summary, sort_keys=True, indent=2) + "\n")
+                fh.flush()
+                os.fsync(fh.fileno())
+            os.replace(tmp, sidecar)
+            typer.echo(str(path))
+            typer.echo(f"{m.run_id}: profile {cfg.profile}, drives rig {len(by_layout['rig'])} pass "
+                       f"{len(by_layout['pass'])}, noise seeds {','.join(map(str, cfg.noise_seeds))}, "
+                       f"samples {sum(r['samples'] for r in rows)}, digest {digest[:16]}, {seconds:.1f} s")
+    except (CheckFailed, FileExistsError) as e:
+        typer.echo(f"error: {e}")
+        raise typer.Exit(code=1)
+    except (ValueError, FileNotFoundError) as e:
+        typer.echo(f"error: {e}")
+        raise typer.Exit(code=2)
+
+
 @_train_app.command("pseco-head")
 def train_pseco_head_cli(
     config: str = typer.Option(..., "--config", "-c"),

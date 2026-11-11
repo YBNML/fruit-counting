@@ -1,6 +1,6 @@
 """`counting eval` sub-app: `eval truth` prints pass/tree ground-truth tables and runs
 the summary/geometry/split checks for one or more orchard_synth bundles and, for bundles
-rendered with body shake, the rig and trajectory checks; `eval run` and
+rendered with body shake, the rig, trajectory and IMU checks; `eval run` and
 `eval ladder` score a stage setting (or walk the oracle ladder) and write the experiment
 folder; `eval sweep` scores a grid of stage-setting points (optionally crossed with
 ladder bases) and writes the same kind of experiment folder with a `sweep.csv`. A split=test
@@ -49,10 +49,11 @@ def truth(
 
     For a bundle rendered with body shake it also checks that the cameras at one position
     share their body and time (rig) and that the recorded trajectory gives each frame pose
-    (trajectory), within 1e-6 m and 1e-4 deg.
+    (trajectory), within 1e-6 m and 1e-4 deg, and that noiseless IMU samples of each side's
+    trajectory, integrated from its first frame to its last, end within 2 cm of it (imu).
 
     Exit code 0 is success, 1 is a check failure (summary mismatch/missing, geometry,
-    split, rig, trajectory), 2 is an input error. A bundle whose sampled frames show no
+    split, rig, trajectory, imu), 2 is an input error. A bundle whose sampled frames show no
     ground reports ground=n/a; the centre check still applies.
     """
     from counting.config.eval_schema import SplitsConfig
@@ -61,6 +62,7 @@ def truth(
     from counting.evaluation.truth import (
         SummaryMismatch,
         check_geometry,
+        check_imu,
         check_rig,
         check_summary,
         check_trajectory,
@@ -177,6 +179,7 @@ def truth(
             if run.meta.shake:
                 rig = check_rig(run)
                 traj = check_trajectory(run)
+                imu = check_imu(run)
                 rig_detail = (
                     f"positions={rig['positions']}, pairs={rig['pairs']}, max_pos_m={rig['max_pos_m']:.3g}, "
                     f"max_rot_deg={rig['max_rot_deg']:.3g}, max_dt_s={rig['max_dt_s']:.3g}"
@@ -185,9 +188,14 @@ def truth(
                     f"frames={traj['frames']}, max_pos_m={traj['max_pos_m']:.3g}, "
                     f"max_rot_deg={traj['max_rot_deg']:.3g}"
                 )
+                imu_detail = (
+                    f"drives={imu['drives']}, max_end_m={imu['max_end_m']:.3g}, "
+                    f"max_end_deg={imu['max_end_deg']:.3g}"
+                )
                 typer.echo(f"rig {'OK' if rig['passed'] else 'FAIL'} ({rig_detail})")
                 typer.echo(f"trajectory {'OK' if traj['passed'] else 'FAIL'} ({traj_detail})")
-                if not (rig["passed"] and traj["passed"]):
+                typer.echo(f"imu {'OK' if imu['passed'] else 'FAIL'} ({imu_detail})")
+                if not (rig["passed"] and traj["passed"] and imu["passed"]):
                     failed = True
     except (ValueError, FileNotFoundError, NotImplementedError) as e:
         typer.echo(f"error: {e}")

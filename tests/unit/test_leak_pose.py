@@ -26,7 +26,8 @@ def test_runner_import_loads_no_cv2_gtsam_or_torch():
     mods = ["counting.evaluation.runner", "counting.evaluation.cli", "counting.evaluation.posesource",
             "counting.evaluation.sweep", "counting.evaluation.report", "counting.geometry.rig",
             "counting.geometry.noise", "counting.config.pose_schema", "counting.cli", "counting.geometry.posefile",
-            "counting.odometry.cache", "counting.odometry.vo"]
+            "counting.odometry.cache", "counting.odometry.vo", "counting.odometry.imufile",
+            "counting.evaluation.imusim", "counting.evaluation.truth"]
     code = "import importlib, sys\n" + "".join(f"importlib.import_module({m!r})\n" for m in mods) + \
            "print(sorted(m for m in ('cv2', 'gtsam', 'torch') if m in sys.modules))"
     assert python_c(code).strip() == "[]"
@@ -68,7 +69,7 @@ def test_vo_inputs_carry_no_pose(apple_run):
 
 def test_odometry_modules_cannot_reach_truth():
     paths = sorted((SRC / "odometry").glob("*.py"))
-    assert {p.name for p in paths} >= {"__init__.py", "cache.py", "vo.py"}
+    assert {p.name for p in paths} >= {"__init__.py", "cache.py", "imufile.py", "vo.py"}
     for path in paths:
         for node in ast.walk(ast.parse(path.read_text(encoding="utf-8"))):
             if isinstance(node, ast.Import):

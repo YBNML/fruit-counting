@@ -1,5 +1,5 @@
 """Ground-truth sets, the summary.json self-check, the pass subsets and their table, the geometry check,
-and the rig and trajectory checks of bundles rendered with body shake.
+and the rig, trajectory and IMU checks of bundles rendered with body shake.
 
 Everything here reads `SceneTruth`/`FruitGt`/`GtRecord` from an orchard_synth
 bundle, so only evaluation and oracle code should import this module (the
@@ -19,12 +19,14 @@ from scipy.spatial.transform import Rotation
 from counting.data.formats.orchard_synth import (
     FrameInput, FramePlan, GtRecord, OrchardLayout, PassKey, SceneTruth, SynthRun, read_depth_m,
 )
+from counting.evaluation.imusim import imu_check
 from counting.geometry.rig import interpolate_pose, pitch_extrinsic, pose_matrix, relative_extrinsic
 
 _GROUND_SEMANTIC = 7
 _GROUND_SAMPLE_MAX = 2000
 RIG_TOL_M = 1e-6      # rig and trajectory checks: position tolerance, metres
 RIG_TOL_DEG = 1e-4    # rig and trajectory checks: rotation tolerance, degrees
+IMU_TOL_M = 0.02      # IMU check: end position tolerance, metres
 
 
 def is_positive(r: GtRecord, variant: str, count1: tuple[float, int]) -> bool:
@@ -276,3 +278,14 @@ def check_trajectory(run: SynthRun, *, tol_m: float = RIG_TOL_M, tol_deg: float 
         max_pos, max_rot = max(max_pos, pos), max(max_rot, rot)
     passed = max_pos <= tol_m and max_rot <= tol_deg
     return {"passed": passed, "frames": len(run.frames), "max_pos_m": max_pos, "max_rot_deg": max_rot}
+
+
+def check_imu(run: SynthRun, *, tol_m: float = IMU_TOL_M) -> dict:
+    """Check that noiseless IMU samples of the recorded body trajectory integrate to its end pose.
+
+    Each side of a bundle rendered with body shake is integrated from its first frame time to its last
+    (`imusim.imu_check`); the check passes when the largest end position error is within `tol_m`.
+    Raises ValueError when `run` is not rendered with body shake.
+    """
+    res = imu_check(run)
+    return {**res, "passed": res["max_end_m"] <= tol_m}
