@@ -1,0 +1,6 @@
+# Generated IMU noise profile for a report rung: the chip's stationary datasheet white noise and a measured bias walk; turn-on bias, temperature and sampling as the judged profile.
+profile: I_lab
+noise: {gyro_n: 7.85e-5, acc_n: 9.81e-4, gyro_w: 1.82e-6, acc_w: 4.75e-5, gyro_b0_dps: 1.0, acc_b0_mg: 4.0, temp_k: 1.0}
+rate_hz: 200.0
+acc_range_g: 4.0
+noise_seeds: [0, 1, 2]

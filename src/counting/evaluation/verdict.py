@@ -32,7 +32,19 @@ its pooled value (`unit="pooled"`); every other metric is judged scene by scene
 noise-seed spread, under `per_run` (in the given bundle order), so a report can
 be built from `results.json` alone without rereading the bundles. The y1 rows of a
 `PITCH_JUDGED_RUNGS` rung take the `JUDGED_PITCHES` values instead (`y1_judged` and
-`judged_y1`) and name the pitches.
+`judged_y1`) and name the pitches. For a noisy rung these are the seed means of each seed's
+judged-pitch pool, and the spread is over those pools.
+
+`PITCH_JUDGED_RUNGS` are rungs L5 and L5VI. A rung L5 row names every `JUDGED_PITCHES[crop]`
+pitch; a rung L5VI row names only those its passes ran (the pitches of every bundle's
+`y1.passes`), and `[]` when it ran none of them (a camera configuration without a judged pitch),
+its value and `ok` then being None.
+
+A pose criteria table names its judged camera configuration (`judged_config`). When the base
+config's camera configuration (`ladder_verdicts`' `config_label`, from `pose.config_label`) is
+named and differs from it, every row gets `report_config` (that name) and keeps the `ok` it
+computes; `verdict_counts`, and so `verdict_summary`, leaves such rows out. A config without a
+configuration name, or a table without `judged_config`, is judged as before.
 
 `subset_verdicts` judges rung L5's pass subsets (`runner._score_subsets`'s table) the
 same way, each against its own truth: `row_abs_e_pipe` scene by scene (the same scene
@@ -47,7 +59,7 @@ from typing import Iterable, Mapping, Sequence
 import numpy as np
 
 from counting.evaluation.ledger import Ledger, combine
-from counting.evaluation.seeds import _mean
+from counting.evaluation.seeds import _mean, _range
 
 POOLED_KEYS = {
     "y1": ("e1_median", "e1_max", "dup_rate", "miss_rate", "merge_rate", "fp_off_rate"),
@@ -57,7 +69,7 @@ POOLED_KEYS = {
 # The camera pitches (deg) of the passes and detection groups judged on a learned detector, per crop.
 JUDGED_PITCHES = {"pear": (45.0, 70.0), "apple": (30.0, 50.0)}
 # Rungs whose y1 is judged on the `JUDGED_PITCHES` passes alone; the other pitches are report-only there.
-PITCH_JUDGED_RUNGS = ("L5",)
+PITCH_JUDGED_RUNGS = ("L5", "L5VI")
 
 _LEDGER_FIELDS = tuple(f.name for f in fields(Ledger))
 
@@ -115,7 +127,13 @@ def pool_rung(items: Sequence[Mapping], pitches: Sequence[float] | None = None) 
 
 def judged_y1(item: Mapping, crop: str) -> dict:
     """The y1 half of `pool_views` over one bundle's rung or sweep cell `item`, at `JUDGED_PITCHES[crop]`
-    alone. Only `item["y1"]` is read, so a sweep cell that keeps no `y6.trees` works too."""
+    alone. Only `item["y1"]` is read, so a sweep cell that keeps no `y6.trees` works too.
+
+    A noisy `item` gives its seeds' mean (`seeds._mean`) of each seed view's judged y1, as `pool_rung`
+    does; only `y1` is read there too.
+    """
+    if item.get("noisy"):
+        return _mean([judged_y1(view, crop) for view in item["per_seed"]])
     return pool_views([{"y1": item["y1"], "y6": None}], JUDGED_PITCHES[crop])["y1"]
 
 
@@ -157,7 +175,8 @@ def _scene_ok(oks: Iterable[bool | None]) -> bool | None:
 
 
 def ladder_verdicts(
-    run_entries: Sequence[Mapping], pooled: Mapping[str, dict], criteria: Mapping, crop: str,
+    run_entries: Sequence[Mapping], pooled: Mapping[str, dict], criteria: Mapping, crop: str, *,
+    config_label: str | None = None,
 ) -> dict[str, list[dict]]:
     """Judge every rung of `pooled` against `criteria[kind][rung][crop]`, in the first bundle's
     rung order and `criteria`'s metric order (`kind` is `y1` then `y6`).
@@ -166,14 +185,23 @@ def ladder_verdicts(
     contributes no rows for that half. Each row is `{metric, op, limit, unit, value, per_run, ok}`:
     `unit` is `"pooled"` (`value` is the pooled value) or `"scene"` (`value` is `None`); `per_run`
     is `[{run_id, seed, value, spread, ok}]` in `run_entries` order, `spread` being the noisy
-    rung's matching `spread` entry or `None`. A row's `ok` is `None` wherever its compared value
+    rung's matching `spread` entry or `None` (on a judged y1 row, the [min, max] over the seeds of
+    each seed view's `judged_y1`). A row's `ok` is `None` wherever its compared value
     is `None`; a `"scene"` row's `ok` is `False` if any scene's is `False`, else `None` if any is
     `None`, else `True`. A rung left with no rows at all is left out of the result.
 
     The y1 rows of a `PITCH_JUDGED_RUNGS` rung are judged on the `JUDGED_PITCHES[crop]` passes
     alone (pooled: `pooled[rung]["y1_judged"]`, from `ladder_pooled(..., crop=crop)`; per scene:
-    `judged_y1`) and carry `"pitches"`; without such a pass, their values and `ok` are None.
+    `judged_y1`) and carry `"pitches"`; without such a pass, their values and `ok` are None. Rung L5's
+    `"pitches"` is `JUDGED_PITCHES[crop]`; rung L5VI's keeps only the pitches its passes ran in some
+    bundle (ascending, `[]` when none).
+
+    With `criteria["judged_config"]` set and `config_label` a name that differs from it, every row
+    also gets `"report_config": config_label` (its `ok` as computed); otherwise no row has the key.
     """
+    judged_config, report_config = criteria.get("judged_config"), None
+    if judged_config and isinstance(config_label, str) and config_label != judged_config:
+        report_config = config_label
     out: dict[str, list[dict]] = {}
     for rung_name in run_entries[0]["rungs"]:
         rows = []
@@ -187,14 +215,21 @@ def ladder_verdicts(
             rungs = [entry["rungs"][rung_name] for entry in run_entries]
             if judged:
                 pooled_vals, scene_vals = pooled[rung_name]["y1_judged"], [judged_y1(r, crop) for r in rungs]
+                spreads = [_range([judged_y1(v, crop) for v in r["per_seed"]]) if r.get("noisy") else None
+                           for r in rungs]
+                pitches = list(JUDGED_PITCHES[crop])
+                if rung_name == "L5VI":
+                    ran = {float(p["pitch"]) for r in rungs for p in r["y1"]["passes"]}
+                    pitches = sorted(set(pitches) & ran)
             else:
                 pooled_vals, scene_vals = pooled[rung_name][kind], [r[kind][metrics_key] for r in rungs]
+                spreads = [r["spread"][kind][metrics_key] if r.get("noisy") else None for r in rungs]
             for key, lim in spec.items():
                 (op, limit), = lim.items()
                 per_run = []
-                for entry, rung, values in zip(run_entries, rungs, scene_vals):
+                for entry, values, seed_spread in zip(run_entries, scene_vals, spreads):
                     per_value = values.get(key)
-                    spread = rung["spread"][kind][metrics_key].get(key) if rung.get("noisy") else None
+                    spread = None if seed_spread is None else seed_spread.get(key)
                     per_run.append({"run_id": entry["meta"]["run_id"], "seed": entry["meta"]["seed"],
                                     "value": per_value, "spread": None if spread is None else list(spread),
                                     "ok": _ok(per_value, op, limit)})
@@ -207,7 +242,9 @@ def ladder_verdicts(
                 row = {"metric": f"{kind}.{key}", "op": op, "limit": limit, "unit": unit,
                        "value": value, "per_run": per_run, "ok": ok}
                 if judged:
-                    row["pitches"] = list(JUDGED_PITCHES[crop])
+                    row["pitches"] = list(pitches)
+                if report_config is not None:
+                    row["report_config"] = report_config
                 rows.append(row)
         if rows:
             out[rung_name] = rows
@@ -269,8 +306,9 @@ def subset_verdicts(
 
 
 def verdict_counts(verdicts: Mapping[str, list[dict]] | None) -> tuple[int, int]:
-    """(# rows across every rung whose `ok` is `True`, total # rows). `verdicts` may be `None`."""
-    rows = [row for rung_rows in (verdicts or {}).values() for row in rung_rows]
+    """(# rows across every rung whose `ok` is `True`, total # rows), leaving out the rows of a report
+    configuration (`report_config`). `verdicts` may be `None`."""
+    rows = [row for rung_rows in (verdicts or {}).values() for row in rung_rows if "report_config" not in row]
     return sum(1 for row in rows if row["ok"] is True), len(rows)
 
 

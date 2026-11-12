@@ -179,7 +179,7 @@ def test_pose_imu_refuses_what_it_does_not_write(heldout_run, tmp_path):
     base = ["pose", "imu", "--config", _imu_config(tmp_path), "--splits", SPLITS]
     held = write_run(tmp_path / "s1003", crop="apple", pitches=(30.0,), seed=1003, size=(64, 36))
     part = write_run(tmp_path / "part", crop="apple", pitches=(30.0,), max_frames=4, size=(64, 36))
-    cases = [(["--run", str(held)], 1, "is a test seed; this command makes no IMU file of a test bundle"),
+    cases = [(["--run", str(held)], 1, "is a test seed; counting pose imu makes an IMU file of a test bundle only from a config file under configs/pose/frozen/"),
              (["--run", str(heldout_run)], 1, "seed 1000 is in no split"),
              (["--run", str(part)], 2, "not a sequence bundle"),
              (["--run", str(held), "--set", "noise.gyro_n=0"], 2, "gyro_n"),

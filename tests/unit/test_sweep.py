@@ -420,7 +420,7 @@ def test_eval_sweep_matches_eval_run_and_writes_the_folder(leaf_runs, tmp_path):
     assert sorted(runs) == [0.04, 0.06]
     assert sorted(p.name for p in sweep_dir.iterdir()) == ["config.yaml", "record.json", "report.md", "results.json",
                                                          "sweep.csv"]
-    assert sweep["schema_version"] == 10 and sweep["sweep"] == {"grid": "g.yaml", "bases": [], "points": [
+    assert sweep["schema_version"] == 11 and sweep["sweep"] == {"grid": "g.yaml", "bases": [], "points": [
         {"name": "baseline", "patch": {}, "factor": None, "value": None},
         {"name": "tracker.repair_m=0.06", "patch": {"tracker": {"repair_m": 0.06}}, "factor": "tracker.repair_m",
          "value": 0.06}]}

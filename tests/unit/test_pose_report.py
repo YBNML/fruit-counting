@@ -167,5 +167,5 @@ def test_sweep_cells_check_pose_settings_after_the_rung(tmp_path):
                 assert config_hash(cell.cfg) == config_hash(twice), (name, crop, cell.point.name, cell.base)
 
 
-def test_schema_version_is_10():
-    assert SCHEMA_VERSION == 10
+def test_schema_version_is_11():
+    assert SCHEMA_VERSION == 11

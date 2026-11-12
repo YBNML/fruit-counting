@@ -177,7 +177,7 @@ def test_eval_ladder_runs_the_supported_pose_rungs(apple_run, tmp_path):
     (d,) = (tmp_path / "out" / "apple_dev_pose_c2").iterdir()
     res = json.loads((d / "results.json").read_text(encoding="utf-8"))
     rungs = res["runs"][0]["rungs"]
-    assert res["schema_version"] == 10 and list(rungs) == ["L3", "L3_al", "L4_base"]
+    assert res["schema_version"] == 11 and list(rungs) == ["L3", "L3_al", "L4_base"]
     assert rungs["L3_al"]["alignment"]["mode"] == ["tracks", "row_plane"] and rungs["L3"]["alignment"] is None
     for name, rung in rungs.items():
         assert rung["pose"]["config"] == "c2" and rung["pose_quality"] is not None, name

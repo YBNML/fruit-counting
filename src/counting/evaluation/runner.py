@@ -85,6 +85,8 @@ class RunContext:
     `cache` identifies the detection cache under `stages.det=cached`
     (`file`, `digest`, and the cache meta's `weights_sha256` and `pretrained`,
     None when the meta has none); it is None otherwise.
+    `allow_test` is the `prepare` argument the context was made with; `evaluate` hands it to
+    `check_pose_supported` as `protected`.
     `_pose_files` holds the pose caches `open_pose_file` opened, by (path, pinned digest or None).
     `_imu_files` holds the IMU files `open_imu_file` opened, by (path, pinned digest or None, config seed).
     """
@@ -98,6 +100,7 @@ class RunContext:
     tables: dict[str, TruthTables]
     prepared: dict[str, object]
     cache: dict | None = None
+    allow_test: bool = False
     _frame_of: dict[int, FrameInput] = field(init=False, repr=False)
     _box_depth: dict[tuple, np.ndarray] = field(default_factory=dict, init=False, repr=False)
     _pose_files: dict[tuple[str, str | None], PoseFile] = field(default_factory=dict, init=False, repr=False)
@@ -344,7 +347,7 @@ def prepare(
         src = {f.idx: match_frame(dets[f.idx], truth.records[f.idx], prefer=prefer) for f in frames}
     tables = {v: truth_sets(truth, run.layout, passes, v) for v in VARIANTS}
     return RunContext(run=run, truth=truth, layout=run.layout, passes=passes, dets=dets, src=src, tables=tables,
-                      prepared=_prepared_settings(cfg, det_seed), cache=cache)
+                      prepared=_prepared_settings(cfg, det_seed), cache=cache, allow_test=allow_test)
 
 
 def describe_run(ctx: RunContext) -> dict:
@@ -578,7 +581,8 @@ def evaluate(ctx: RunContext, cfg: EvalAppConfig, *, subsets: bool = False, nois
     `G1`/`G6` are the `cfg.truth.variant` truth; a ratio with a zero
     denominator, and the median/max/percentile of an empty set, is None.
     A pose setting the runner does not run raises `NotImplementedError` before
-    anything else (`check_pose_supported`).
+    anything else (`check_pose_supported`); its split=test stops are lifted
+    by `ctx.allow_test` (protected requests only).
     `cfg` is then checked (`_check_config`, against `noise_seed` as the
     detection noise seed, or the prepared one without it): a config that
     differs from the prepared one raises `ValueError`. Then `noise_seed` must
@@ -616,7 +620,7 @@ def evaluate(ctx: RunContext, cfg: EvalAppConfig, *, subsets: bool = False, nois
     (`_score_subsets`): the passes' tracks are reused, and Y6 is scored again on
     each subset of `pass_subsets`.
     """
-    check_pose_supported(cfg)
+    check_pose_supported(cfg, protected=ctx.allow_test)
     _check_config(ctx, cfg, ctx.prepared.get("det_seed") if noise_seed is None else noise_seed)
     root = ctx.run.root
     if cfg.is_noisy() and noise_seed is None:
@@ -957,7 +961,8 @@ def run_ladder(
     rung may change the detector, not `FRAME_KEYS` (`_check_frames`); without
     `context_for` it is refused as `evaluate` refuses it (`_check_config`).
     Every rung and cell config is checked before any of them runs (first
-    `check_pose_supported`, right after the configs are built), and the
+    `check_pose_supported`, right after the configs are built, without its
+    split=test stops under `ctx.allow_test`: protected requests only), and the
     rungs of a group against their own context before they run. With
     `subsets`, the rungs of `SUBSET_RUNGS` alone also get the pass-subset table
     (`evaluate(..., subsets=True)`).
@@ -973,7 +978,7 @@ def run_ladder(
                 d = cfg.stages.dedup if d == "crop_default" else d
                 cells.append((track, d, _patched(base, {"stages": {"track": track, "dedup": d}})))
     for c in [*configs.values(), *(c for _, _, c in cells)]:
-        check_pose_supported(c)
+        check_pose_supported(c, protected=ctx.allow_test)
     on_ctx: list[str] = []
     groups: dict[str, list[str]] = {}
     for name, c in configs.items():

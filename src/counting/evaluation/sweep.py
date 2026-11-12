@@ -353,12 +353,12 @@ def run_sweep(
     A cell under `stages.det=oracle_noisy` belongs to one group per noise seed;
     pose and depth noise cells run all their seeds on their group's context.
     Every cell's pose settings are checked (`check_pose_supported`) before the first `prepare`.
-    Every `prepare` gets `allow_test`.
+    Every `prepare` gets `allow_test`, which also lifts the split=test pose stops (protected requests only).
     Returns `{"meta": describe_run(first group's context), "cells": [kept result per cell, in input order]}`
     and the seconds spent, `{"prepare": ..., "evaluate": ...}`.
     """
     for cell in cells:
-        check_pose_supported(cell.cfg)
+        check_pose_supported(cell.cfg, protected=allow_test)
     check_frame_selection(run, cells)
     groups: dict[str, list[tuple[int, int | None]]] = {}
     for i, cell in enumerate(cells):

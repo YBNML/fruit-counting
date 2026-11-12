@@ -75,7 +75,8 @@ through `fusion.fusion_inputs`, and the cameras from the fused body as above.
 
 Modes. `check_pose_supported` lets through `pose.source` truth or file, with or without the rig,
 fusion (`pose.fuse=imu` on either source, `pose.fuse=vo` on a file source), and every `align.mode`.
-In this order it stops fusion on `split=test` and a file source on `split=test` or with
+In this order it stops fusion on `split=test` and a file source on `split=test` (the two split=test
+stops only for a request that did not pass the held-out checks, `protected`) or with
 `noise.drift_time_offset_s` above 0 with `NotImplementedError`, then fusion without gtsam
 (`NotImplementedError`) or without the fixed fusion settings (`FileNotFoundError`). `pose_settings`
 names the settings a result ran with, and `pose_cache_entry` the pose cache a file source read.
@@ -115,17 +116,19 @@ _PITCH_KEYS = ("pass_pitch_trans_m", "pass_pitch_rot_deg")
 _RIG_KEYS = ("rig_extr_trans_mm", "rig_extr_rot_deg")
 
 
-def check_pose_supported(cfg: EvalAppConfig) -> None:
+def check_pose_supported(cfg: EvalAppConfig, *, protected: bool = False) -> None:
     """Refuse the pose settings the runner does not run, in this order: fusion (`pose.fuse` vo or imu)
     with `split=test`, `pose.source=file` with `split=test`, then `pose.source=file` with
     `noise.drift_time_offset_s` above 0, each with `NotImplementedError`; then fusion without gtsam
     (`NotImplementedError`, looked up with `importlib.util.find_spec` only) and fusion without the fixed
-    fusion settings `fusion.FUSE_FIXED_PATH` (`FileNotFoundError`). A config without `pose` passes."""
+    fusion settings `fusion.FUSE_FIXED_PATH` (`FileNotFoundError`). A config without `pose` passes.
+    A `protected` request (a split=test request that passed the held-out checks) skips the two
+    split=test stops; the other stops and their order stay."""
     pose = cfg.pose
     fused = pose is not None and pose.fuse != "none"
-    if fused and cfg.split == "test":
+    if fused and cfg.split == "test" and not protected:
         raise NotImplementedError(f"pose.fuse={pose.fuse} with split=test is not supported")
-    if pose is not None and pose.source == "file" and cfg.split == "test":
+    if pose is not None and pose.source == "file" and cfg.split == "test" and not protected:
         raise NotImplementedError("pose.source=file with split=test is not supported")
     if pose is not None and pose.source == "file" and cfg.noise.factor("drift_time_offset_s") > 0:
         raise NotImplementedError("noise.drift_time_offset_s > 0 with pose.source=file is not supported; the "

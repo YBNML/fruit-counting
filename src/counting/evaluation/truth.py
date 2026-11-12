@@ -1,6 +1,9 @@
 """Ground-truth sets, the summary.json self-check, the pass subsets and their table, the geometry check,
 and the rig, trajectory and IMU checks of bundles rendered with body shake.
 
+`pass_coverage` compares the G6 of the chosen passes with the G6 of every pitch's passes on the same sides
+and step.
+
 Everything here reads `SceneTruth`/`FruitGt`/`GtRecord` from an orchard_synth
 bundle, so only evaluation and oracle code should import this module (the
 prediction path never does; see `counting.data.formats.orchard_synth`).
@@ -94,6 +97,25 @@ def truth_sets(
     g6_total = {t: truth.totals.get(t, 0) for t in layout.tree_ids}
     return TruthTables(variant=variant, tree_ids=layout.tree_ids, tree_of=tree_of,
                        g1=g1, g6=g6, g6_total=g6_total)
+
+
+def pass_coverage(
+    scene: SceneTruth,
+    layout: OrchardLayout,
+    chosen: Mapping[PassKey, Sequence[FrameInput]],
+    every: Mapping[PassKey, Sequence[FrameInput]],
+    *,
+    variant: str,
+) -> dict:
+    """How much of the G6 of `every` (every pitch's passes on the same sides and step) the passes in `chosen` see.
+
+    `{"pitches", "g6", "g6_all", "ratio"}`: the pitches of `chosen` (ascending floats), the G6 sizes of
+    `chosen` and of `every` (`truth_sets` under `variant`), and `g6 / g6_all`, None when `g6_all` is 0.
+    """
+    g6 = len(truth_sets(scene, layout, chosen, variant).g6)
+    g6_all = len(truth_sets(scene, layout, every, variant).g6)
+    return {"pitches": sorted({float(k.pitch_deg) for k in chosen}), "g6": g6, "g6_all": g6_all,
+            "ratio": g6 / g6_all if g6_all else None}
 
 
 class SummaryMismatch(RuntimeError):

@@ -276,7 +276,7 @@ def test_report_names_the_alignment_and_the_aligned_world_end(small, tmp_path):
     folder = Path(r.output.splitlines()[0])
     results = json.loads((folder / "results.json").read_text(encoding="utf-8"))
     rung = results["runs"][0]["rungs"]["run"]
-    assert results["schema_version"] == 10
+    assert results["schema_version"] == 11
     assert (rung["pose"]["predict_window"], rung["pose"]["flow"]) == (None, None)
     assert [s["stage"] for s in rung["alignment"]["stages"]] == ["both_sides", "row_plane"]
     report = (folder / "report.md").read_text(encoding="utf-8")

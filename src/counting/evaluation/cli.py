@@ -345,25 +345,33 @@ def _run_eval(
     1. read the config (with `--set`, then `--run`), the splits and the criteria;
     2. read the ladder (and its default rungs), or the grid and its points (and, with grid
        bases, the ladder);
-    3. under split=test, `check_test_request` on the config and every file read so far, then
-       `check_test_log` on the output folder's `test_log.csv`;
+    3. under split=test, `check_test_request` on the config and every file read so far (with a
+       pose section also the fixed fusion settings `fusion.FUSE_FIXED_PATH`, and a ladder must be
+       the committed pose ladder), then `check_test_log` on the output folder's `test_log.csv`;
     4. check the pass-subset verdict request (`check_verdict_request`: only a ladder reads
        `cfg.verdict_subsets`), then the ladder request, or the `--set` overlap and the sweep cells;
-       under split=test, `check_test_rungs` on the requested rungs or the sweep cells; then the
-       pose settings the runner does not run (`check_pose_supported`) of the config, of every
-       requested rung (and the 2 x 2 base rung) or of every sweep cell;
+       under split=test, `check_test_rungs` on the requested rungs or the sweep cells, then
+       `check_test_pose_rungs` on the requested rungs (and the 2 x 2 base rung), the sweep cells
+       or, for `eval run`, the config; then the pose settings the runner does not run
+       (`check_pose_supported`, without its split=test stops for a request that passed the
+       split=test checks) of the config, of every requested rung (and the 2 x 2 base rung) or of
+       every sweep cell;
     5. open every bundle in `cfg.runs` (a sweep checks each one's frame selection, split=test
-       runs `check_test_bundles` and, with `detector.cache`, `check_test_caches`) and sort them
+       runs `check_test_bundles`, with `detector.cache` `check_test_caches`, and with a pose
+       section `check_test_trajectories` and `check_test_pose_caches`) and sort them
        by (fingerprint, run_id), so the results do not depend on the order the bundles were
        listed in; a ladder then checks `cfg.verdict_subsets` against them (`check_verdict_subsets`);
     6. score the bundles one at a time, one context at a time; only a request that passed the
        split=test checks lets `prepare` take a split=test config (`allow_test`); a ladder whose
        requested rung L5 runs on cached detections also scores those caches as detections
-       (`detection`: `score_runs` at rung L5's thresholds and post-processing);
-    7. build the experiment id, `pooled` (run and ladder, with `y1_judged` when rung L5 ran),
-       `verdicts` (a ladder with criteria, plus the L5 `detection` rows and, with
-       `cfg.verdict_subsets`, the `L5[<name>]` rows of `subset_verdicts`) and, for a ladder with
-       rung L5, the checked error `budget` (`ladder_budget`), and write the experiment folder; the
+       (`detection`: `score_runs` at rung L5's thresholds and post-processing); with a pose section
+       and `passes.pitches`, each bundle's `meta` gets its pass `coverage` (`pass_coverage`: the G6 of
+       the chosen pitches' passes against that of every pitch's passes on the same sides and step);
+    7. build the experiment id, `pooled` (run and ladder, with `y1_judged` when rung L5 or L5VI ran),
+       `verdicts` (a ladder with criteria, report rows only when the base config's `pose.config_label`
+       names a camera configuration other than the criteria's `judged_config`, plus the L5 `detection`
+       rows and, with `cfg.verdict_subsets`, the `L5[<name>]` rows of `subset_verdicts`) and, for a
+       ladder with rung L5, the checked error `budget` (`ladder_budget`), and write the experiment folder; the
        digests of the detection caches (`_cache_identities`), of the pose caches
        (`_pose_cache_identities`) and of the IMU files (`_imu_file_identities`) the results name,
        and the sha256 of each fixed fusion settings file they ran with (`_fusion_identity`), join
@@ -383,13 +391,14 @@ def _run_eval(
     from counting.config.eval_schema import EvalAppConfig, SplitsConfig
     from counting.config.hashing import config_hash
     from counting.config.loader import load_yaml_model
-    from counting.data.formats.orchard_synth import SynthRun
+    from counting.data.formats.orchard_synth import SynthRun, select_frames
+    from counting.evaluation import fusion as fusion_mod
     from counting.evaluation.budget import ladder_budget
     from counting.evaluation.detmetrics import detection_rows, score_runs
     from counting.evaluation.posesource import check_pose_supported
     from counting.evaluation.protect import (
-        append_log_row, check_test_bundles, check_test_caches, check_test_log, check_test_request, check_test_rungs,
-        earlier_log_runs,
+        append_log_row, check_test_bundles, check_test_caches, check_test_log, check_test_pose_caches,
+        check_test_pose_rungs, check_test_request, check_test_rungs, check_test_trajectories, earlier_log_runs,
     )
     from counting.evaluation.record import build_record, counting_repo, experiment_id, git_state, request_extra
     from counting.evaluation.report import SCHEMA_VERSION, ReproducibilityError, write_experiment
@@ -400,11 +409,19 @@ def _run_eval(
     from counting.evaluation.sweep import (
         check_frame_selection, check_set_overlap, grid_points, load_grid, run_sweep, sweep_cells,
     )
-    from counting.evaluation.truth import SummaryMismatch
+    from counting.evaluation.truth import SummaryMismatch, pass_coverage
     from counting.evaluation.verdict import ladder_pooled, ladder_verdicts, subset_verdicts, verdict_summary
 
     def file_sha256(path: str) -> str:
         return hashlib.sha256(Path(path).expanduser().read_bytes()).hexdigest()
+
+    def by_pass(bundle: SynthRun, pitches: list[float] | None) -> dict:
+        """`bundle`'s frames at `pitches` (every pitch when None) on `cfg.passes`' sides and step, by pass."""
+        out: dict = {}
+        for f in select_frames(bundle.frames, base_step_m=bundle.meta.base_step_m, pitches=pitches,
+                               sides=cfg.passes.sides, step_m=cfg.passes.step_m):
+            out.setdefault(f.pass_key, []).append(f)
+        return out
 
     earlier = 0
     try:
@@ -436,6 +453,8 @@ def _run_eval(
                 files["--ladder"] = ladder_path
             if grid is not None:
                 files["--grid"] = grid_path
+            if cfg.pose is not None:
+                files["fixed fusion settings"] = fusion_mod.FUSE_FIXED_PATH   # the path as it is when called
             protected = check_test_request(cfg, config_path=config, sets=set_ or [], runs=run_ or [], files=files,
                                            grid=grid, ladder=ladder, repo=counting_repo())
             check_test_log(Path(cfg.output_dir).expanduser() / "test_log.csv")
@@ -443,22 +462,26 @@ def _run_eval(
         check_verdict_request(cfg, rungs or (), subsets=subsets, kind=kind)
         if kind == "ladder":
             check_ladder_request(cfg, ladder, rungs, with_2x2=with_2x2, subsets=subsets)
+            names = [*rungs, ladder["interaction_2x2"]["base"]] if with_2x2 else rungs
             if protected is not None:
                 check_test_rungs(cfg, {name: rung_config(cfg, ladder, name) for name in rungs})
+                check_test_pose_rungs(cfg, {name: (name, rung_config(cfg, ladder, name)) for name in names}, ladder)
         elif kind == "sweep":
             check_set_overlap([s.split("=", 1)[0] for s in (set_ or [])], points)
             cells = sweep_cells(cfg, grid, ladder)
             if protected is not None:
                 check_test_rungs(cfg, {f"{c.point.name} @ {c.base}": c.cfg for c in cells})
+                check_test_pose_rungs(cfg, {f"{c.point.name} @ {c.base}": (c.base, c.cfg) for c in cells}, ladder)
+        elif protected is not None:
+            check_test_pose_rungs(cfg, {"run": (None, cfg)}, None)
         if kind == "run":
-            check_pose_supported(cfg)
+            check_pose_supported(cfg, protected=protected is not None)
         elif kind == "ladder":
-            names = [*rungs, ladder["interaction_2x2"]["base"]] if with_2x2 else rungs
             for name in names:
-                check_pose_supported(rung_config(cfg, ladder, name))
+                check_pose_supported(rung_config(cfg, ladder, name), protected=protected is not None)
         else:
             for cell in cells:
-                check_pose_supported(cell.cfg)
+                check_pose_supported(cell.cfg, protected=protected is not None)
 
         started = datetime.now(timezone.utc).isoformat()
         t0 = time.perf_counter()
@@ -471,6 +494,9 @@ def _run_eval(
             check_test_bundles(bundles, splits_cfg)
             if cfg.detector.cache is not None:
                 check_test_caches(bundles, cfg)
+            if cfg.pose is not None:
+                check_test_trajectories(bundles)
+                check_test_pose_caches(bundles, cfg)
         bundles.sort(key=lambda b: (b.meta.fingerprint, b.meta.run_id))
         if kind == "ladder":
             check_verdict_subsets(bundles, cfg)
@@ -503,6 +529,11 @@ def _run_eval(
             t_prepare += timings["prepare"]
             t_score += timings["evaluate"]
             run_entries.append(entry)
+        if cfg.pose is not None and cfg.passes.pitches is not None:
+            for bundle, entry in zip(bundles, run_entries):
+                entry["meta"]["coverage"] = pass_coverage(
+                    bundle.truth(), bundle.layout, by_pass(bundle, cfg.passes.pitches), by_pass(bundle, None),
+                    variant=cfg.truth.variant)
         detection = None
         if kind == "ladder" and "L5" in rungs:
             l5 = rung_config(cfg, ladder, "L5")
@@ -584,7 +615,8 @@ def _run_eval(
         # run ids carry no criteria hash (verdicts would break run reruns); sweep cells keep tree tables at the
         # baseline point only, so only a ladder gets verdicts
         if kind == "ladder" and criteria is not None:
-            results["verdicts"] = ladder_verdicts(run_entries, results["pooled"], criteria, cfg.crop)
+            results["verdicts"] = ladder_verdicts(run_entries, results["pooled"], criteria, cfg.crop,
+                                                  config_label=cfg.pose.config_label if cfg.pose else None)
             if detection is not None:
                 det_rows = detection_rows(detection, criteria, cfg.crop)
                 if det_rows:

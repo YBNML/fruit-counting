@@ -5,7 +5,9 @@ A noisy rung or cell (`noisy`) is drawn from its seed means, with a noise line a
 per-seed table; the CSVs carry one row per noise seed and a `mean` row. A ladder result with a
 `budget` (`counting.evaluation.budget`) also gets `budget.csv` and the budget tables.
 A rung or cell run with a pose section (`pose`, `pose_quality`) names its pose source in the head
-and gets the pose quality tables; a result without one reads as it did before.
+and gets the pose quality tables; a result without one reads as it did before. A bundle whose `meta`
+has a pass `coverage` gets a head line with it. A verdict row of a report camera configuration
+(`report_config`) reads `보고(구성 <name>)` instead of a verdict.
 """
 
 from __future__ import annotations
@@ -23,7 +25,7 @@ from counting.config.eval_schema import POSE_NOISE_KEYS, EvalAppConfig
 from counting.evaluation.budget import TERMS, ladder_pairs, path_pairs
 from counting.evaluation.verdict import JUDGED_PITCHES, PITCH_JUDGED_RUNGS, judged_y1, pool_rung, verdict_counts
 
-SCHEMA_VERSION = 10
+SCHEMA_VERSION = 11
 
 
 class ReproducibilityError(RuntimeError):
@@ -873,6 +875,8 @@ def _verdict_row(rung_name: str, row: dict) -> list[str]:
     per_run = ", ".join(_verdict_per_run_cell(metric, p) for p in row["per_run"])
     limit = f"{_OP_SYMBOL[row['op']]}{_criteria_cell(metric, row['limit'])}"
     verdict = "-" if row["ok"] is None else ("OK" if row["ok"] else "FAIL")
+    if row.get("report_config") is not None:
+        verdict = f"보고(구성 {row['report_config']})"
     unit = "장면마다" if row["unit"] == "scene" else "합침"
     label = metric
     if row.get("pitches"):
@@ -1088,6 +1092,13 @@ def _fusion_line(fusion: dict) -> str:
     return line
 
 
+def _coverage_line(run_id: str, coverage: dict) -> str:
+    """The head line of one bundle's pass coverage: the G6 of the chosen passes, that of every pitch's passes
+    and their ratio (three decimals, `-` when there is none)."""
+    ratio = "-" if coverage["ratio"] is None else f"{coverage['ratio']:.3f}"
+    return f"> 덮음 {run_id}: G6① {coverage['g6']} / 세 기울기 {coverage['g6_all']} = {ratio}"
+
+
 def render_report(results: dict, *, criteria: Mapping | None) -> str:
     """Build the human-readable `report.md` for one experiment.
 
@@ -1101,7 +1112,8 @@ def render_report(results: dict, *, criteria: Mapping | None) -> str:
     (`_detector_line` of `_first_cache`); when one read a pose cache, the next head line names that
     cache (`_pose_cache_line` of `_first_pose_cache`); when one read an IMU file, the next head line
     names that file (`_imu_file_line` of `_first_imu_file`); and when one was fused, the next head line
-    names the fusion (`_fusion_line` of `_first_fusion`).
+    names the fusion (`_fusion_line` of `_first_fusion`). Then each bundle whose `meta` has a `coverage`
+    gets its `_coverage_line`, in bundle order.
 
     With a pose section the head's second line names the pose source (`_pose_text`); when a rung
     or cell started from the nominal start (`pose.start` `nominal_from_first_frame`), the next head
@@ -1134,6 +1146,9 @@ def render_report(results: dict, *, criteria: Mapping | None) -> str:
     fusion = _first_fusion(results)
     if fusion is not None:
         lines.append(_fusion_line(fusion))
+    for run in results["runs"]:
+        if run["meta"].get("coverage") is not None:
+            lines.append(_coverage_line(run["meta"]["run_id"], run["meta"]["coverage"]))
     if results["split"] == "dev":
         lines.append("> dev 묶음: 개발용 수치다. 판정에 쓰지 않는다.")
     lines.append("")

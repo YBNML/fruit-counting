@@ -446,8 +446,7 @@ def pose_vo(
     run_: list[str] = typer.Option(..., "--run", help="A bundle to run the odometry on (repeat for more)"),
     set_: list[str] = typer.Option(None, "--set", help="Dot-path override: key.path=value", show_default=False),
     splits_path: str = typer.Option(
-        "configs/eval/splits_pose.yaml", "--splits",
-        help="Splits YAML (every bundle's seed must be in a split other than test)",
+        "configs/eval/splits_pose.yaml", "--splits", help="Splits YAML (every bundle's seed must be in a split)",
     ),
 ) -> None:
     """Run the frame-to-frame RGB-D visual odometry over bundles and write one pose cache per bundle.
@@ -457,13 +456,15 @@ def pose_vo(
     With `step_m` set, the odometry runs on the thinned frames only. The cache meta names the bundle
     (run id, fingerprint, sha256 of all its RGB and depth images), the settings and their hash, the
     OpenCV and numpy versions, the code state, the splits file's sha256 and the image size; the time
-    taken goes to the summary only. Every bundle must be a sequence bundle with its seed in a split
-    other than test: this command makes no pose cache of a test bundle.
+    taken goes to the summary only. Every bundle must be a sequence bundle with its seed in a split.
+    A test bundle needs a frozen config under configs/pose/frozen/, a clean committed tree and no --set;
+    each test file adds a row to `<output_dir>/test_log.csv` as soon as it is written.
 
-    Exit code 0 is success, 1 is a check failure (a seed in no split or in the test split, an existing
-    cache or summary), 2 is an input error (missing bundle or image, a bundle that is not a sequence,
-    a bad config or `--set`).
+    Exit code 0 is success, 1 is a check failure (a seed in no split, a test-bundle protection check, an
+    existing cache or summary), 2 is an input error (missing bundle or image, a bundle that is not a
+    sequence, a bad config or `--set`).
     """
+    from datetime import datetime, timezone
     from pathlib import Path
 
     import cv2
@@ -476,11 +477,15 @@ def pose_vo(
     from counting.data.formats.orchard_synth import SynthRun, select_frames
     from counting.detection.cached import file_sha256, rgb_fingerprint
     from counting.evaluation.posesource import vo_inputs
-    from counting.evaluation.record import git_state
-    from counting.evaluation.runner import CheckFailed
+    from counting.evaluation.protect import (
+        append_log_row, check_test_bundles, check_test_log, check_test_pose_file, earlier_log_runs, pose_log_row,
+    )
+    from counting.evaluation.record import counting_repo, git_state
+    from counting.evaluation.runner import CheckFailed, ProtectionError
     from counting.odometry.cache import pose_cache_path
     from counting.odometry.vo import vo_to_cache
 
+    started = datetime.now(timezone.utc).isoformat()
     try:
         try:
             cfg = load_yaml_model(config, VoConfig, overrides=set_)
@@ -491,18 +496,29 @@ def pose_vo(
         bundles = [SynthRun.open(path) for path in run_]
         for bundle in bundles:
             seed = bundle.meta.seed
-            split = splits.split_of(seed)
-            if split is None:
+            if splits.split_of(seed) is None:
                 raise CheckFailed(f"{bundle.root}: seed {seed} is in no split")
-            if split == "test":
-                raise CheckFailed(f"{bundle.root}: seed {seed} is a test seed; this command makes no pose cache "
-                                  "of a test bundle")
             if not bundle.meta.is_sequence:
                 raise ValueError(f"{bundle.root}: not a sequence bundle (max_frames or irregular step)")
+        held_out = [b for b in bundles if splits.split_of(b.meta.seed) == "test"]
         bundles.sort(key=lambda b: (b.meta.fingerprint, b.meta.run_id))
 
+        out_root = Path(cfg.output_dir).expanduser()
+        log = out_root / "test_log.csv"
         chash = config_hash(cfg)
-        paths = [pose_cache_path(Path(cfg.output_dir).expanduser() / chash, b.meta.run_id) for b in bundles]
+        extra = f"opencv:{cv2.__version__}"
+        protected, earlier = None, 0
+        if held_out:
+            try:
+                protected = check_test_pose_file(command="vo", config_path=config, sets=set_ or [],
+                                                 files={"--splits": splits_path}, repo=counting_repo())
+            except ProtectionError as e:
+                raise CheckFailed(f"{held_out[0].root}: seed {held_out[0].meta.seed} is a test seed; {e}") from e
+            check_test_bundles(bundles, splits)
+            check_test_log(log)
+            earlier = earlier_log_runs(log, config_hash=chash, extra=extra)
+
+        paths = [pose_cache_path(out_root / chash, b.meta.run_id) for b in bundles]
         for path in paths:
             for p in (path, path.with_suffix(".json")):
                 if p.exists():
@@ -514,16 +530,23 @@ def pose_vo(
         rgb_shas = [rgb_fingerprint(b.frames) for b in bundles]
         depth_shas = [b.depth_fingerprint() for b in bundles]
 
-        code = git_state()
+        code = protected.code if protected is not None else git_state()
         common = {"vo": {k: v for k, v in cfg.model_dump(mode="json").items() if k != "output_dir"},
                   "vo_config_hash": chash, "opencv": cv2.__version__, "numpy": np.__version__,
                   "counting_commit": code["commit"], "counting_dirty": code["dirty"],
                   "splits_sha256": file_sha256(Path(splits_path).expanduser())}
+        if earlier > 0:
+            typer.echo(f"warning: test_log.csv already lists {earlier} test pose row(s) of config {chash} with "
+                       f"{extra}; this run adds one row per bundle")
         for bundle, frames, rgb_sha, depth_sha, path in zip(bundles, inputs, rgb_shas, depth_shas, paths):
             m, cam = bundle.meta, bundle.frames[0].camera
             meta = {"run_id": m.run_id, "fingerprint": m.fingerprint, "rgb_sha256": rgb_sha,
                     "depth_sha256": depth_sha, **common, "image_size": [cam.width, cam.height]}
             summary = vo_to_cache(frames, cfg, path, meta=meta)
+            if protected is not None:
+                append_log_row(log, pose_log_row(kind="pose_vo", date=started, config_rel=protected.config_rel,
+                                                 config_hash=chash, extra=extra, fingerprint=m.fingerprint,
+                                                 digest=summary["digest"], commit=code["commit"]))
             passes = summary["passes"]
             typer.echo(str(path))
             typer.echo(f"{m.run_id}: frames {summary['n_frames']}, pairs {sum(p['pairs'] for p in passes)}, "
@@ -543,8 +566,7 @@ def pose_imu(
     run_: list[str] = typer.Option(..., "--run", help="A bundle to make the IMU file of (repeat for more)"),
     set_: list[str] = typer.Option(None, "--set", help="Dot-path override: key.path=value", show_default=False),
     splits_path: str = typer.Option(
-        "configs/eval/splits_pose.yaml", "--splits",
-        help="Splits YAML (every bundle's seed must be in a split other than test)",
+        "configs/eval/splits_pose.yaml", "--splits", help="Splits YAML (every bundle's seed must be in a split)",
     ),
 ) -> None:
     """Simulate the IMU of bundles and write one IMU file per bundle.
@@ -558,19 +580,21 @@ def pose_imu(
     before the first file is written. The file meta names the bundle (run id, fingerprint), the profile
     and its noise, the sampling, the assumed motion, the trajectory source, the settings hash, the numpy
     and SciPy versions, the code state and the splits file's sha256; the time taken goes to the summary
-    only. Every bundle must be a sequence bundle with its seed in a split other than test: this command
-    makes no IMU file of a test bundle. A profile without white noise or turn-on bias is refused when the
-    config is read, since a noiseless IMU is the truth.
+    only. Every bundle must be a sequence bundle with its seed in a split. A test bundle needs a frozen
+    config under configs/pose/frozen/, a clean committed tree and no --set; each test file adds a row to
+    `<output_dir>/test_log.csv` as soon as it is written. A profile without white noise or turn-on bias is
+    refused when the config is read, since a noiseless IMU is the truth.
 
-    Exit code 0 is success, 1 is a check failure (a seed in no split or in the test split, an existing
-    file or summary), 2 is an input error (missing bundle, a bundle that is not a sequence, a bad config
-    or `--set`, a profile without white noise or turn-on bias).
+    Exit code 0 is success, 1 is a check failure (a seed in no split, a test-bundle protection check, an
+    existing file or summary), 2 is an input error (missing bundle, a bundle that is not a sequence, a bad
+    config or `--set`, a profile without white noise or turn-on bias).
     """
     import importlib.metadata
     import json
     import os
     import time
     from dataclasses import asdict
+    from datetime import datetime, timezone
     from pathlib import Path
 
     import numpy as np
@@ -582,10 +606,14 @@ def pose_imu(
     from counting.data.formats.orchard_synth import SynthRun
     from counting.detection.cached import file_sha256
     from counting.evaluation.imusim import AssumedMotion, ImuProfile, ImuSampling, imu_session, session_drives
-    from counting.evaluation.record import git_state
-    from counting.evaluation.runner import CheckFailed
+    from counting.evaluation.protect import (
+        append_log_row, check_test_bundles, check_test_log, check_test_pose_file, earlier_log_runs, pose_log_row,
+    )
+    from counting.evaluation.record import counting_repo, git_state
+    from counting.evaluation.runner import CheckFailed, ProtectionError
     from counting.odometry.imufile import LAYOUTS, imu_file_path, write_imu_file
 
+    started = datetime.now(timezone.utc).isoformat()
     try:
         try:
             cfg = load_yaml_model(config, ImuConfig, overrides=set_)
@@ -596,18 +624,29 @@ def pose_imu(
         bundles = [SynthRun.open(path) for path in run_]
         for bundle in bundles:
             seed = bundle.meta.seed
-            split = splits.split_of(seed)
-            if split is None:
+            if splits.split_of(seed) is None:
                 raise CheckFailed(f"{bundle.root}: seed {seed} is in no split")
-            if split == "test":
-                raise CheckFailed(f"{bundle.root}: seed {seed} is a test seed; this command makes no IMU file "
-                                  "of a test bundle")
             if not bundle.meta.is_sequence:
                 raise ValueError(f"{bundle.root}: not a sequence bundle (max_frames or irregular step)")
+        held_out = [b for b in bundles if splits.split_of(b.meta.seed) == "test"]
         bundles.sort(key=lambda b: (b.meta.fingerprint, b.meta.run_id))
 
+        out_root = Path(cfg.output_dir).expanduser()
+        log = out_root / "test_log.csv"
         chash = config_hash(cfg)
-        paths = [imu_file_path(Path(cfg.output_dir).expanduser() / chash, b.meta.run_id) for b in bundles]
+        extra = f"imu:{cfg.profile}"
+        protected, earlier = None, 0
+        if held_out:
+            try:
+                protected = check_test_pose_file(command="imu", config_path=config, sets=set_ or [],
+                                                 files={"--splits": splits_path}, repo=counting_repo())
+            except ProtectionError as e:
+                raise CheckFailed(f"{held_out[0].root}: seed {held_out[0].meta.seed} is a test seed; {e}") from e
+            check_test_bundles(bundles, splits)
+            check_test_log(log)
+            earlier = earlier_log_runs(log, config_hash=chash, extra=extra)
+
+        paths = [imu_file_path(out_root / chash, b.meta.run_id) for b in bundles]
         for path in paths:
             for p in (path, path.with_suffix(".json")):
                 if p.exists():
@@ -618,13 +657,16 @@ def pose_imu(
         drives = [{layout: session_drives(b, layout, motion) for layout in LAYOUTS} for b in bundles]
 
         profile, sampling = ImuProfile.from_config(cfg.noise), ImuSampling.of(cfg)
-        code = git_state()
+        code = protected.code if protected is not None else git_state()
         common = {"imu_seed": cfg.seed, "noise_seeds": list(cfg.noise_seeds), "profile": cfg.profile,
                   "noise": cfg.noise.model_dump(), "rate_hz": cfg.rate_hz, "acc_range_g": cfg.acc_range_g,
                   "row_end_s": cfg.row_end_s, "motion": asdict(motion), "imu_config_hash": chash,
                   "numpy": np.__version__, "scipy": importlib.metadata.version("scipy"),
                   "counting_commit": code["commit"], "counting_dirty": code["dirty"],
                   "splits_sha256": file_sha256(Path(splits_path).expanduser())}
+        if earlier > 0:
+            typer.echo(f"warning: test_log.csv already lists {earlier} test pose row(s) of config {chash} with "
+                       f"{extra}; this run adds one row per bundle")
         for bundle, by_layout, path in zip(bundles, drives, paths):
             m = bundle.meta
             start = time.perf_counter()
@@ -642,6 +684,10 @@ def pose_imu(
                     "traj_source": by_layout["rig"][0].source}
             digest = write_imu_file(path, streams, meta)
             seconds = time.perf_counter() - start
+            if protected is not None:
+                append_log_row(log, pose_log_row(kind="pose_imu", date=started, config_rel=protected.config_rel,
+                                                 config_hash=chash, extra=extra, fingerprint=m.fingerprint,
+                                                 digest=digest, commit=code["commit"]))
             summary = {"digest": digest, "file": path.name, "meta": meta, "streams": rows, "seconds": seconds}
             sidecar = path.with_suffix(".json")
             tmp = sidecar.with_name(sidecar.name + ".tmp")

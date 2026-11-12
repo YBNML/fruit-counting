@@ -1,0 +1,25 @@
+# Base config of the pose ladder on val for camera configuration c1: the c1 development config on the shaken
+# val scene, with the val pose caches, IMU files and detection caches and the alignment knobs (align.mode
+# none; rungs choose the alignment).
+run_name: apple_val_pose_c1
+crop: apple
+split: val                 # tuning runs pick settings here; never a verdict
+tuning: true               # must be false for split=test
+runs: [~/datasets/orchard_synth/apple/val_s200_shake]
+truth: {variant: count1}
+passes: {pitches: [30], sides: [A, B], step_m: null}
+stages: {det: oracle, track: landmark, center: measured, dedup: hybrid, assign: grid}
+detector: {positives: count1, cache: runs/detect/88e8c93628216703, noise: null}
+lift: {depth: box_far, box_frac: 0.5, center_offset_m: {fruit: 0.02, bag: 0.03}}
+noise: {pose_trans_sigma_m: 0, pose_rot_sigma_deg: 0, pass_bias_m: 0, depth_rel_sigma: 0, depth_dropout: 0, seeds: [0, 1, 2]}
+tracker: {predict: pose, gate_px_frac: 0.5, gate_m: 0.05, max_gap: null, repair_m: 0.08, min_obs: 1, score_hi: 0.6, score_lo: 0.2, min_obs_cached: 4, depth_gate: soft}
+dedup: {radius_m: 0.09, band_m: 0.05}
+pose:
+  rig_ref: 30
+  config_label: c1
+  caches: {vo: {dir: runs/pose/a45a4d9dca516ca8}, vo_dd: {dir: runs/pose/510f2d4b21947576}}   # configs/pose/vo.yaml; vo_dd with depth_k 0
+  imu_files: {imu_ext: {dir: runs/imu/682fc7ac53717171}, imu_lab: {dir: runs/imu/2539defedcbebb34}, imu_icm: {dir: runs/imu/02e33e5ef0e7b86b}, imu_ext_x4: {dir: runs/imu/fee3499d725ef4e8}}   # configs/pose/<name>.yaml
+align: {mode: none, segment_m: 3.0, pair_radius_m: 0.5, min_pairs: 20, oracle_sigma_m: 0.02}   # roll_pitch_sigma_deg unset: its start value
+seed: 0
+stop_after: y6
+output_dir: runs/eval_pose
