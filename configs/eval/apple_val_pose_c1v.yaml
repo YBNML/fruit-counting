@@ -16,9 +16,9 @@ dedup: {radius_m: 0.09, band_m: 0.05}
 pose:
   rig_ref: 22.5
   config_label: c1v
-  caches: {vo: {dir: runs/pose/a45a4d9dca516ca8}, vo_dd: {dir: runs/pose/510f2d4b21947576}}   # configs/pose/vo.yaml; vo_dd with depth_k 0
+  caches: {vo: {dir: runs/pose/b16b37e34b609dd2}, vo_dd: {dir: runs/pose/52ad7d4423dea8fb}}   # configs/pose/frozen/apple_vo.yaml and apple_vo_dd.yaml
   imu_files: {imu_ext: {dir: runs/imu/682fc7ac53717171}, imu_lab: {dir: runs/imu/2539defedcbebb34}, imu_icm: {dir: runs/imu/02e33e5ef0e7b86b}, imu_ext_x4: {dir: runs/imu/fee3499d725ef4e8}}   # configs/pose/<name>.yaml
-align: {mode: none, segment_m: 3.0, pair_radius_m: 0.5, min_pairs: 20, oracle_sigma_m: 0.02}   # roll_pitch_sigma_deg unset: its start value
+align: {mode: none, segment_m: 3.0, pair_radius_m: 0.5, roll_pitch_sigma_deg: 1.0, min_pairs: 20, oracle_sigma_m: 0.02}   # knobs chosen on val
 seed: 0
 stop_after: y6
 output_dir: runs/eval_pose

@@ -1,0 +1,25 @@
+# Visual odometry settings fixed on val with noiseless keypoint depth (depth_k 0) for the held-out pose caches of this crop.
+n_features: 6000
+orb_scale: 1.2
+orb_levels: 8
+fast_threshold: 7
+clahe_clip: 3.0
+clahe_tile: 8
+match_ratio: 0.8
+ransac_px: 3.0
+final_px: 2.0
+ransac_iters: 300
+ransac_confidence: 0.999
+min_inliers: 30
+guided_radius_px: 12.0
+prior_radius_px: 60.0
+guided_max_hamming: 64
+guided_ratio: 0.9
+depth_max_m: 10.0
+depth_nb: 2
+depth_k: 0.0
+noise_seed: 0
+seed: 0
+threads: 1
+step_m: null
+output_dir: runs/pose

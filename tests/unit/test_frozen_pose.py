@@ -88,8 +88,7 @@ def test_selection_rules_shape():
     assert items["pitch_pair"]["start"] == {"apple": [10, 50], "pear": [20, 70]}
     assert items["single_pitch"]["start"] == {"apple": 30, "pear": 45}
     ladder = _ladder()
-    dvo = ladder["baselines"]["L4_drift_dvo"]["noise"]
-    assert items["d_vo"]["start"] == {k: dvo[k] for k in VO_KEYS}
+    assert items["d_vo"]["start"] == dict(zip(VO_KEYS, (0.003, 0.03, 0.7, 0.013)))
     vo = ladder["noise_blocks"]["vo"]
     assert items["fusion_sigma"]["start"] == {"vo_sigma_trans_mm": vo["drift_step_trans_mm"],
                                               "vo_sigma_rot_deg": vo["drift_step_rot_deg"]}

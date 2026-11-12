@@ -18,17 +18,23 @@ ROOT = Path(__file__).resolve().parents[2]
 EVAL = ROOT / "configs" / "eval"
 POSE_CFG = ROOT / "configs" / "pose"
 LADDER = load_ladder(EVAL / "sweeps_pose" / "ladder_pose.yaml")
-# Pose cache and IMU file folders: <output_dir>/<config hash> of each committed settings file.
-VO_DIR = f"runs/pose/{config_hash(load_yaml_model(POSE_CFG / 'vo.yaml', VoConfig))}"
-VO_DD_DIR = f"runs/pose/{config_hash(load_yaml_model(POSE_CFG / 'vo.yaml', VoConfig, overrides=['depth_k=0.0']))}"
+# Pose cache and IMU file folders: <output_dir>/<config hash> of each committed settings file; a crop's pose caches
+# come from its frozen odometry settings (vo) and their depth_k 0 twin (vo_dd).
+VO_DIRS = {crop: {n: f"runs/pose/{config_hash(load_yaml_model(POSE_CFG / 'frozen' / f'{crop}_{n}.yaml', VoConfig))}"
+                  for n in ("vo", "vo_dd")} for crop in ("apple", "pear")}
 IMU_DIRS = {n: f"runs/imu/{config_hash(load_yaml_model(POSE_CFG / f'{n}.yaml', ImuConfig))}"
             for n in ("imu_ext", "imu_lab", "imu_icm", "imu_ext_x4")}
-# The four alignment knobs of a val base config; roll_pitch_sigma_deg stays unset (its start value).
-KNOBS = {"mode": "none", "segment_m": 3.0, "pair_radius_m": 0.5, "min_pairs": 20, "oracle_sigma_m": 0.02}
+# The alignment knobs of each crop's val base configs, chosen on val; pear's roll_pitch_sigma_deg stays unset (its
+# start value).
+KNOBS = {"apple": {"mode": "none", "segment_m": 3.0, "pair_radius_m": 0.5, "roll_pitch_sigma_deg": 1.0, "min_pairs": 20,
+                   "oracle_sigma_m": 0.02},
+         "pear": {"mode": "none", "segment_m": 6.0, "pair_radius_m": 0.5, "min_pairs": 20, "oracle_sigma_m": 0.02}}
+# The tracker prediction chosen on val for each crop.
+PREDICT = {"apple": "pose", "pear": "pose"}
 # (crop, camera configuration) -> (pass pitches, reference camera pitch)
-LAYOUTS = {("apple", "c2"): ([10.0, 50.0], 50.0), ("pear", "c2"): ([20.0, 70.0], 70.0),
+LAYOUTS = {("apple", "c2"): ([10.0, 50.0], 10.0), ("pear", "c2"): ([20.0, 70.0], 20.0),
            ("apple", "c1"): ([30.0], 30.0), ("pear", "c1"): ([45.0], 45.0),
-           ("apple", "c3"): ([10.0, 30.0, 50.0], 50.0), ("pear", "c3"): ([20.0, 45.0, 70.0], 70.0),
+           ("apple", "c3"): ([10.0, 30.0, 50.0], 10.0), ("pear", "c3"): ([20.0, 45.0, 70.0], 20.0),
            ("apple", "c1v"): ([22.5], 22.5), ("pear", "c1v"): ([45.0], 45.0)}
 
 
@@ -39,12 +45,13 @@ def test_val_pose_configs_follow_the_development_configs():
         expected = _patched(dev, {
             "run_name": f"{crop}_val_pose_{label}", "split": "val", "runs": [f"~/datasets/orchard_synth/{crop}/{scene}"],
             "passes": {"pitches": pitches}, "detector": {"cache": "runs/detect/88e8c93628216703"},
-            "pose": {"rig_ref": ref, "config_label": label, "caches": {"vo": {"dir": VO_DIR}, "vo_dd": {"dir": VO_DD_DIR}},
+            "tracker": {"predict": PREDICT[crop]},
+            "pose": {"rig_ref": ref, "config_label": label, "caches": {n: {"dir": d} for n, d in VO_DIRS[crop].items()},
                      "imu_files": {n: {"dir": d} for n, d in IMU_DIRS.items()}},
-            "align": KNOBS})
+            "align": KNOBS[crop]})
         cfg = load_yaml_model(EVAL / f"{crop}_val_pose_{label}.yaml", EvalAppConfig)
         assert cfg.model_dump() == expected.model_dump(), (crop, label)
-        assert cfg.align.roll_pitch_sigma_deg is None and cfg.tuning is True
+        assert cfg.align.roll_pitch_sigma_deg == KNOBS[crop].get("roll_pitch_sigma_deg") and cfg.tuning is True
 
 
 def test_val_pose_configs_pass_the_ladder_request():

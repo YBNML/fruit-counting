@@ -27,8 +27,8 @@ runner = CliRunner()
 # The named noise values of the ladder's noise_blocks.
 VO = {"drift_scale_sigma": 0.0045, "drift_rate_deg_per_m": 0.045, "drift_step_trans_mm": 2.1,
       "drift_step_rot_deg": 0.039}
-VO_DVO = {"drift_scale_sigma": 0.003, "drift_rate_deg_per_m": 0.03, "drift_step_trans_mm": 0.7,
-          "drift_step_rot_deg": 0.013}
+VO_DVO = {"drift_scale_sigma": 0.0054, "drift_rate_deg_per_m": 0.036, "drift_step_trans_mm": 0.78,
+          "drift_step_rot_deg": 0.019}
 START = {"pass_side_trans_m": 0.05, "pass_side_rot_deg": 0.5}
 RIG = {"rig_extr_trans_mm": 14.0, "rig_extr_rot_deg": 0.4}
 PITCH = {"pass_pitch_trans_m": 0.02, "pass_pitch_rot_deg": 0.25}

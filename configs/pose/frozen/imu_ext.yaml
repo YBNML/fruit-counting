@@ -1,0 +1,6 @@
+# Judged IMU noise profile fixed for the held-out IMU files: the values of configs/pose/imu_ext.yaml.
+profile: I_ext
+noise: {gyro_n: 1.16e-3, acc_n: 4.97e-3, gyro_w: 1.82e-5, acc_w: 4.75e-4, gyro_b0_dps: 1.0, acc_b0_mg: 4.0, temp_k: 1.0}
+rate_hz: 200.0
+acc_range_g: 4.0
+noise_seeds: [0, 1, 2]

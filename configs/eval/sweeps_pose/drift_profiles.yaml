@@ -9,8 +9,8 @@ common:
           imu_acc_b0_mg: 4.0, imu_temp_k: 1.0,
           imu_time_offset_ms: 0.0, imu_extr_trans_mm: 10.0, imu_extr_rot_deg: 0.3}
 combos:
-  D_vo: {noise: {drift_scale_sigma: 0.003, drift_rate_deg_per_m: 0.03, drift_step_trans_mm: 0.7, drift_step_rot_deg: 0.013}}
-  D_vo_x3: {noise: {drift_scale_sigma: 0.009, drift_rate_deg_per_m: 0.09, drift_step_trans_mm: 2.1, drift_step_rot_deg: 0.039}}
+  D_vo: {noise: {drift_scale_sigma: 0.0054, drift_rate_deg_per_m: 0.036, drift_step_trans_mm: 0.78, drift_step_rot_deg: 0.019}}
+  D_vo_x3: {noise: {drift_scale_sigma: 0.0162, drift_rate_deg_per_m: 0.108, drift_step_trans_mm: 2.34, drift_step_rot_deg: 0.057}}
   D_ext_x0.5: {noise: {drift_scale_sigma: 0.00225, drift_rate_deg_per_m: 0.0225, drift_step_trans_mm: 1.05,
                        drift_step_rot_deg: 0.0195}}
   D_ext_x3: {noise: {drift_scale_sigma: 0.0135, drift_rate_deg_per_m: 0.135, drift_step_trans_mm: 6.3, drift_step_rot_deg: 0.117}}

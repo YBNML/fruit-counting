@@ -14,11 +14,11 @@ noise: {pose_trans_sigma_m: 0, pose_rot_sigma_deg: 0, pass_bias_m: 0, depth_rel_
 tracker: {predict: pose, gate_px_frac: 0.5, gate_m: 0.10, max_gap: null, repair_m: 0.18, min_obs: 1, score_hi: 0.9, score_lo: 0.1, min_obs_cached: 3, depth_gate: soft}
 dedup: {radius_m: 0.135, band_m: 0.10}
 pose:
-  rig_ref: 70
+  rig_ref: 20
   config_label: c3
-  caches: {vo: {dir: runs/pose/a45a4d9dca516ca8}, vo_dd: {dir: runs/pose/510f2d4b21947576}}   # configs/pose/vo.yaml; vo_dd with depth_k 0
+  caches: {vo: {dir: runs/pose/a45a4d9dca516ca8}, vo_dd: {dir: runs/pose/510f2d4b21947576}}   # configs/pose/frozen/pear_vo.yaml and pear_vo_dd.yaml
   imu_files: {imu_ext: {dir: runs/imu/682fc7ac53717171}, imu_lab: {dir: runs/imu/2539defedcbebb34}, imu_icm: {dir: runs/imu/02e33e5ef0e7b86b}, imu_ext_x4: {dir: runs/imu/fee3499d725ef4e8}}   # configs/pose/<name>.yaml
-align: {mode: none, segment_m: 3.0, pair_radius_m: 0.5, min_pairs: 20, oracle_sigma_m: 0.02}   # roll_pitch_sigma_deg unset: its start value
+align: {mode: none, segment_m: 6.0, pair_radius_m: 0.5, min_pairs: 20, oracle_sigma_m: 0.02}   # knobs chosen on val; roll_pitch_sigma_deg unset: its start value
 seed: 0
 stop_after: y6
 output_dir: runs/eval_pose
