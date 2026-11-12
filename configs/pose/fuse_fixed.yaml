@@ -1,0 +1,17 @@
+# Fixed values of the batch fusion (estimator IMU noise, start priors, floor of the drift-model odometry factor
+# sigma); not config keys.
+estimator:           # ten times the standstill values: white noise of the chip datasheet, bias random walk measured at rest
+  gyro_n: 7.85e-4
+  acc_n: 9.81e-3
+  gyro_w: 1.82e-5
+  acc_w: 4.75e-4
+start_speed_mps: 0.5
+start_speed_sigma_mps: 0.2
+start_roll_pitch_sigma_deg: 5.0
+shake_share:
+  side_m: 0.02
+  height_m: 0.01
+  along_m: 0.01
+  yaw_deg: 0.5
+vo_sigma_floor_trans_mm: 0.1
+vo_sigma_floor_rot_deg: 0.001

@@ -1,0 +1,20 @@
+# Assumed thresholds of the pose ladder. They judge runs of the judged camera configuration only
+# (judged_config, the base config's pose.config_label); other configurations are report-only.
+judged_config: c2
+y1:
+  LVI:
+    pear:  {e1_median: {le: 0.02}}
+    apple: {e1_median: {le: 0.04}}
+  L5VI:            # judged on the pitches of the pair listed in JUDGED_PITCHES (verdict.py); report-only without one
+    pear:  {e1_median: {le: 0.08}}
+    apple: {e1_median: {le: 0.10}}
+y6:
+  L4_drift:
+    pear:  {row_abs_e_pipe: {le: 0.05}, tree_mae_over_mean: {le: 0.06}, miss_rate: {le: 0.04}, excess_rate: {le: 0.04}}
+    apple: {row_abs_e_pipe: {le: 0.10}, tree_mae_over_mean: {le: 0.10}, miss_rate: {le: 0.08}, excess_rate: {le: 0.08}}
+  LVI:
+    pear:  {row_abs_e_pipe: {le: 0.05}, tree_mae_over_mean: {le: 0.06}, miss_rate: {le: 0.04}, excess_rate: {le: 0.04}, attribution_error: {le: 0.02}}
+    apple: {row_abs_e_pipe: {le: 0.10}, tree_mae_over_mean: {le: 0.10}, miss_rate: {le: 0.08}, excess_rate: {le: 0.08}, attribution_error: {le: 0.02}}
+  L5VI:
+    pear:  {row_abs_e_pipe: {le: 0.08}, tree_mae_over_mean: {le: 0.12}, miss_rate: {le: 0.08}, excess_rate: {le: 0.08}}
+    apple: {row_abs_e_pipe: {le: 0.12}, tree_mae_over_mean: {le: 0.15}, miss_rate: {le: 0.12}, excess_rate: {le: 0.12}}

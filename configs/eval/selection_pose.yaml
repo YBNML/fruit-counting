@@ -1,0 +1,63 @@
+# Rules for the values the pose ladder chooses on val before the held-out scenes are scored. Items are
+# chosen in `order`, each by its steps; a choice that differs from its start value still follows the rule.
+order: [pitch_pair, single_pitch, rig_ref, vo, d_vo, fusion_sigma, align, predict]
+fixed:
+  judged_point: rungs L4_drift, LVI and L5VI of the pose ladder as committed
+  knobs: dedup radius and band, score thresholds and min_obs_cached of the frozen learned-detector configs
+items:
+  pitch_pair:
+    start: {apple: [10, 50], pear: [20, 70]}
+    candidates: every pair of the three rendered pitches
+    steps:
+      - {metric: coverage, of: "G6 count1 truth of the candidate / of all three pitches", run: "eval truth --subsets on the shaken val scene", pick: max}
+      - {within: 0.01, metric: total_error, of: "(misses + duplicates + fp_off + fp_bg + boundary) / G6 count1 truth of the candidate", run: "rung L3 on val with passes.pitches = candidate", pick: min}
+      - {within: 0.005, metric: tree_mae_over_mean, run: "the same L3 runs", pick: min}
+      - {tie: start}
+  single_pitch:
+    start: {apple: 30, pear: 45}
+    candidates: each rendered pitch
+    steps: as pitch_pair
+  rig_ref:
+    start: {apple: {"10,50": 50, "10,30": 10}, pear: {"20,70": 70}}
+    candidates: the pitches of the chosen pair; the single pitch for one camera
+    steps:
+      - {metric: end_position_drift_median, of: "per-camera odometry alone, depth noise k 0.0036, both sides", pick: min}
+  vo:
+    start: {depth_nb: 2, n_features: 6000, final_px: 2.0, depth_max_m: 10.0}   # VoConfig keys; the other keys keep their configs/pose/vo.yaml values
+    steps:
+      - {metric: interpass_p90, of: "same side and both sides, after fusion and alignment", rung: LVI, pick: min}
+      - {metric: end_drift_median, rung: LVI, pick: min}
+      - {metric: rpe_p90, rung: LVI, pick: min}
+  d_vo:
+    start: {drift_step_trans_mm: 0.7, drift_step_rot_deg: 0.013, drift_scale_sigma: 0.003, drift_rate_deg_per_m: 0.03}
+    fit_to: [rpe_p50, end_drift_median, end_rotation_median]   # measured in the reference camera frame
+    rung: LV
+  fusion_sigma:
+    start: {vo_sigma_trans_mm: 2.1, vo_sigma_rot_deg: 0.039}
+    candidates: ["val odometry rpe_p50 / 1.54", "the judged walk sigmas", "3 x the judged walk sigmas"]
+    steps: as vo
+    scope: file pose source only; a truth source takes its factor sigmas from its drift values
+  align:
+    start: {segment_m: 3.0, pair_radius_m: 0.5, roll_pitch_sigma_deg: "2 sqrt((b0/g)^2 + d^2), d = imu_extr_rot_deg"}
+    fixed: {min_pairs: 20}     # not a candidate
+    candidates: {segment_m: [3.0, 6.0], roll_pitch_sigma_deg: [0.25, 1.0, "2 sqrt((b0/g)^2 + d^2)"]}
+    steps:
+      - {veto: "drop a candidate whose L3_al differs from L3, in either direction, by more than the limit of its crop in any of the three metrics",
+         rung: L3_al, of: "the signed row e_pipe (y6.row.e_pipe), y6.metrics.miss_rate and y6.metrics.excess_rate",
+         limits: {apple: {row_e_pipe: 0.01, miss_rate: 0.015, excess_rate: 0.015},
+                  pear: {row_e_pipe: 0.005, miss_rate: 0.005, excess_rate: 0.005}}}
+      - {metric: interpass_p90, rungs: [L4_drift, LVI], pick: min}
+      - {tie: simplest}
+  predict:
+    start: pose
+    candidates: [pose, pose_local]
+    window: the number m of recent observations of pose_local, chosen by the same steps when pose_local is a candidate
+    point: the judged point with the rpe_weak jitter
+    steps:
+      - {metric: y1_duplicates_plus_misses_median, pick: min}
+      - {within: 0.005, tie: simplest, order: [pose, pose_local]}
+vetoes:
+  count: drop a pose-knob candidate whose LVI (misses + excess) is more than 0.01 above the best candidate's
+  other_path: on the straight val scene of seed 200 with the assumed constant-speed IMU, take the next candidate when the chosen one is worse on the same pose metric; not for pitch_pair or single_pitch
+  exp_scene: the exp scene has one pitch; it is not used for the alignment knobs
+tuning: true
