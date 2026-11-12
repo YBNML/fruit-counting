@@ -82,7 +82,7 @@ def test_pose_criteria_rows():
 
 def test_selection_rules_shape():
     rules = _yaml(EVAL / "selection_pose.yaml")
-    assert set(rules) == {"order", "fixed", "items", "vetoes", "tuning"}
+    assert set(rules) == {"order", "fixed", "items", "vetoes", "detail", "tuning"}
     items = rules["items"]
     assert set(items) == set(rules["order"])
     assert items["pitch_pair"]["start"] == {"apple": [10, 50], "pear": [20, 70]}
