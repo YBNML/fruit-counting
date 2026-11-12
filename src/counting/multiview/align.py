@@ -33,12 +33,23 @@ One fit without known pairs (`fit_rigid`):
 6. Gathering again, up to `REFIT_ROUNDS` times: the refined transform measures every candidate again,
    mutual nearest pairs are chosen among the new inliers and the refinement runs again. It stops, with
    the transform before, when the pairs stay the same or fall below `min_pairs`.
+7. The check on held-out pairs (`_check`): the final pairs fall into two folds by alternate rank along the
+   row; each fold is measured by the refinement of the other, started from its mean pair displacement.
+   The fit stands only when the median held-out distance lies more than `CHECK_MARGIN_M` below the median
+   pair distance at the identity; otherwise there is no fit, as with pairs that differ by noise alone.
 The residual of a fit is the median distance of its pairs after the transform.
 
-Fallbacks (`with_fallback`). A segment with a fit of its own uses it (`own`). A segment without one takes
-the fit of the segment with its own fit whose centre is nearest, the first on a tie (`nearest`). When no
-segment has its own fit, one fit of all the moving points is tried (`group`, with the three-pair
-hypotheses), and without that every segment keeps the identity (`identity`, no residual).
+Fallbacks (`with_fallback`). A segment with a fit of its own uses it (`own`); a fit the check refuses is no
+fit of its own. A segment without one takes the fit of the segment with its own fit whose centre is
+nearest, the first on a tie (`nearest`). When no segment has its own fit, one fit of all the moving points
+is tried (`group`, with the three-pair hypotheses), and without that every segment keeps the identity
+(`identity`, no residual). Between the sides, a fit of the whole group short of pairs is tried once more
+after a coarse shift (`_coarse_shift`): every displacement from a moving point to a reference point within
+`COARSE_RADIUS_M` votes for those within `COARSE_VOTE_M` of it, and with at least `COARSE_MIN_VOTES` votes
+the componentwise median around the most voted one moves the moving points before the fit. That fit goes
+on with the same generator, passes the same check on the points before the move and stands only with more
+pairs than the identity has (`_identity_pairs`: mutual nearest pairs within `INLIER_M` without any move).
+The fits on one side and the fits of a segment take no coarse shift.
 
 Used tracks. A stage reads the tracks of a pass with a finite centre, at least `min_obs` observations and a
 centre less than half the row spacing from the target row across the row. Each is moved by the transform
@@ -67,10 +78,11 @@ side keep every track.
 
 Determinism: every draw comes from a generator keyed by the caller (`noise_rng(*key, segment)`, the fit
 of the whole group taking the segment count as its index), candidates and pairs are sorted, ties break by
-fixed rules and the tolerances are fixed, so the same inputs give the same bytes. `align_passes` keys the
-fits of a group by (seed, noise seed, `STEP_ALIGN`, scene, stage, side, group) and its thinning by the same
-parts under `STEP_ALIGN_THIN`: stage 0 on one side and 1 between the sides, side A 0 and B 1, group 0 for
-the rig and the pitch in thousandths of a degree for a pass.
+fixed rules and the tolerances are fixed, so the same inputs give the same bytes. The check draws nothing,
+and the fit after a coarse shift goes on with the generator of the fit of the whole group. `align_passes`
+keys the fits of a group by (seed, noise seed, `STEP_ALIGN`, scene, stage, side, group) and its thinning by
+the same parts under `STEP_ALIGN_THIN`: stage 0 on one side and 1 between the sides, side A 0 and B 1,
+group 0 for the rig and the pitch in thousandths of a degree for a pass.
 """
 
 from __future__ import annotations
@@ -95,6 +107,10 @@ RANSAC_DRAWS = 200           # shift hypotheses of a fit
 RANSAC_DRAWS_RIGID = 1000    # three-pair rigid hypotheses of the fit of a whole group
 RIGID_AREA_M2 = 0.05         # smallest cross product of the three moving points of a rigid hypothesis (m^2)
 REFIT_ROUNDS = 2             # rounds of gathering the pairs again
+CHECK_MARGIN_M = 0.005       # margin by which a fit must beat the identity on its held-out pairs (m)
+COARSE_RADIUS_M = 1.5        # radius of the candidate displacements of a coarse shift (m)
+COARSE_VOTE_M = 0.10         # distance within which two candidate displacements vote for each other (m)
+COARSE_MIN_VOTES = 8         # fewest votes a coarse shift stands on
 USES = ("own", "nearest", "line", "group", "identity")    # where the transform of a segment comes from
 _METHODS = ("tracks", "row_plane")                         # the stages `align_passes` runs
 _SIDES = {"A": 0, "B": 1}                                  # side part of a group key
@@ -253,23 +269,52 @@ def _kabsch(P: np.ndarray, Q: np.ndarray) -> np.ndarray:
     return H
 
 
-def fit_rigid(moving, reference, *, radius_m: float, sigma_rp_deg: float | None, min_pairs: int,
-              rng: np.random.Generator, rigid_draws: int = 0) -> tuple[np.ndarray | None, int, float | None]:
-    """The rigid transform moving the points `moving` onto `reference` without known pairs, its pair count
-    and its median pair residual; `(None, pairs, None)` with fewer than `min_pairs` pairs and
-    `(None, 0, None)` without candidates. `rigid_draws` three-pair hypotheses follow the shift ones."""
-    moving = np.asarray(moving, dtype=np.float64).reshape(-1, 3)
-    reference = np.asarray(reference, dtype=np.float64).reshape(-1, 3)
-    if len(moving) == 0 or len(reference) == 0:
-        return None, 0, None
+def _candidates(moving: np.ndarray, reference: np.ndarray, radius_m: float) -> tuple[np.ndarray, np.ndarray]:
+    """Every reference point within `radius_m` of each moving point, as index arrays (moving, reference) in
+    moving then reference order."""
     near = cKDTree(reference).query_ball_point(moving, radius_m)
     pm = np.array([m for m, rs in enumerate(near) for _ in rs], dtype=np.int64)
     pr = np.array([r for rs in near for r in sorted(rs)], dtype=np.int64)
+    return pm, pr
+
+
+def _check(M: np.ndarray, R: np.ndarray, sigma_rp_deg: float | None) -> bool:
+    """Whether a fit beats the identity on held-out pairs. The pairs (moving points `M` before any move, row
+    by row with their reference points `R`) fall into two folds by alternate rank along the row (x, stable
+    order); each fold is measured by the refinement of the other started from its mean pair displacement.
+    The median held-out distance must lie more than `CHECK_MARGIN_M` below the median pair distance at the
+    identity."""
+    rank = np.empty(len(M), dtype=np.int64)
+    rank[np.argsort(M[:, 0], kind="stable")] = np.arange(len(M))
+    fold = rank % 2
+    held = np.empty(len(M))
+    for f in (0, 1):
+        train, test = fold != f, fold == f
+        Af, _ = _refine(M[train], R[train], (R[train] - M[train]).mean(axis=0), sigma_rp_deg)
+        held[test] = np.linalg.norm(M[test] @ Af[:3, :3].T + Af[:3, 3] - R[test], axis=1)
+    return bool(np.median(held) < np.median(np.linalg.norm(R - M, axis=1)) - CHECK_MARGIN_M)
+
+
+def fit_rigid(moving, reference, *, radius_m: float, sigma_rp_deg: float | None, min_pairs: int,
+              rng: np.random.Generator, rigid_draws: int = 0,
+              shift: np.ndarray | None = None) -> tuple[np.ndarray | None, int, float | None]:
+    """The rigid transform moving the points `moving` onto `reference` without known pairs, its pair count
+    and its median pair residual; `(None, pairs, None)` with fewer than `min_pairs` pairs or when the fit
+    does not beat the identity on held-out pairs (`_check`), and `(None, 0, None)` without candidates.
+    `rigid_draws` three-pair hypotheses follow the shift hypotheses. With `shift` (3,) the fit runs on the
+    moving points moved by it and the transform returned includes it, so it applies to `moving` as given;
+    the check reads the points before the move."""
+    original = np.asarray(moving, dtype=np.float64).reshape(-1, 3)
+    moving = original if shift is None else original + shift
+    reference = np.asarray(reference, dtype=np.float64).reshape(-1, 3)
+    if len(moving) == 0 or len(reference) == 0:
+        return None, 0, None
+    pm, pr = _candidates(moving, reference, radius_m)
     if len(pm) == 0:
         return None, 0, None
 
     D = reference[pr] - moving[pm]
-    best = None                              # ((inliers, -distance sum), distances, shift or None)
+    best = None                              # ((inliers, -distance sum), distances, start or None)
     for i in rng.choice(len(pm), size=min(RANSAC_DRAWS, len(pm)), replace=False):
         e = np.linalg.norm(D - D[i], axis=1)
         inliers = e <= INLIER_M
@@ -290,12 +335,12 @@ def fit_rigid(moving, reference, *, radius_m: float, sigma_rp_deg: float | None,
         if score > best[0]:
             best = (score, e, None)
 
-    _, e, shift = best
+    _, e, start = best
     pairs = _mutual(pm, pr, e, e <= INLIER_M)
     if len(pairs) < min_pairs:
         return None, len(pairs), None
     M, R = moving[pm[pairs]], reference[pr[pairs]]
-    A, residual = _refine(M, R, (R - M).mean(axis=0) if shift is None else shift, sigma_rp_deg)
+    A, residual = _refine(M, R, (R - M).mean(axis=0) if start is None else start, sigma_rp_deg)
     for _ in range(REFIT_ROUNDS):
         e = np.linalg.norm(moving[pm] @ A[:3, :3].T + A[:3, 3] - reference[pr], axis=1)
         again = _mutual(pm, pr, e, e <= INLIER_M)
@@ -304,7 +349,46 @@ def fit_rigid(moving, reference, *, radius_m: float, sigma_rp_deg: float | None,
         pairs = again
         M, R = moving[pm[pairs]], reference[pr[pairs]]
         A, residual = _refine(M, R, (R - M).mean(axis=0), sigma_rp_deg)
+    if not _check(original[pm[pairs]], reference[pr[pairs]], sigma_rp_deg):
+        return None, len(pairs), None
+    if shift is not None:
+        T = np.eye(4)
+        T[:3, 3] = shift
+        A = A @ T
     return A, len(pairs), residual
+
+
+def _coarse_shift(moving: np.ndarray, reference: np.ndarray) -> np.ndarray | None:
+    """The shift most of the candidate displacements agree on: every displacement from a moving point to a
+    reference point within `COARSE_RADIUS_M` (moving then reference order) votes for each displacement
+    within `COARSE_VOTE_M` of it, itself included; the componentwise median of the displacements around the
+    most voted one (the first on a tie). None without candidates or below `COARSE_MIN_VOTES` votes."""
+    moving = np.asarray(moving, dtype=np.float64).reshape(-1, 3)
+    reference = np.asarray(reference, dtype=np.float64).reshape(-1, 3)
+    if len(moving) == 0 or len(reference) == 0:
+        return None
+    pm, pr = _candidates(moving, reference, COARSE_RADIUS_M)
+    if len(pm) == 0:
+        return None
+    D = reference[pr] - moving[pm]
+    tree = cKDTree(D)
+    votes = tree.query_ball_point(D, COARSE_VOTE_M, return_length=True)
+    best = int(np.argmax(votes))
+    if votes[best] < COARSE_MIN_VOTES:
+        return None
+    return np.median(D[tree.query_ball_point(D[best], COARSE_VOTE_M)], axis=0)
+
+
+def _identity_pairs(moving: np.ndarray, reference: np.ndarray) -> int:
+    """The pairs the identity already has: the mutual nearest pairs among the candidates within `INLIER_M`
+    (moving then reference order), by the distance without any move."""
+    moving = np.asarray(moving, dtype=np.float64).reshape(-1, 3)
+    reference = np.asarray(reference, dtype=np.float64).reshape(-1, 3)
+    if len(moving) == 0 or len(reference) == 0:
+        return 0
+    pm, pr = _candidates(moving, reference, INLIER_M)
+    e = np.linalg.norm(reference[pr] - moving[pm], axis=1)
+    return len(_mutual(pm, pr, e, np.ones(len(pm), dtype=bool)))
 
 
 def fit_known(moving, reference, *, sigma_rp_deg: float | None) -> tuple[np.ndarray, float]:
@@ -340,18 +424,32 @@ def with_fallback(own: Sequence[tuple[np.ndarray | None, int, float | None]], se
 
 
 def fit_segments(moving, x, reference, segments: Segments, *, radius_m: float, sigma_rp_deg: float | None,
-                 min_pairs: int, key: Sequence[int]) -> list[Fit]:
+                 min_pairs: int, key: Sequence[int], coarse: bool = False) -> list[Fit]:
     """The fit of each segment: the moving points at positions `x` inside its window onto all of
     `reference`, drawn from `noise_rng(*key, j)`, with `with_fallback`; the fit of the whole group uses
-    every moving point, `noise_rng(*key, len(segments.centres))` and the three-pair hypotheses."""
+    every moving point, `noise_rng(*key, len(segments.centres))` and the three-pair hypotheses. With
+    `coarse`, a fit of the whole group short of pairs runs once more after `_coarse_shift`, going on with
+    the same generator, and stands only with more pairs than the identity has (`_identity_pairs`)."""
     moving = np.asarray(moving, dtype=np.float64).reshape(-1, 3)
     x = np.asarray(x, dtype=np.float64).reshape(-1)
     count = len(segments.centres)
     own = [fit_rigid(moving[segments.window(j, x)], reference, radius_m=radius_m, sigma_rp_deg=sigma_rp_deg,
                      min_pairs=min_pairs, rng=noise_rng(*key, j)) for j in range(count)]
-    return with_fallback(own, segments, lambda: fit_rigid(
-        moving, reference, radius_m=radius_m, sigma_rp_deg=sigma_rp_deg, min_pairs=min_pairs,
-        rng=noise_rng(*key, count), rigid_draws=RANSAC_DRAWS_RIGID))
+
+    def whole() -> tuple[np.ndarray | None, int, float | None]:
+        rng = noise_rng(*key, count)
+        first = fit_rigid(moving, reference, radius_m=radius_m, sigma_rp_deg=sigma_rp_deg, min_pairs=min_pairs,
+                          rng=rng, rigid_draws=RANSAC_DRAWS_RIGID)
+        if coarse and first[0] is None and first[1] < min_pairs:
+            s = _coarse_shift(moving, reference)
+            if s is not None:
+                A, n, residual = fit_rigid(moving, reference, radius_m=radius_m, sigma_rp_deg=sigma_rp_deg,
+                                           min_pairs=min_pairs, rng=rng, rigid_draws=RANSAC_DRAWS_RIGID, shift=s)
+                if A is not None and n > _identity_pairs(moving, reference):
+                    return A, n, residual
+        return first
+
+    return with_fallback(own, segments, whole)
 
 
 @dataclass(frozen=True, eq=False)
@@ -463,7 +561,7 @@ def align_passes(passes: Sequence[AlignPass], layout: OrchardLayout, methods: Se
             moving, x = moving[keep], x[keep]
         fits = fit_segments(moving, x, points(reference)[0], segments, radius_m=settings.pair_radius_m,
                             sigma_rp_deg=settings.roll_pitch_sigma_deg, min_pairs=settings.min_pairs,
-                            key=(key[0], key[1], STEP_ALIGN, key[2], *code))
+                            key=(key[0], key[1], STEP_ALIGN, key[2], *code), coarse=stage == "both_sides")
         stages.append(StageRecord(stage, label, segments, fits))
         step = _stack(segments, fits)
         for p in group:

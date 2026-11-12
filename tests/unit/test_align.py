@@ -1,6 +1,7 @@
 """Aligning the tracked passes without truth: the alignment knobs and draw steps, the segments along the
-tree row, the rigid fits of a segment and their fallbacks, the alignment of passes by the tracks two passes
-share and to the row centre plane, and the stress options."""
+tree row, the rigid fits of a segment, the check that keeps the identity, the coarse shift of a group fit
+between the sides and their fallbacks, the alignment of passes by the tracks two passes share and to the row
+centre plane, and the stress options."""
 
 import dataclasses
 import inspect
@@ -147,6 +148,57 @@ def test_segment_fits_borrow_then_go_whole_then_identity():
     assert [f.use for f in lost] == ["identity"] * 5
     assert all(f.residual_m is None and np.array_equal(f.matrix, np.eye(4)) for f in lost)
     assert all(a.matrix.tobytes() == b.matrix.tobytes() for a, b in zip(got, fits(20)))
+
+
+def test_a_fit_must_beat_the_identity_on_held_out_pairs():
+    for seed in range(5):                      # the same 30 points on both sides, noise only: the identity is right
+        X = _cloud(150, 60 + seed, x=(0.0, 3.0))
+        rng = np.random.default_rng(70 + seed)
+        moving = np.r_[X[:30] + rng.normal(0.0, 0.015, (30, 3)), _cloud(120, 80 + seed, x=(0.0, 3.0))]
+        reference = np.r_[X[:30] + rng.normal(0.0, 0.015, (30, 3)), X[30:]]
+        A, n, residual = fit_rigid(moving, reference, radius_m=0.5, sigma_rp_deg=None, min_pairs=20,
+                                   rng=noise_rng(1))
+        assert A is None and residual is None and n >= 20       # enough pairs, refused
+    error = rigid([0.0, 0.0, 0.0], [0.06, -0.03, 0.02])
+    for seed in (0, 1):                                          # a real offset of 7 cm stands
+        X = _cloud(150, 60 + seed, x=(0.0, 3.0))
+        rng = np.random.default_rng(70 + seed)
+        moving = np.r_[_move(error, X[:30]) + rng.normal(0.0, 0.015, (30, 3)), _cloud(120, 80 + seed, x=(0.0, 3.0))]
+        A, n, _ = fit_rigid(moving, X, radius_m=0.5, sigma_rp_deg=None, min_pairs=20, rng=noise_rng(1))
+        assert A is not None and n >= 20
+        assert np.linalg.norm((_move(A, _move(error, X[:30])) - X[:30]).mean(axis=0)) < 0.01
+
+
+def test_a_noise_fit_is_not_borrowed_along_the_pass():
+    seg = Segments.along([0.0, 6.0], 3.0)                         # centres 0, 1.5, 3, 4.5 and 6
+    for seed in range(3):
+        X = np.r_[_cloud(25, 7 + seed, x=(-1.0, -0.2)), _cloud(5, 8 + seed, x=(6.2, 7.0))]
+        rng = np.random.default_rng(20 + seed)
+        moving, reference = X + rng.normal(0.0, 0.01, X.shape), X + rng.normal(0.0, 0.01, X.shape)
+        fits = fit_segments(moving, moving[:, 0], reference, seg, radius_m=0.5, sigma_rp_deg=None, min_pairs=20,
+                            key=(0, 0, 15, 5))
+        assert [f.use for f in fits] == ["identity"] * 5 and fits[0].n >= 20
+        assert all(f.residual_m is None and np.array_equal(f.matrix, np.eye(4)) for f in fits)
+
+
+def test_the_group_fit_between_the_sides_retries_after_a_coarse_shift():
+    seg = Segments.along([0.0, 20.0], 3.0)                        # 14 segments
+    X = _cloud(300, 51, x=(0.0, 20.0))
+    error = rigid([0.0, 0.0, radians(0.1)], [0.8, 0.3, -0.1])     # beyond the pair radius everywhere
+    moving = _move(error, X[:240]) + np.random.default_rng(52).normal(0.0, 0.01, (240, 3))
+
+    def fits(coarse, M=moving, x=moving[:, 0], R=X):
+        return fit_segments(M, x, R, seg, radius_m=0.5, sigma_rp_deg=None, min_pairs=20,
+                            key=(0, 0, 15, 5, 1, 1, 0), coarse=coarse)
+
+    shifted = fits(True)
+    assert [f.use for f in shifted] == ["group"] * len(seg.centres)
+    assert np.percentile(np.linalg.norm(_move(shifted[0].matrix, _move(error, X[:240])) - X[:240], axis=1), 90) < 0.005
+    assert [f.use for f in fits(False)] == ["identity"] * len(seg.centres)     # no coarse shift on one side
+    for seed in (0, 1):                                           # two groups with no fruit in common stay apart
+        low = _cloud(300, 90 + seed, x=(0.0, 20.0), z=(0.8, 2.0))
+        high = _cloud(300, 95 + seed, x=(0.0, 20.0), z=(1.8, 3.2))
+        assert {f.use for f in fits(True, high, high[:, 0], low)} == {"identity"}
 
 
 def _split(X, side, error, seed, aisle):
