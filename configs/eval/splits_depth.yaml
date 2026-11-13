@@ -1,0 +1,7 @@
+# Seed splits of the depth evaluation: new val and held-out seeds; the earlier held-out seeds are not listed.
+dev: [5]
+val: [200, 201]
+test: [1006, 1007, 1008]
+exp: [300]
+train: [100, 101, 102, 103, 104, 105, 106, 107, 108, 109,
+        110, 111, 112, 113, 114, 115, 116, 117, 118, 119]
