@@ -1,0 +1,49 @@
+# Held-out run of the pose ladder for camera configuration c2 (judged); every setting was fixed on val and the caches and IMU files are pinned.
+run_name: apple_test_pose
+crop: apple
+split: test                # held-out run; every setting below was fixed on val and is never tuned here
+tuning: false
+runs: [~/datasets/orchard_synth/apple/test_s1003_shake, ~/datasets/orchard_synth/apple/test_s1004_shake,
+       ~/datasets/orchard_synth/apple/test_s1005_shake]
+truth: {variant: count1}
+passes: {pitches: [10, 50], sides: [A, B], step_m: null}
+stages: {det: oracle, track: landmark, center: measured, dedup: hybrid, assign: grid}
+detector:
+  positives: count1
+  cache: runs/detect/88e8c93628216703
+  noise: null
+  digests:                 # one pinned detection cache digest per bundle
+    apple_s1003_7d0fa63d: "6a4a5c003eb39435f0d86a2ab42a9bd857e75a7b0b2de7e8ebf119b2beea76c5"
+    apple_s1004_8c3e380d: "85a0ef592944a6a0e46cebef7c9063c6138ffdb28e127dfa118da564d02b5eb5"
+    apple_s1005_33c3058e: "777bd350314291714375be55662071d2e21ae31b8d8541916941aeb819d87f3e"
+lift: {depth: box_far, box_frac: 0.5, center_offset_m: {fruit: 0.02, bag: 0.03}}
+noise: {pose_trans_sigma_m: 0, pose_rot_sigma_deg: 0, pass_bias_m: 0, depth_rel_sigma: 0, depth_dropout: 0, seeds: [0, 1, 2]}
+tracker: {predict: pose, gate_px_frac: 0.5, gate_m: 0.05, max_gap: null, repair_m: 0.08, min_obs: 1, score_hi: 0.6, score_lo: 0.2, min_obs_cached: 4, depth_gate: soft}
+dedup: {radius_m: 0.09, band_m: 0.05}
+pose:
+  rig_ref: 10
+  config_label: c2
+  caches:                   # configs/pose/frozen/apple_vo.yaml and apple_vo_dd.yaml; one pinned pose cache digest per bundle
+    vo:
+      dir: runs/pose/b16b37e34b609dd2
+      digests:
+        apple_s1003_7d0fa63d: "a7d120dc6d9c6136fd23bb12f701339601638c2e74ad0f19189b86831608ec23"
+        apple_s1004_8c3e380d: "4225cd8be238d50dd479c02dab58c1d8bc27f5a3e83ed6040edc0410acbb90ee"
+        apple_s1005_33c3058e: "680e7cb2afeddcd4b6c77a9d83609bf26ae2010c57a15f51fe22f6219f620961"
+    vo_dd:
+      dir: runs/pose/52ad7d4423dea8fb
+      digests:
+        apple_s1003_7d0fa63d: "c194cb4c071d8a68459e4c45d45f61d06b05830e92590431f47286af65d95c59"
+        apple_s1004_8c3e380d: "9c30a34e1c70e84c09e79590d634e4fe01144f89e1f5fd0dd4172e13b1d769d2"
+        apple_s1005_33c3058e: "2cb6264d92082a5efe9ac3a133a25cf29616e127874f0b32501410997d4c7faa"
+  imu_files:                # configs/pose/frozen/imu_ext.yaml, the judged IMU profile only; one pinned IMU file digest per bundle
+    imu_ext:
+      dir: runs/imu/682fc7ac53717171
+      digests:
+        apple_s1003_7d0fa63d: "c05f253279ef5b2963d5158dd4beeec6e83b105e5f3f28e512af6aa12e13c064"
+        apple_s1004_8c3e380d: "a9e03276881b4a6f918d9dc6af7de130e3c32c3b1747ad5398ae4add636ab56b"
+        apple_s1005_33c3058e: "d9662f791f35d34b2057d942f1c3f9b44d2a7b6705203a1ef77db5d20da89124"
+align: {mode: none, segment_m: 3.0, pair_radius_m: 0.5, roll_pitch_sigma_deg: 1.0, min_pairs: 20, oracle_sigma_m: 0.02}   # knobs chosen on val
+seed: 0
+stop_after: y6
+output_dir: runs/eval_pose

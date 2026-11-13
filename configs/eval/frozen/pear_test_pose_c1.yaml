@@ -1,0 +1,49 @@
+# Held-out run of the pose ladder for camera configuration c1 (report only); every setting was fixed on val and the caches and IMU files are pinned.
+run_name: pear_test_pose_c1
+crop: pear
+split: test                # held-out run; every setting below was fixed on val and is never tuned here
+tuning: false
+runs: [~/datasets/orchard_synth/pear/test_s1003_shake, ~/datasets/orchard_synth/pear/test_s1004_shake,
+       ~/datasets/orchard_synth/pear/test_s1005_shake]
+truth: {variant: count1}
+passes: {pitches: [45], sides: [A, B], step_m: null}
+stages: {det: oracle, track: landmark, center: measured, dedup: self_side, assign: grid}
+detector:
+  positives: count1
+  cache: runs/detect/88e8c93628216703
+  noise: null
+  digests:                 # one pinned detection cache digest per bundle
+    pear_s1003_2f536246: "046f4e1268570f8a2f5e4c06adad667ba6ddfd61c9ee124e88c20a3e2d64e5d3"
+    pear_s1004_df156985: "1fce9f81c7b23f3b5cb2763e3eead5545f68dc2e283ba40e1060fbed29277605"
+    pear_s1005_0f79160e: "f93291dc2a7682b9e02c92ef4b3b3247170129601292d6b73a0d6edbe5a5d853"
+lift: {depth: box_far, box_frac: 0.5, center_offset_m: {bag: 0.04}}
+noise: {pose_trans_sigma_m: 0, pose_rot_sigma_deg: 0, pass_bias_m: 0, depth_rel_sigma: 0, depth_dropout: 0, seeds: [0, 1, 2]}
+tracker: {predict: pose, gate_px_frac: 0.5, gate_m: 0.10, max_gap: null, repair_m: 0.18, min_obs: 1, score_hi: 0.9, score_lo: 0.1, min_obs_cached: 3, depth_gate: soft}
+dedup: {radius_m: 0.135, band_m: 0.10}
+pose:
+  rig_ref: 45
+  config_label: c1
+  caches:                   # configs/pose/frozen/pear_vo.yaml and pear_vo_dd.yaml; one pinned pose cache digest per bundle
+    vo:
+      dir: runs/pose/a45a4d9dca516ca8
+      digests:
+        pear_s1003_2f536246: "28cebc296ac8b3081239173202c4bf91cf96efb5684c6e4ad8c9fa5bc0f50880"
+        pear_s1004_df156985: "60ec341ac23a07a01a3b7749052b0efd6fe1b39baa0ec1c94ec451437003b558"
+        pear_s1005_0f79160e: "da00bcf566d6bf1301eb9dcc769475b489dbd1648c6b6fee4bb840b03675c1a7"
+    vo_dd:
+      dir: runs/pose/510f2d4b21947576
+      digests:
+        pear_s1003_2f536246: "67bbcc6a52c9348fc2b64cc567d5cf143cd99c89b7b63a652749fadeb1f75b66"
+        pear_s1004_df156985: "3bb1ab2682033694310c6028563da81792dbb4f00e8cad849f73c977c965fa62"
+        pear_s1005_0f79160e: "fefae7ad84242f6e24ed4a410a1c484940d9879e10babe79cd32f11b8bc6bb36"
+  imu_files:                # configs/pose/frozen/imu_ext.yaml, the judged IMU profile only; one pinned IMU file digest per bundle
+    imu_ext:
+      dir: runs/imu/682fc7ac53717171
+      digests:
+        pear_s1003_2f536246: "32bd52eff844c680d63aa58a6dff127602c2b1efea12563d8c17e5f380cb4fa9"
+        pear_s1004_df156985: "451cb3d9f7cc3c267fa3836b80996c62d1fd65c02caf4172c3420b25be18a16f"
+        pear_s1005_0f79160e: "d934b8f38703bdb6c2418246a5ae773b4ae2bddedd21b8d87fa4a13d123c44d0"
+align: {mode: none, segment_m: 6.0, pair_radius_m: 0.5, min_pairs: 20, oracle_sigma_m: 0.02}   # knobs chosen on val; roll_pitch_sigma_deg unset: its start value
+seed: 0
+stop_after: y6
+output_dir: runs/eval_pose
