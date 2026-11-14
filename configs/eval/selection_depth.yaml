@@ -1,0 +1,57 @@
+# Rules for the LiDAR depth values the depth ladder chooses on val before the held-out scenes are scored.
+# The rules choose for the depth-unit rungs (suffix _ld); the navigation-unit rungs (suffix _ldn) take the
+# values the depth unit chose. Items are chosen in `order`; the vetoes drop candidates before an item's steps.
+order: [match_window, lidar_far, combine]
+fixed:
+  start: {match: gate, window_s: 0.5, combine: ivw, min_points: 3, gate_k: 3}
+  belief: {belief_cam_rel: 0.02, belief_range_m: 0.02}   # lift.lidar constants; they never read noise.*
+  lidar_far_scale: 1.0
+  camera_far: the camera lift.far_* values of the frozen configs; not chosen
+  simulation: the judged values of the two LiDAR simulation configs (depth unit, navigation unit); not chosen
+items:
+  match_window:
+    rung: LVI_ld
+    scene: val seed 200
+    crops: each crop on its own
+    candidates: {match: [far, gate, map], window_s: [0.15, 0.5, 1.0], map_window_s: [1.0, pass]}
+    others: start
+    steps:
+      - {metric: over_10cm_rate, pick: min}
+      - {within: 0.005, metric: abs_error_p90_m, pick: min}
+      - {tie: start}
+  lidar_far:
+    when: match_window picks far
+    crops: each crop on its own
+    start: {far_min_frac: 0.25, far_gap_m: 0.03}
+    candidates: {far_min_frac: [0.1, 0.25], far_gap_m: [0.03, 0.06]}
+    steps: as match_window
+  combine:
+    rung: LVI_ld
+    scene: val seed 200
+    crops: each crop on its own
+    holds: match and window_s as chosen by match_window, and the lidar_far values when the match is far
+    candidates: {combine: [replace, ivw], min_points: [1, 3, 5], gate_k: [2, 3, 5]}   # gate_k only when the match is gate
+    steps:
+      - {metric: miss_plus_excess, pick: min}
+      - {within: 0.002, tie: simplest}
+vetoes:
+  drift: drop a candidate whose L4_drift_ld miss_plus_excess is more than 0.01 above the best candidate's
+  second_scene: drop a candidate whose apple L4_drift_ld or LVI_ld excess_rate on val seed 201 is above that of L4_drift or LVI on the same scene
+  pear: drop a candidate when a pear judged rung (L4_drift_ld, LVI_ld, L5VI_ld) fails a line of its criteria, or when its pear miss_plus_excess is more than 0.005 above that of its camera-only rung
+  learned_detector: drop a candidate whose apple L5VI_ld miss_rate or excess_rate on val seed 200 or 201 is more than 0.005 above that of L5VI on the same scene, or above 0.12
+  none_left: when no candidate of an item is left, nothing is chosen and the no_candidate stop holds
+stops:
+  when: read after the choice, before the held-out caches and the second frozen commit; a stop leaves the rendered held-out scenes unopened and the next path is set with the user
+  depth_tail: on val seed 200 and the LVI_ld rung (noise seeds 0, 1 and 2 pooled), for each crop, among the counted-row truth-matched detections that used LiDAR depth under the chosen values, the share whose LiDAR depth z_L before combining (with the judged LiDAR noise) is more than 0.10 m off the truth depth_med is more than twice the share of the same detections whose noise-free camera box depth (box_far on depth16 with the judged camera values) is more than 0.10 m off it, or the coverage of the chosen values is more than 0.10 below the coverage of the start values; val seed 201 is reported
+  gain: on val seed 200, the apple L4_drift_ld excess_rate is not more than 0.01 below the apple L4_drift excess_rate
+  second_scene: on val seed 201, the apple L4_drift_ld or LVI_ld excess_rate is above 0.08 (L5VI_ld keeps its own line of 0.12); the camera-only value and the paired difference are written beside it, and when the camera-only rung is also above 0.08 and the _ld rung is more than 0.01 below it, the scene is called hard and the next step is set with the user
+  no_candidate: no candidate is left after the vetoes
+disclosed: values known when this file was committed, written beside the choice - the simple box pairing tail of the dev seed 5 trial of the simulated LiDAR (p90 0.05 to 0.23 m, over 10 cm 0.08 to 0.14), its truth-label pairing accuracy (p90 about 0.015 m), the camera-only val depth tables (detection sigma axis, true-depth axis, depth pairs, odometry depth axis) and the camera-only values on val seed 201 known by then
+detail:
+  depth_metrics: over_10cm_rate is the share of the counted-row detections matched to a truth record (noise seeds 0, 1 and 2 pooled, fallback detections included) whose |e| is above 0.10 m, e being the depth the lift receives (after combining and fallback, with the judged camera and LiDAR noise) minus the truth depth_med; a detection left without depth by dropout stays in the denominator, is not counted as over and is counted on its own; abs_error_p90_m is the 90th percentile of |e| over the detections with depth; the LiDAR-only |e| of the covered detections and of the detections every candidate covers are reported; these combined-depth metrics serve the match_window and lidar_far items only, and the depth_tail stop reads the LiDAR depth z_L before combining
+  count_metrics: miss_plus_excess = y6.metrics.miss_rate + y6.metrics.excess_rate of the rung; every count metric is the mean over noise seeds 0, 1 and 2 on the one val scene of the crop; a criteria line is the line of the crop in the depth criteria
+  coverage: the share of the counted-row truth-matched detections that used LiDAR depth (at least min_points points, no fallback)
+  ties: a within on a step is the band of the step before it; a step without within rounds metres to 1e-4 m and ratios to 0.0001 and counts equal rounded values as equal; candidates still equal after the last step take the start value
+  simplest: replace before ivw, then min_points and gate_k at their start values, then the smaller value
+  vetoes: every veto applies to the candidates of every item before its steps, the best candidate of drift being the one with the smallest L4_drift_ld miss_plus_excess; drift reads each crop on its own, second_scene and learned_detector read apple and act on the apple choice, pear acts on the pear choice
+tuning: true
