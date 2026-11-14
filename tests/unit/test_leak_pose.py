@@ -29,7 +29,8 @@ def test_runner_import_loads_no_cv2_gtsam_or_torch():
             "counting.geometry.noise", "counting.config.pose_schema", "counting.cli", "counting.geometry.posefile",
             "counting.odometry.cache", "counting.odometry.vo", "counting.odometry.imufile",
             "counting.evaluation.imusim", "counting.evaluation.truth", "counting.odometry.vio",
-            "counting.evaluation.fusion", "counting.multiview.align", "counting.evaluation.alignment"]
+            "counting.evaluation.fusion", "counting.multiview.align", "counting.evaluation.alignment",
+            "counting.geometry.lidarfile", "counting.multiview.lidardepth", "counting.evaluation.lidarsource"]
     code = "import importlib, sys\n" + "".join(f"importlib.import_module({m!r})\n" for m in mods) + \
            "print(sorted(m for m in ('cv2', 'gtsam', 'torch') if m in sys.modules))"
     assert python_c(code).strip() == "[]"

@@ -10,12 +10,14 @@ screen gate costs `soft_cost` extra instead of being refused. Under
 `predict: pose_local` a landmark is predicted from the median of its last
 `predict_window` observations that define X, so drift since its older
 observations does not move the prediction; the track's X stays the median of
-every observation.
+every observation. Given a `TrackTrace`, `track_pass` also counts, for the
+report only, the pairs it joined at the soft depth cost and why each track was
+born; the tracks are the same with or without one.
 """
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Literal, Mapping, Sequence
 
 import numpy as np
@@ -30,6 +32,9 @@ from counting.multiview.lift import complete_edge_boxes, edge_touch
 _OUT = 1e6        # cost of a pair outside the gate; such pairs are never kept
 _MIN_Z = 0.05     # metres; a landmark nearer than this to the camera plane ends its track
 _MIN_IOU = 0.1    # IoU gate for tracks chained by box overlap
+# Why a track was born (`TrackTrace.births`): no active track had the box inside its screen gate (or IoU gate), every
+# track that had it there refused it at the depth gate, or a track that took it took another box instead.
+BIRTH_CAUSES = ("no_track_in_reach", "depth_gate", "other")
 
 
 @dataclass
@@ -50,6 +55,21 @@ class PassTracks:
         for key in sorted(self.det_track):
             out[self.det_track[key]].append(key)
         return out
+
+
+@dataclass
+class TrackTrace:
+    """What `track_pass` did in one pass, counted for the report only.
+
+    `soft_depth_pairs` counts the track-detection pairs joined although the depth gate failed (`depth_gate="soft"`:
+    joined at `soft_cost` extra). `births` counts the new tracks by `BIRTH_CAUSES`: `no_track_in_reach` when no
+    active track had the detection inside its screen gate (`gate_px_frac`; for a track chained by box overlap, its
+    IoU gate), `depth_gate` when every track that had it there failed the depth gate, and `other` when one passed
+    both gates but the assignment gave it another detection.
+    """
+
+    soft_depth_pairs: int = 0
+    births: dict[str, int] = field(default_factory=lambda: dict.fromkeys(BIRTH_CAUSES, 0))
 
 
 def predict_boxes(
@@ -210,15 +230,21 @@ def _prediction(landmarks: Sequence[_Track], cfg: TrackerConfig) -> np.ndarray:
 
 
 def _cost_matrix(
-    active: list[_Track], boxes: np.ndarray, touch: np.ndarray, zP: np.ndarray, cfg: TrackerConfig
-) -> np.ndarray:
+    active: list[_Track], boxes: np.ndarray, touch: np.ndarray, zP: np.ndarray, cfg: TrackerConfig, *,
+    masks: bool = False,
+) -> tuple[np.ndarray, tuple[np.ndarray, np.ndarray] | None]:
     """Track x detection cost; pairs outside the gate get `_OUT`.
 
     Tracks with a prediction this frame use the edge-aware cost and depth gate
     (refused when hard, `soft_cost` extra when soft); the others use `1 - IoU`
-    with their last box.
+    with their last box. Returns the cost and, with `masks`, two track x
+    detection masks (else None): the pairs inside the screen gate (the IoU gate
+    for the others) and those of them that also pass the depth gate (all of
+    them for the others).
     """
     cost = np.full((len(active), len(boxes)), _OUT)
+    reach = np.zeros(cost.shape, dtype=bool) if masks else None
+    passed = np.zeros(cost.shape, dtype=bool) if masks else None
     pred = [i for i, t in enumerate(active) if t.pred is not None]
     by_iou = [i for i, t in enumerate(active) if t.pred is None]
     if pred:
@@ -236,10 +262,15 @@ def _cost_matrix(
             cost[pred] = np.where(screen, np.where(depth_ok, c, c + cfg.soft_cost), _OUT)
         else:
             cost[pred] = np.where(screen & depth_ok, c, _OUT)
+        if masks:
+            reach[pred] = screen
+            passed[pred] = screen & depth_ok
     if by_iou:
         iou = box_iou(np.stack([active[i].box for i in by_iou]), boxes)
         cost[by_iou] = np.where(iou >= _MIN_IOU, 1.0 - iou, _OUT)
-    return cost
+        if masks:
+            reach[by_iou] = passed[by_iou] = iou >= _MIN_IOU
+    return cost, None if reach is None else (reach, passed)
 
 
 def _associate(cost: np.ndarray, stages: Sequence[np.ndarray]) -> dict[int, int]:
@@ -257,6 +288,13 @@ def _associate(cost: np.ndarray, stages: Sequence[np.ndarray]) -> dict[int, int]
     return pairs
 
 
+def _birth_cause(reach: np.ndarray, passed: np.ndarray) -> str:
+    """The `BIRTH_CAUSES` entry of a detection that starts a track, from its column of the gate masks."""
+    if not reach.any():
+        return "no_track_in_reach"
+    return "depth_gate" if not passed.any() else "other"
+
+
 def track_pass(
     frames: Sequence[FrameInput],
     dets: Mapping[int, Detections],
@@ -264,11 +302,14 @@ def track_pass(
     cfg: TrackerConfig,
     *,
     method: Literal["landmark", "last_box"] = "landmark",
+    trace: TrackTrace | None = None,
 ) -> PassTracks:
     """Track one pass's detections frame by frame (idx order) into `PassTracks`.
 
     `points[idx]` holds each detection's lifted 3D point (NaN without depth).
-    Every track is returned, including ones later repair or `min_obs` drops.
+    Every track is returned, including ones the repair step joins or `min_obs` drops.
+    With `trace`, each frame adds to its counts (`TrackTrace`), read from the
+    gates of the cost matrix; the tracks are the same as without it.
     """
     if method not in ("landmark", "last_box"):
         raise ValueError(f"unknown tracking method: {method!r}")
@@ -300,7 +341,11 @@ def track_pass(
                 t.alive = bool(alive[k])
         active = [t for t in active if t.alive]   # a landmark ends once its grown box leaves the image
 
-        pairs = _associate(_cost_matrix(active, D.boxes, touch, zP, cfg), (hi, use & ~hi))
+        cost, gates = _cost_matrix(active, D.boxes, touch, zP, cfg, masks=trace is not None)
+        pairs = _associate(cost, (hi, use & ~hi))
+        if gates is not None:   # a pair inside the screen gate that failed the depth gate was joined at the soft cost
+            reach, passed = gates
+            trace.soft_depth_pairs += sum(1 for i, j in pairs.items() if reach[i, j] and not passed[i, j])
         nxt = []
         for i, t in enumerate(active):
             if i in pairs:
@@ -317,6 +362,8 @@ def track_pass(
         used = set(pairs.values())
         for j in np.flatnonzero(hi):
             if int(j) not in used:
+                if gates is not None:
+                    trace.births[_birth_cause(reach[:, j], passed[:, j])] += 1
                 t = _Track()
                 t.add((frame.idx, int(j)), P[j], float(S_d[j]), bool(edge[j]), D.boxes[j])
                 tracks.append(t)

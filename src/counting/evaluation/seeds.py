@@ -68,6 +68,14 @@ def combine_seeds(cfg: EvalAppConfig, per_seed: Sequence[tuple[int, dict]]) -> d
     the first result's is None, else the first result's `mode` and `settings` with
     the seeds' mean `summary`. `spread` then has `alignment` (`summary`) and
     `per_seed` keeps each seed's whole `alignment` entry, its stages included.
+
+    When the first result has `lidar` (a LiDAR box depth), the combined result has
+    the seeds' mean `lidar` (`_mean`: its texts must agree) and `per_seed` keeps
+    each seed's `lidar`. When it has `camera_depth_sha256` (a config with LiDAR
+    files), `per_seed` keeps each seed's, and the combined result gets the seeds'
+    `depth_rows` as a list in seed order. When it has `mechanism`, the combined
+    result has the seeds' mean `mechanism` (`_mean`) and `per_seed` keeps each
+    seed's.
     """
     results = [r for _, r in per_seed]
     y1 = _mean([r["y1"] for r in results])
@@ -95,4 +103,17 @@ def combine_seeds(cfg: EvalAppConfig, per_seed: Sequence[tuple[int, dict]]) -> d
             spread["alignment"] = {"summary": _range(summaries)}
             for item, r in zip(out["per_seed"], results):
                 item["alignment"] = r["alignment"]
+    if "lidar" in first:
+        out["lidar"] = _mean([r["lidar"] for r in results])
+        for item, r in zip(out["per_seed"], results):
+            item["lidar"] = r["lidar"]
+    if "camera_depth_sha256" in first:
+        for item, r in zip(out["per_seed"], results):
+            item["camera_depth_sha256"] = r["camera_depth_sha256"]
+    if "depth_rows" in first:
+        out["depth_rows"] = [r["depth_rows"] for r in results]
+    if "mechanism" in first:
+        out["mechanism"] = _mean([r["mechanism"] for r in results])
+        for item, r in zip(out["per_seed"], results):
+            item["mechanism"] = r["mechanism"]
     return out

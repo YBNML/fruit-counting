@@ -31,11 +31,26 @@ pose.source=file the flows come from the pose file and the IMU stream from the I
 a noise seed and a `pass_side_*` key set, each pass draws 13 without the rig with a noise seed and a
 `pass_pitch_*` key set, and 7, 9 and 11 are drawn as above. A key set to 0 draws like any other
 value, so configs that set the same keys share their draws.
+
+The LiDAR depth and the depth error forms add steps 18 to 21, each key starting `(cfg.seed, noise seed, step,
+scene)` like the steps above, with side and aisle as `side_code` and unit 0 for the depth unit or 1 for the
+navigation unit. LiDAR points 18 `(..., side, aisle, unit)` draw the range g(N), then the angle g(N, 2) about two
+axes square to the beam, then the dropout u(N), once for every point of the side's file, not per frame; the
+camera-LiDAR extrinsic error of the depth unit 19 `(cfg.seed, noise seed, 19, scene, unit)`, one per scene and
+unit, whatever the pitch, the rig or the pose section, t(3) then r(3); the persistent depth field 20
+`(..., side, aisle)` its 64 cosines, the wave vectors g(64, 3) then the phases u(64); the depth scale 21
+`(..., *pass_key_code)` one value. Which of these a run draws: with `lift.depth` lidar or lidar_oracle and a noise
+seed, each side of the unit's file draws 18 whatever the LiDAR noise values (an unset key counts as 0); with a
+depth-unit file, a noise seed and a `lidar_extr_*` key set (a key at 0 included), each scene draws 19. A
+navigation-unit file holds the IMU, so its extrinsic error is the camera-to-IMU one: step 11 under the fusion's key
+(the reference pitch under the rig, the pass pitch without it), drawn with a noise seed and an `imu_extr_*` key
+set, fused or not. With a noise seed, each side draws 20 when `depth_persist_sigma` is set and each pass draws 21
+when `depth_scale_sigma` is set (a key at 0 included), for any depth method.
 """
 
 from __future__ import annotations
 
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from math import hypot, sqrt
 
@@ -79,6 +94,7 @@ def perturb_depth(z: np.ndarray, rng: np.random.Generator, rel_sigma: float, dro
 STEP_WALK, STEP_START, STEP_RIG, STEP_TIME, STEP_DEPTH_K, STEP_IMU, STEP_IMU_EXTR, STEP_FLOW, STEP_PITCH, STEP_GPS = (
     5, 6, 7, 8, 9, 10, 11, 12, 13, 14)
 STEP_ALIGN, STEP_ALIGN_THIN, STEP_STRUCT = 15, 16, 17
+STEP_LIDAR, STEP_LIDAR_EXTR, STEP_DEPTH_PERSIST, STEP_DEPTH_SCALE = 18, 19, 20, 21
 REF_STEP_M = 0.15  # the base step (m) the walk sigmas are given for
 
 
@@ -208,6 +224,86 @@ def depth_k_noise(key: Sequence[int], z: np.ndarray, k: float) -> np.ndarray:
     z = np.asarray(z, dtype=np.float64)
     g = noise_rng(*key).standard_normal(z.shape[0])
     return k * z**2 * g
+
+
+def _square_axes(d: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """Two unit axes e1, e2 (as x, y, z component arrays) square to each unit row of `d` (N, 3) and to each other,
+    in closed form without a branch (Duff et al. 2017, "Building an orthonormal basis, revisited")."""
+    x, y, z = d[:, 0], d[:, 1], d[:, 2]
+    s = np.where(z >= 0.0, 1.0, -1.0)
+    a = -1.0 / (s + z)
+    b = x * y * a
+    return 1.0 + s * x * x * a, s * b, -s * x, b, s + y * y * a, -y
+
+
+def lidar_point_noise(key: Sequence[int], dirs: np.ndarray, ranges: np.ndarray, *, range_sigma_m: float,
+                      range_sigma_near_m: float, near_range_m: float, ang_sigma_deg: float, dropout: float,
+                      range_bias_m: float) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """The measured beams of noiseless points: `dirs` (N, 3) unit directions and `ranges` (N,) in m.
+
+    From the generator of `key`: the range g(N), the angle g(N, 2), the dropout u(N), in this order and whatever
+    the values. The range becomes `r + sigma * g + range_bias_m` (a positive bias is farther), sigma
+    `range_sigma_near_m` where the noiseless range is below `near_range_m` and `range_sigma_m` elsewhere. The
+    direction turns by the angle `radians(ang_sigma_deg) * |a|` towards `a1 e1 + a2 e2`, with e1 and e2 two unit
+    axes square to the beam. A point is kept where `u >= dropout`. Returns (directions, ranges, keep), the first
+    two in the dtypes of `dirs` and `ranges`; zero sigmas and bias give back their bytes.
+    """
+    dirs = np.asarray(dirs)
+    ranges = np.asarray(ranges)
+    n = ranges.shape[0]
+    if dirs.shape != (n, 3):
+        raise ValueError(f"lidar_point_noise needs dirs (N, 3) for N ranges; got {dirs.shape} for {n}")
+    g = noise_rng(*key)
+    range_draw = g.standard_normal(n)
+    angle_draw = g.standard_normal((n, 2))
+    keep = g.random(n) >= dropout
+    r = ranges.astype(np.float64)
+    sigma = np.where(r < near_range_m, range_sigma_near_m, range_sigma_m)
+    out_r = (r + sigma * range_draw + range_bias_m).astype(ranges.dtype)
+    if ang_sigma_deg == 0:
+        return dirs.copy(), out_r, keep
+    d = dirs.astype(np.float64)
+    w1, w2 = np.radians(ang_sigma_deg) * angle_draw[:, 0], np.radians(ang_sigma_deg) * angle_draw[:, 1]
+    e1x, e1y, e1z, e2x, e2y, e2z = _square_axes(d)
+    phi = np.sqrt(w1 * w1 + w2 * w2)
+    k = np.divide(np.sin(phi), phi, out=np.ones(n), where=phi > 0)
+    c = np.cos(phi)
+    out_d = np.column_stack([c * d[:, 0] + k * (w1 * e1x + w2 * e2x),
+                             c * d[:, 1] + k * (w1 * e1y + w2 * e2y),
+                             c * d[:, 2] + k * (w1 * e1z + w2 * e2z)])
+    return out_d.astype(dirs.dtype), out_r, keep
+
+
+_PERSIST_COSINES = 64
+
+
+def depth_persist_field(key: Sequence[int], sigma_rel: float, length_m: float) -> Callable[[np.ndarray], np.ndarray]:
+    """A smooth random field of relative depth error over 3D points, `sigma_rel` times a unit-variance field.
+
+    From the generator of `key`: 64 wave vectors g(64, 3) / `length_m`, then 64 phases 2 pi u(64), whatever the
+    values. The field at a point x is `sigma_rel * sqrt(2 / 64) * sum_k cos(w_k . x + phase_k)`, so over keys two
+    points at distance d correlate as `exp(-d**2 / (2 * length_m**2))`. The returned function maps points (n, 3)
+    to their values (n,); with `sigma_rel` 0 they are all 0.
+    """
+    if not length_m > 0:
+        raise ValueError(f"depth_persist_field needs a length above 0, got {length_m}")
+    g = noise_rng(*key)
+    waves = g.standard_normal((_PERSIST_COSINES, 3)) / length_m
+    phases = 2.0 * np.pi * g.random(_PERSIST_COSINES)
+    amplitude = sigma_rel * np.sqrt(2.0 / _PERSIST_COSINES)
+
+    def field(points: np.ndarray) -> np.ndarray:
+        X = np.asarray(points, dtype=np.float64).reshape(-1, 3)
+        if sigma_rel == 0:
+            return np.zeros(len(X))
+        return amplitude * np.cos(X @ waves.T + phases).sum(axis=1)
+
+    return field
+
+
+def depth_scale(key: Sequence[int], sigma: float) -> float:
+    """A depth scale error (ratio): `sigma` times one unit normal from the generator of `key`."""
+    return float(sigma * noise_rng(*key).standard_normal())
 
 
 def vo_factor_sigma(sigmas: DriftSigmas, base_step_m: float, floor_trans_m: float,

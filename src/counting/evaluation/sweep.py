@@ -58,7 +58,11 @@ baseline point keeps the per-tree Y6 table. A noisy cell also keeps `noisy`,
 `seeds`, `noise`, `spread` and `per_seed`, same as a noisy ladder rung. A cell
 with a pose section keeps `pose` and `pose_quality` (and each seed's
 `pose_quality` in `per_seed`), and the mode, settings and summary of its
-`alignment` (no stages, none per seed).
+`alignment` (no stages, none per seed). A cell with LiDAR files keeps its
+`camera_depth_sha256` and its `depth_rows` (a list per noise seed when noisy;
+each seed's `camera_depth_sha256` in `per_seed`), and one with a LiDAR box depth
+its `lidar` entry (each seed's in `per_seed` too). A cell with a `mechanism`
+entry keeps it, and each seed's in `per_seed`.
 """
 
 from __future__ import annotations
@@ -85,6 +89,8 @@ _GRID_KEYS = ("bases", "common", "factors", "product", "combos")
 _STAGE_SECTIONS = ("truth", "passes", "stages", "detector", "lift", "noise", "tracker", "dedup", "pose", "align")
 _PASS_KEYS = ("pitch", "side", "aisle", "n_frames", "U1", "G1", "e1", "ledger")
 _Y6_KEYS = ("mode", "n_landmarks", "row", "ledger", "metrics")
+# The entries of a cell with LiDAR files, kept as they are; a seed view has no depth_rows.
+_LIDAR_KEYS = ("lidar", "camera_depth_sha256", "depth_rows", "mechanism")
 
 
 @dataclass(frozen=True)
@@ -325,11 +331,12 @@ def _kept(cell: SweepCell, res: dict) -> dict:
     `pose` and `pose_quality` (a config with a pose section) are kept as they are, and so is each
     `per_seed` item's `pose_quality`. `alignment` keeps only its `mode`, `settings` and `summary` (None
     stays None), and a `per_seed` item keeps no `alignment`. A cached cell's `cache` (noisy or not) is
-    kept as it is.
+    kept as it is. `lidar`, `camera_depth_sha256`, `depth_rows` and `mechanism` are kept as they are, and so
+    are each `per_seed` item's `lidar`, `camera_depth_sha256` and `mechanism`.
     """
     out = {"point": cell.point.name, "base": cell.base, "overridden": list(cell.overridden),
            "stages": res["stages"], "lift_depth": res["lift_depth"], **_kept_view(cell, res["y1"], res["y6"])}
-    for key in ("pose", "pose_quality"):
+    for key in ("pose", "pose_quality", *_LIDAR_KEYS):
         if key in res:
             out[key] = res[key]
     if "alignment" in res:
@@ -338,7 +345,7 @@ def _kept(cell: SweepCell, res: dict) -> dict:
     if res.get("noisy"):
         out.update(noisy=True, seeds=res["seeds"], noise=res["noise"], spread=res["spread"],
                    per_seed=[{"noise_seed": p["noise_seed"], **_kept_view(cell, p["y1"], p["y6"]),
-                              **({"pose_quality": p["pose_quality"]} if "pose_quality" in p else {})}
+                              **{k: p[k] for k in ("pose_quality", *_LIDAR_KEYS) if k in p}}
                              for p in res["per_seed"]])
     if "cache" in res:
         out["cache"] = res["cache"]

@@ -7,7 +7,9 @@ per-seed table; the CSVs carry one row per noise seed and a `mean` row. A ladder
 A rung or cell run with a pose section (`pose`, `pose_quality`) names its pose source in the head
 and gets the pose quality tables; a result without one reads as it did before. A bundle whose `meta`
 has a pass `coverage` gets a head line with it. A verdict row of a report camera configuration
-(`report_config`) reads `보고(구성 <name>)` instead of a verdict.
+(`report_config`) reads `보고(구성 <name>)` instead of a verdict. A rung or cell that took a LiDAR box depth
+(`lidar`) gets a head line each (`_lidar_lines`); the per-detection depth rows go to `depth_rows/`, beside
+`results.json`, not in it. A rung or cell with a `mechanism` entry gets a head line each (`_mechanism_lines`).
 """
 
 from __future__ import annotations
@@ -21,8 +23,13 @@ from typing import Mapping
 import numpy as np
 import yaml
 
-from counting.config.eval_schema import POSE_NOISE_KEYS, EvalAppConfig
+from counting.config.eval_schema import (
+    DEPTH_FORM_KEYS, LIDAR_EXTR_KEYS, LIDAR_NOISE_KEYS, POSE_NOISE_KEYS, EvalAppConfig,
+)
 from counting.evaluation.budget import TERMS, ladder_pairs, path_pairs
+from counting.evaluation.lidarsource import (
+    DEPTH_ROWS_INDEX, DepthRows, depth_rows_csv, depth_rows_file_names, depth_rows_index_csv,
+)
 from counting.evaluation.verdict import JUDGED_PITCHES, PITCH_JUDGED_RUNGS, judged_y1, pool_rung, verdict_counts
 
 SCHEMA_VERSION = 11
@@ -160,14 +167,17 @@ def _write_csv(path: Path, header: list[str], rows: list[list]) -> None:
 
 def write_experiment(
     out_root: Path, *, cfg: EvalAppConfig, results: dict, record: dict, criteria: Mapping | None,
+    depth_rows: Mapping[str, DepthRows] | None = None,
 ) -> tuple[Path, bool]:
     """Write the experiment folder `out_root/<run_name>/<experiment_id>/`.
 
-    Computes the new `results.json` bytes, the CSV rows and the `report.md` text first, so
-    neither an error building them nor a different `results.json` already there
-    (`ReproducibilityError`) leaves a file behind. Otherwise (re-)writes every file and returns
-    `(folder, reproduced)`. A result with a `budget` also gets `budget.csv`, one row per budget
-    row in order.
+    Computes the new `results.json` bytes, the CSV rows, the `report.md` text and the depth rows
+    files first, so neither an error building them (a refused depth rows file name included) nor a
+    different `results.json` already there (`ReproducibilityError`) leaves a file behind. Otherwise
+    (re-)writes every file and returns `(folder, reproduced)`. A result with a `budget` also gets
+    `budget.csv`, one row per budget row in order. `depth_rows` (cell name -> rows, from
+    `pop_depth_rows`) gives `depth_rows/<file>` per cell (`depth_rows_file_names`, `depth_rows_csv`)
+    and `depth_rows/index.csv` (`depth_rows_index_csv`).
     """
     folder = Path(out_root) / results["run_name"] / results["experiment_id"]
     new_bytes = results_bytes(results)
@@ -180,6 +190,11 @@ def write_experiment(
             tables.append(("budget.csv", _BUDGET_HEADER,
                            [[row[k] for k in _BUDGET_HEADER] for row in results["budget"]]))
     report_text = render_report(results, criteria=criteria)
+    rows_files: list[tuple[str, str]] = []
+    if depth_rows:
+        names = depth_rows_file_names(list(depth_rows))
+        rows_files = [(names[cell], depth_rows_csv(rows)) for cell, rows in depth_rows.items()]
+        rows_files.append((f"{DEPTH_ROWS_INDEX}.csv", depth_rows_index_csv(names)))
     results_path = folder / "results.json"
     reproduced = False
     if results_path.exists():
@@ -194,6 +209,10 @@ def write_experiment(
     results_path.write_bytes(new_bytes)
     for name, header, rows in tables:
         _write_csv(folder / name, header, rows)
+    if rows_files:
+        (folder / "depth_rows").mkdir(exist_ok=True)
+        for name, text in rows_files:
+            (folder / "depth_rows" / name).write_bytes(text.encode("utf-8"))
     (folder / "report.md").write_text(report_text, encoding="utf-8")
     return folder, reproduced
 
@@ -243,6 +262,16 @@ _CONTRIB_LABELS = {
     ("L3", "L4_base"): "L3→L4_base (자세·깊이 잡음(기준 조합))",
     ("L3", "L5"): "L3→L5 (검출)",
     ("L5", "L5_L4base"): "L5→L5_L4base (자세·깊이 잡음(기준 조합), 학습 검출기)",
+    ("L4_drift", "L4_drift_ld"): "L4_drift→L4_drift_ld (LiDAR 깊이)",
+    ("LVI", "LVI_ld"): "LVI→LVI_ld (LiDAR 깊이)",
+    ("L5VI", "L5VI_ld"): "L5VI→L5VI_ld (LiDAR 깊이)",
+    ("L4_drift_ld", "L4_drift_ldn"): "L4_drift_ld→L4_drift_ldn (항법 LiDAR 공용)",
+    ("LVI_ld", "LVI_ldn"): "LVI_ld→LVI_ldn (항법 LiDAR 공용)",
+    ("L3", "L3_ld"): "L3→L3_ld (LiDAR 깊이)",
+    ("LVI_ld", "L5VI_ld"): "LVI_ld→L5VI_ld (검출)",
+    ("L4_drift_ld_orc", "L4_drift_ld"): "L4_drift_ld_orc→L4_drift_ld (짝짓기)",
+    ("LVI_ddd", "LVI"): "LVI_ddd→LVI (상자 깊이)",
+    ("LVI_ddv", "LVI"): "LVI_ddv→LVI (VO 깊이)",
 }
 _OP_SYMBOL = {"le": "≤", "ge": "≥"}
 # Criteria metrics that are ratios, shown in percent like everywhere else in the report.
@@ -498,6 +527,15 @@ def _pose_noise_line(res: dict) -> str | None:
     n = res["noise"]
     values = [f"{key} {_g(n[key])}" for key in POSE_NOISE_KEYS if n.get(key) is not None]
     return "- 자세 모형 잡음: " + ", ".join(values) if values else None
+
+
+def _depth_noise_line(res: dict) -> str | None:
+    """The LiDAR noise, LiDAR extrinsic and depth error form keys of a noisy rung or cell that have a value, in
+    `NoiseConfig.depth_keys` order; None without any."""
+    n = res["noise"]
+    values = [f"{key} {_g(n[key])}" for key in LIDAR_NOISE_KEYS + LIDAR_EXTR_KEYS + DEPTH_FORM_KEYS
+              if n.get(key) is not None]
+    return "- LiDAR·깊이 오차 잡음: " + ", ".join(values) if values else None
 
 
 def _cm(x) -> str:
@@ -1099,6 +1137,64 @@ def _coverage_line(run_id: str, coverage: dict) -> str:
     return f"> 덮음 {run_id}: G6① {coverage['g6']} / 세 기울기 {coverage['g6_all']} = {ratio}"
 
 
+def _ratio3(x) -> str:
+    return "-" if x is None else f"{x:.3f}"
+
+
+def _named_items(results: dict) -> list[tuple[str, dict]]:
+    """Every rung (run, ladder) or cell (sweep, `<point> @ <base or ->`) of `results` with its name, in
+    `_report_items` order, the name led by the run id when there are several bundles."""
+    out = []
+    multi = len(results["runs"]) > 1
+    for run in results["runs"]:
+        prefix = f"{run['meta']['run_id']} " if multi else ""
+        if results["kind"] == "sweep":
+            items = [(f"{cell['point']} @ {cell['base'] or '-'}", cell) for cell in run["cells"]]
+        else:
+            items = list(run["rungs"].items())
+        out += [(prefix + name, item) for name, item in items]
+    return out
+
+
+def _lidar_lines(results: dict) -> list[str]:
+    """The head lines of the rungs (run, ladder) or cells (sweep) with a `lidar` entry (`_named_items`): the LiDAR
+    file and its unit, the method and the match, the sidecar digest, the coverage of the matched counted-row
+    detections and of every counted-row detection, the fallback share, the median point count, the share over 10 cm
+    and the p90 of |e| of the depth the lift receives. Empty when no rung or cell has one."""
+    lines = []
+    for name, item in _named_items(results):
+        e = item.get("lidar")
+        if e is None:
+            continue
+        lines.append(f"> LiDAR {name}: 파일 {e['file']}({e['unit']}) · {e['method']} "
+                     f"{e['settings']['match']} · 사이드카 {e['sidecar_sha256'][:16]} · "
+                     f"덮음 {_ratio3(e['coverage'])}(찍는 줄 전부 {_ratio3(e['coverage_all'])}) · "
+                     f"넘어감 {_ratio3(e['fallback_rate'])} · 점 수 중앙값 {_count(e['points']['p50'])} · "
+                     f"깊이 10 cm 넘음 {_ratio3(e['depth']['over_10cm_rate'])} · "
+                     f"|e| p90 {_m(e['depth']['abs_error_p90_m'])} m")
+    return lines
+
+
+def _mechanism_lines(results: dict) -> list[str]:
+    """The head lines of the rungs or cells with a `mechanism` entry (`_named_items`), for the report only: the
+    pairs the tracker joined at the soft depth cost, the new tracks by cause (no track in reach, the depth gate,
+    lost in the assignment), the count and the p50 and p90 distance of the same-fruit fragment pairs left in a pass,
+    and the cross-side pairs the band kept apart (`-` without a hybrid dedup). Seed means show one decimal. Empty
+    when no rung or cell has one."""
+    lines = []
+    for name, item in _named_items(results):
+        e = item.get("mechanism")
+        if e is None:
+            continue
+        b, f = e["births"], e["fragments"]
+        lines.append(f"> 기구 {name}: 깊이 문 비용 짝 {_count(e['soft_depth_pairs'])} · "
+                     f"새 트랙(닿는 트랙 없음 {_count(b['no_track_in_reach'])}, 깊이 문 {_count(b['depth_gate'])}, "
+                     f"배정 {_count(b['other'])}) · 같은 과실 조각 짝 {_count(f['n'])}"
+                     f"(p50 {_m(f['p50_m'])} m, p90 {_m(f['p90_m'])} m) · "
+                     f"띠에 막힌 짝 {_count(e['band_blocked_pairs'])}")
+    return lines
+
+
 def render_report(results: dict, *, criteria: Mapping | None) -> str:
     """Build the human-readable `report.md` for one experiment.
 
@@ -1112,14 +1208,16 @@ def render_report(results: dict, *, criteria: Mapping | None) -> str:
     (`_detector_line` of `_first_cache`); when one read a pose cache, the next head line names that
     cache (`_pose_cache_line` of `_first_pose_cache`); when one read an IMU file, the next head line
     names that file (`_imu_file_line` of `_first_imu_file`); and when one was fused, the next head line
-    names the fusion (`_fusion_line` of `_first_fusion`). Then each bundle whose `meta` has a `coverage`
-    gets its `_coverage_line`, in bundle order.
+    names the fusion (`_fusion_line` of `_first_fusion`). Then each rung or cell with a LiDAR box depth
+    gets its `_lidar_lines` line, each with a `mechanism` entry its `_mechanism_lines` line, and each
+    bundle whose `meta` has a `coverage` gets its `_coverage_line`, in bundle order.
 
     With a pose section the head's second line names the pose source (`_pose_text`); when a rung
     or cell started from the nominal start (`pose.start` `nominal_from_first_frame`), the next head
     line says so. When the rungs' pose sources differ, each rung's heading is followed by its
     `> 자세:` line. A noisy rung with pose-model noise keys gets `_pose_noise_line` under its noise
-    line, and a rung with `pose_quality` gets `_pose_quality_lines` after its Y6 section.
+    line, and one with LiDAR noise, LiDAR extrinsic or depth error form keys `_depth_noise_line` after
+    that; a rung with `pose_quality` gets `_pose_quality_lines` after its Y6 section.
 
     A rung whose `alignment` is not None gets `_alignment_lines` after its pose quality: the settings
     line (`> 정합 설정`: segment length, pair radius, roll and pitch prior and fewest pairs, `-` for a
@@ -1146,6 +1244,8 @@ def render_report(results: dict, *, criteria: Mapping | None) -> str:
     fusion = _first_fusion(results)
     if fusion is not None:
         lines.append(_fusion_line(fusion))
+    lines += _lidar_lines(results)
+    lines += _mechanism_lines(results)
     for run in results["runs"]:
         if run["meta"].get("coverage") is not None:
             lines.append(_coverage_line(run["meta"]["run_id"], run["meta"]["coverage"]))
@@ -1181,6 +1281,9 @@ def render_report(results: dict, *, criteria: Mapping | None) -> str:
                 pose_noise = _pose_noise_line(rung)
                 if pose_noise is not None:
                     lines.append(pose_noise)
+                depth_noise = _depth_noise_line(rung)
+                if depth_noise is not None:
+                    lines.append(depth_noise)
                 lines.append("")
             lines.append("**Y1**")
             lines += _table(_Y1_HEADERS, _y1_rows(rung["y1"]["passes"]))

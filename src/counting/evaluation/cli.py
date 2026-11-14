@@ -312,6 +312,24 @@ def _imu_file_identities(run_entries: list[dict]) -> list[dict]:
     return [found[key] for key in sorted(found)]
 
 
+def _lidar_file_identities(run_entries: list[dict]) -> list[dict]:
+    """The LiDAR files the results read, from the `lidar` entry of every rung and sweep cell (a LiDAR box depth).
+
+    One `{name, run_id, sidecar_sha256, sim_commit}` per (run_id, sidecar sha256), in that order. A result
+    without a `lidar` entry adds none, so a config whose rungs take the camera box depth names no LiDAR file.
+    """
+    found: dict[tuple[str, str], dict] = {}
+    for entry in run_entries:
+        run_id = entry["meta"]["run_id"]
+        for res in _cell_results(entry):
+            lidar = res.get("lidar")
+            if lidar is not None:
+                found.setdefault((run_id, lidar["sidecar_sha256"]), {
+                    "name": lidar["file"], "run_id": run_id, "sidecar_sha256": lidar["sidecar_sha256"],
+                    "sim_commit": lidar["sim_commit"]})
+    return [found[key] for key in sorted(found)]
+
+
 def _fusion_identity(run_entries: list[dict]) -> dict | None:
     """The fusion the results ran, from the `pose.fusion` of every rung and sweep cell, or None when none
     was fused: `{gtsam, fuse_fixed_sha256}`, the gtsam version they share (None when they differ) and the
@@ -346,19 +364,30 @@ def _run_eval(
     2. read the ladder (and its default rungs), or the grid and its points (and, with grid
        bases, the ladder);
     3. under split=test, `check_test_request` on the config and every file read so far (with a
-       pose section also the fixed fusion settings `fusion.FUSE_FIXED_PATH`, and a ladder must be
-       the committed pose ladder), then `check_test_log` on the output folder's `test_log.csv`;
+       pose section also the fixed fusion settings `fusion.FUSE_FIXED_PATH`, and without a protect
+       section a ladder must be the committed pose ladder); then the experiment id's request part
+       (`request_extra`) and the config hash; then, under split=test, for a config with a protect
+       section `check_test_frozen_request` on the request (its files by their repository paths, with
+       their sha256), and `check_test_log` on the output folder's `test_log.csv` (under split=test the
+       output folder is `held_out_output_root`: a relative `output_dir` is the counting repository's),
+       then, for a config with a protect section, `check_test_once` on it (the request has not run before);
     4. check the pass-subset verdict request (`check_verdict_request`: only a ladder reads
        `cfg.verdict_subsets`), then the ladder request, or the `--set` overlap and the sweep cells;
-       under split=test, `check_test_rungs` on the requested rungs or the sweep cells, then
+       under split=test, for a config with a protect section `check_test_rung_protect` on the
+       requested rung or sweep cell configs, then `check_test_rungs` on them, then
        `check_test_pose_rungs` on the requested rungs (and the 2 x 2 base rung), the sweep cells
-       or, for `eval run`, the config; then the pose settings the runner does not run
+       or, for `eval run`, the config, then, for a config with a protect section, `check_test_lift`
+       and `check_test_lidar_rungs` on the rung or sweep cell configs (its noise rule skips the cells
+       of the grid's `baseline` point); then the pose settings the runner does not run
        (`check_pose_supported`, without its split=test stops for a request that passed the
        split=test checks) of the config, of every requested rung (and the 2 x 2 base rung) or of
        every sweep cell;
     5. open every bundle in `cfg.runs` (a sweep checks each one's frame selection, split=test
-       runs `check_test_bundles`, with `detector.cache` `check_test_caches`, and with a pose
-       section `check_test_trajectories` and `check_test_pose_caches`) and sort them
+       runs `check_test_bundles`, with a protect section `check_test_seed_set`, with
+       `detector.cache` `check_test_caches`, with a pose section `check_test_trajectories` and
+       `check_test_pose_caches`, and with `lift.lidar_files` `check_test_lidar_files`, which holds
+       the requested ladder rungs, not the sweep cells, to the noise of the LiDAR files' contract)
+       and sort them
        by (fingerprint, run_id), so the results do not depend on the order the bundles were
        listed in; a ladder then checks `cfg.verdict_subsets` against them (`check_verdict_subsets`);
     6. score the bundles one at a time, one context at a time; only a request that passed the
@@ -374,9 +403,10 @@ def _run_eval(
        ladder with rung L5, the checked error `budget` (`ladder_budget`), and write the experiment folder; the
        digests of the detection caches (`_cache_identities`), of the pose caches
        (`_pose_cache_identities`) and of the IMU files (`_imu_file_identities`) the results name,
-       and the sha256 of each fixed fusion settings file they ran with (`_fusion_identity`), join
-       the bundle fingerprints, and the record lists them (`fusion` with the gtsam version and the
-       CPU count);
+       the sha256 of each fixed fusion settings file they ran with (`_fusion_identity`) and, as
+       `lidar:<name>:<sidecar sha256, 16 characters>`, the LiDAR files they read
+       (`_lidar_file_identities`), join the bundle fingerprints, and the record lists them (`fusion`
+       with the gtsam version and the CPU count);
     8. under split=test, add a `test_log.csv` row, and warn when the log already lists a run
        with the same config hash and request (`extra`).
     Under `stages.det=oracle_noisy`, `eval run` prepares the bundle once per noise seed. A ladder
@@ -395,10 +425,13 @@ def _run_eval(
     from counting.evaluation import fusion as fusion_mod
     from counting.evaluation.budget import ladder_budget
     from counting.evaluation.detmetrics import detection_rows, score_runs
+    from counting.evaluation.lidarsource import pop_depth_rows
     from counting.evaluation.posesource import check_pose_supported
     from counting.evaluation.protect import (
-        append_log_row, check_test_bundles, check_test_caches, check_test_log, check_test_pose_caches,
-        check_test_pose_rungs, check_test_request, check_test_rungs, check_test_trajectories, earlier_log_runs,
+        append_log_row, check_test_bundles, check_test_caches, check_test_frozen_request, check_test_lidar_files,
+        check_test_lidar_rungs, check_test_lift, check_test_log, check_test_once, check_test_pose_caches,
+        check_test_pose_rungs, check_test_request, check_test_rung_protect, check_test_rungs, check_test_seed_set,
+        check_test_trajectories, earlier_log_runs, held_out_output_root, repo_relative,
     )
     from counting.evaluation.record import build_record, counting_repo, experiment_id, git_state, request_extra
     from counting.evaluation.report import SCHEMA_VERSION, ReproducibilityError, write_experiment
@@ -447,6 +480,7 @@ def _run_eval(
                 rungs = [*(ladder.get("rungs") or {}), *(ladder.get("baselines") or {})]
 
         protected = None
+        lidar_rungs: dict = {}   # under split=test, the rung configs whose LiDAR noise must be the LiDAR contract's
         if cfg.split == "test":
             files = {"--splits": splits_path, "--criteria": criteria_path}
             if ladder is not None:
@@ -455,25 +489,58 @@ def _run_eval(
                 files["--grid"] = grid_path
             if cfg.pose is not None:
                 files["fixed fusion settings"] = fusion_mod.FUSE_FIXED_PATH   # the path as it is when called
+            repo = counting_repo()
             protected = check_test_request(cfg, config_path=config, sets=set_ or [], runs=run_ or [], files=files,
-                                           grid=grid, ladder=ladder, repo=counting_repo())
-            check_test_log(Path(cfg.output_dir).expanduser() / "test_log.csv")
+                                           grid=grid, ladder=ladder, repo=repo)
+        extra = request_extra(kind, ladder_sha256=ladder_sha256, rungs=rungs or (), with_2x2=with_2x2,
+                              subsets=subsets, grid_name=grid.path.name if grid else None, grid_sha256=grid_sha256,
+                              criteria_sha256=criteria_sha256)
+        chash = config_hash(cfg)
+        out_root = Path(cfg.output_dir).expanduser()
+        if protected is not None:
+            out_root = held_out_output_root(cfg.output_dir, repo)   # the test log does not follow the current folder
+            if cfg.protect is not None:   # every file is tracked by now, so each one has a repository path
+                check_test_frozen_request(
+                    cfg, kind=kind, files={option: Path(repo_relative(path, repo)) for option, path in files.items()},
+                    ladder_sha256=ladder_sha256, grid_sha256=grid_sha256, criteria_sha256=criteria_sha256,
+                    splits_sha256=file_sha256(splits_path), rungs=rungs, with_2x2=with_2x2, subsets=subsets,
+                    criteria=criteria)
+            test_log = out_root / "test_log.csv"
+            check_test_log(test_log)
+            if cfg.protect is not None:
+                check_test_once(test_log, config_hash=chash, kind=kind, extra=extra)
 
         check_verdict_request(cfg, rungs or (), subsets=subsets, kind=kind)
         if kind == "ladder":
             check_ladder_request(cfg, ladder, rungs, with_2x2=with_2x2, subsets=subsets)
             names = [*rungs, ladder["interaction_2x2"]["base"]] if with_2x2 else rungs
             if protected is not None:
-                check_test_rungs(cfg, {name: rung_config(cfg, ladder, name) for name in rungs})
+                rung_cfgs = {name: rung_config(cfg, ladder, name) for name in rungs}
+                if cfg.protect is not None:
+                    check_test_rung_protect(cfg, rung_cfgs)
+                check_test_rungs(cfg, rung_cfgs)
                 check_test_pose_rungs(cfg, {name: (name, rung_config(cfg, ladder, name)) for name in names}, ladder)
+                if cfg.protect is not None:
+                    check_test_lift(cfg, rung_cfgs)
+                    check_test_lidar_rungs(cfg, rung_cfgs)
+                lidar_rungs = rung_cfgs
         elif kind == "sweep":
             check_set_overlap([s.split("=", 1)[0] for s in (set_ or [])], points)
             cells = sweep_cells(cfg, grid, ladder)
             if protected is not None:
-                check_test_rungs(cfg, {f"{c.point.name} @ {c.base}": c.cfg for c in cells})
+                cell_cfgs = {f"{c.point.name} @ {c.base}": c.cfg for c in cells}
+                if cfg.protect is not None:
+                    check_test_rung_protect(cfg, cell_cfgs)
+                check_test_rungs(cfg, cell_cfgs)
                 check_test_pose_rungs(cfg, {f"{c.point.name} @ {c.base}": (c.base, c.cfg) for c in cells}, ladder)
+                if cfg.protect is not None:
+                    check_test_lift(cfg, cell_cfgs)
+                    check_test_lidar_rungs(cfg, cell_cfgs, baseline_cells=[
+                        f"{c.point.name} @ {c.base}" for c in cells if c.point.name == "baseline"])
+                # sweep cells are not held to the LiDAR contract: a grid moves the noise on purpose
         elif protected is not None:
             check_test_pose_rungs(cfg, {"run": (None, cfg)}, None)
+            lidar_rungs = {"run": cfg}
         if kind == "run":
             check_pose_supported(cfg, protected=protected is not None)
         elif kind == "ladder":
@@ -492,11 +559,15 @@ def _run_eval(
                 check_frame_selection(bundle, cells)
         if protected is not None:
             check_test_bundles(bundles, splits_cfg)
+            if cfg.protect is not None:
+                check_test_seed_set(bundles, splits_cfg)
             if cfg.detector.cache is not None:
                 check_test_caches(bundles, cfg)
             if cfg.pose is not None:
                 check_test_trajectories(bundles)
                 check_test_pose_caches(bundles, cfg)
+            if cfg.lift.lidar_files:
+                check_test_lidar_files(bundles, cfg, lidar_rungs)
         bundles.sort(key=lambda b: (b.meta.fingerprint, b.meta.run_id))
         if kind == "ladder":
             check_verdict_subsets(bundles, cfg)
@@ -559,9 +630,6 @@ def _run_eval(
             uses_box_depth = any(d != "det_depth" for d in lift_depths)
         else:
             uses_box_depth = any(cell.cfg.lift.depth != "det_depth" for cell in cells)
-        extra = request_extra(kind, ladder_sha256=ladder_sha256, rungs=rungs or (), with_2x2=with_2x2,
-                              subsets=subsets, grid_name=grid.path.name if grid else None, grid_sha256=grid_sha256,
-                              criteria_sha256=criteria_sha256)
 
         fingerprints = [bundle.meta.fingerprint for bundle in bundles]
         data = [entry["meta"] for entry in run_entries]
@@ -601,13 +669,15 @@ def _run_eval(
             fingerprints += identity["fuse_fixed_sha256"]
             fusion = {"gtsam": identity["gtsam"], "cpus": os.cpu_count(),
                       "fuse_fixed_sha256": identity["fuse_fixed_sha256"]}
+        lidar_ids = _lidar_file_identities(run_entries)
+        fingerprints += [f"lidar:{c['name']}:{c['sidecar_sha256'][:16]}" for c in lidar_ids]
 
         code = protected.code if protected is not None else git_state()
-        chash = config_hash(cfg)
         exp_id = experiment_id(config_hash=chash, fingerprints=fingerprints, code=code, seed=cfg.seed, extra=extra)
         results = {"schema_version": SCHEMA_VERSION, "kind": kind, "run_name": cfg.run_name,
                    "experiment_id": exp_id, "split": cfg.split, "crop": cfg.crop, "runs": run_entries,
                    "pooled": None, "verdicts": None}
+        depth_rows = pop_depth_rows(results)   # the per-detection rows go beside results.json, not in it
         if kind != "sweep":
             results["pooled"] = ladder_pooled(run_entries, crop=cfg.crop)
         if detection is not None:
@@ -644,9 +714,10 @@ def _run_eval(
         record = build_record(cfg=cfg, runs=data, code=code,
                               timings={"prepare": round(t_prepare, 3), "evaluate": round(t_score, 3)},
                               started=started, finished=finished, extra=record_extra, detector=detector,
-                              pose_caches=pose_ids or None, imu_files=imu_ids or None, fusion=fusion)
-        out_root = Path(cfg.output_dir).expanduser()
-        folder, reproduced = write_experiment(out_root, cfg=cfg, results=results, record=record, criteria=criteria)
+                              pose_caches=pose_ids or None, imu_files=imu_ids or None, fusion=fusion,
+                              lidar_files=lidar_ids or None)
+        folder, reproduced = write_experiment(out_root, cfg=cfg, results=results, record=record, criteria=criteria,
+                                              depth_rows=depth_rows or None)
 
         if protected is not None:
             log = out_root / "test_log.csv"

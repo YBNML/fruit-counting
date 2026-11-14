@@ -15,6 +15,7 @@ Results are JSON-shaped dicts of plain Python values (str, int, float, bool, Non
 from __future__ import annotations
 
 import copy
+import hashlib
 import json
 import time
 from dataclasses import dataclass, field, replace
@@ -24,7 +25,9 @@ from typing import Callable, Mapping, Sequence
 import numpy as np
 import yaml
 
-from counting.config.eval_schema import EvalAppConfig, LiftConfig, SplitsConfig
+from counting.config.eval_schema import (
+    DEPTH_FORM_KEYS, LIDAR_DEPTHS, LIDAR_NOISE_KEYS, EvalAppConfig, LiftConfig, SplitsConfig,
+)
 from counting.data.formats.orchard_synth import (
     FrameInput, OrchardLayout, PassKey, SceneTruth, SynthRun, read_depth_m, select_frames,
 )
@@ -32,12 +35,15 @@ from counting.detection.base import Detections
 from counting.detection.cached import CachedDetector, cache_path
 from counting.detection.oracle import OracleDetector
 from counting.evaluation import fusion as fusion_mod
+from counting.evaluation import lidarsource
 from counting.evaluation.alignment import (
     ORACLE_SIGMA_M, align_settings, alignment_entry, oracle_alignment, structure_points, truth_alignment,
 )
 from counting.evaluation.fusion import FusionInputs
+from counting.evaluation.lidarsource import DepthRows, NoisyPoints
 from counting.evaluation.ledger import Ledger, UnitView, build_ledger, combine
 from counting.evaluation.match import match_frame, unit_majority
+from counting.evaluation.mechanism import band_blocked_pairs, mechanism_entry, split_fragments
 from counting.evaluation.oracle_stages import (
     oracle_dedup, oracle_tracks, truth_centers, truth_row_mask, truth_trees,
 )
@@ -50,22 +56,30 @@ from counting.evaluation.truth import (
     SummaryMismatch, TruthTables, check_summary, is_positive, pass_subsets, truth_sets,
 )
 from counting.geometry.camera import Camera
+from counting.geometry.lidarfile import LidarFile, lidar_folder
 from counting.geometry.noise import (
-    STEP_BIAS, STEP_DEPTH, STEP_DEPTH_K, STEP_DET, STEP_POSE, depth_k_noise, noise_rng, pass_bias, pass_key_code,
-    perturb_depth,
+    STEP_BIAS, STEP_DEPTH, STEP_DEPTH_K, STEP_DEPTH_PERSIST, STEP_DEPTH_SCALE, STEP_DET, STEP_POSE, depth_k_noise,
+    depth_persist_field, depth_scale, noise_rng, pass_bias, pass_key_code, perturb_depth, side_code,
 )
 from counting.geometry.posefile import PoseFile
+from counting.geometry.rig import pose_matrix
 from counting.multiview.align import AlignPass, AlignResult, PassAlignment, Segments, align_passes, track_x
 from counting.multiview.assign import assign_trees, in_target_row
 from counting.multiview.dedup import dedup, repair_pass
+from counting.multiview.lidardepth import (
+    BoxLidar, LidarSettings, PassCloud, box_lidar_depth, combine_depth, pass_cloud, window,
+)
 from counting.multiview.lift import box_far_depth, box_median_depth, lift_points
 from counting.odometry.cache import pose_cache_path
 from counting.odometry.imufile import ImuFile, imu_file_path
-from counting.tracking.landmark import PassTracks, track_pass
+from counting.tracking.landmark import PassTracks, TrackTrace, track_pass
 
 VARIANTS = ("count1", "any", "strict")
 FRAME_KEYS = ("crop", "split", "passes", "detector.positives")   # the frames and truth a ladder rung may not change
 SUBSET_RUNGS = ("L3", "L5")   # the ladder rungs that get the pass-subset table under `subsets`
+# The camera depth noise keys whose draws `camera_depth_sha256` records (the error forms included).
+CAMERA_DEPTH_NOISE_KEYS = ("depth_rel_sigma", "depth_dropout", "depth_k", "depth_persist_sigma", "depth_scale_sigma",
+                           "depth_bias_rel")
 
 
 class CheckFailed(ValueError):
@@ -89,6 +103,10 @@ class RunContext:
     `check_pose_supported` as `protected`.
     `_pose_files` holds the pose caches `open_pose_file` opened, by (path, pinned digest or None).
     `_imu_files` holds the IMU files `open_imu_file` opened, by (path, pinned digest or None, config seed).
+    `_lidar_files` holds the LiDAR files `open_lidar_file` opened, by (folder, pinned digest). `_lidar_points` holds
+    the measured points of one LiDAR noise draw (`lidarsource.noisy_points`), by (`cfg.seed`, folder, sidecar digest,
+    unit, side code, noise seed, `LIDAR_NOISE_KEYS` values): only the two sides of one such draw at a time, so a
+    draw that differs but for the side empties it first.
     """
 
     run: SynthRun
@@ -105,6 +123,8 @@ class RunContext:
     _box_depth: dict[tuple, np.ndarray] = field(default_factory=dict, init=False, repr=False)
     _pose_files: dict[tuple[str, str | None], PoseFile] = field(default_factory=dict, init=False, repr=False)
     _imu_files: dict[tuple[str, str | None, int], ImuFile] = field(default_factory=dict, init=False, repr=False)
+    _lidar_files: dict[tuple[str, str | None], LidarFile] = field(default_factory=dict, init=False, repr=False)
+    _lidar_points: dict[tuple, NoisyPoints] = field(default_factory=dict, init=False, repr=False)
 
     def __post_init__(self) -> None:
         self._frame_of = {f.idx: f for frames in self.passes.values() for f in frames}
@@ -255,6 +275,35 @@ def open_imu_file(ctx: RunContext, cfg: EvalAppConfig) -> ImuFile | None:
         ctx._imu_files[key] = ImuFile(path, fingerprint=run.meta.fingerprint, run_id=run_id, digest=pin,
                                       imu_seed=cfg.seed)
     return ctx._imu_files[key]
+
+
+def open_lidar_file(ctx: RunContext, cfg: EvalAppConfig) -> LidarFile | None:
+    """The LiDAR file `lift.lidar_file` of `ctx`'s bundle under a LiDAR box depth (`LIDAR_DEPTHS`), opened once per
+    context; None under any other `lift.depth`, which leaves the files unopened.
+
+    Refuses, in order (`ValueError`): a bundle without frame times (rendered without body shake), and a run that
+    `lift.lidar_files.<name>.digests` does not pin (naming the folder). The folder is
+    `lidar_folder(dir, bundle folder name)`; `LidarFile` then checks the sidecar against the pinned digest, the unit,
+    the bundle (crop, name, seed and the sha256 of its `manifest.json` and `trajectory.json`), the simulation config
+    sha256 and the simulator commits of that file set. The opened file is kept in the context by (folder, digest).
+    """
+    lift = cfg.lift
+    if lift.depth not in LIDAR_DEPTHS:
+        return None
+    run, name = ctx.run, lift.lidar_file
+    if run.plans() is None:
+        raise ValueError(f"{run.root}: lift.depth={lift.depth} needs a shaken bundle with frame times")
+    files, run_id = lift.lidar_files[name], run.meta.run_id
+    folder = lidar_folder(files.dir, run.root.name)
+    if run_id not in files.digests:
+        raise ValueError(f"{folder}: lift.lidar_files.{name}: no pinned lidar.json digest for run {run_id}")
+    pin = files.digests[run_id]
+    key = (str(folder), pin)
+    if key not in ctx._lidar_files:
+        ctx._lidar_files[key] = LidarFile(folder, unit=files.unit, bundle=run.root.name, crop=run.meta.crop,
+                                          seed=run.meta.seed, inputs=lidarsource.bundle_inputs(run), digest=pin,
+                                          config_sha256=files.sim_config_sha256, sim_commits=files.sim_commits)
+    return ctx._lidar_files[key]
 
 
 def _match_by_score(dets, recs, score_hi, prefer):
@@ -408,7 +457,10 @@ class _PassTrack:
     `frames` are the pass's frames in `ctx.passes`, with the truth cameras that scoring uses;
     `cameras` maps each frame idx to the camera the lift and the tracker used. `tracks` are the
     tracks after in-pass repair (or the oracle tracks). `depth_errs` are the pass's box-depth
-    errors in frame order, and `depth_err` is their `depth_error_stats`.
+    errors in frame order, and `depth_err` is their `depth_error_stats`. With `lift.lidar_files`,
+    `rows` are the pass's depth rows; under a LiDAR box depth, `lidar_counts` holds the pass's
+    `frames`, its `cloud_points` and the `window_points` of its frames' windows. With `lift.lidar_files`
+    and a tracker other than the oracle, `trace` holds what `track_pass` counted (`TrackTrace`).
     """
 
     key: PassKey
@@ -417,6 +469,119 @@ class _PassTrack:
     tracks: PassTracks
     depth_errs: list[np.ndarray]
     depth_err: dict | None
+    rows: DepthRows | None = None
+    lidar_counts: dict | None = None
+    trace: TrackTrace | None = None
+
+
+@dataclass(frozen=True, eq=False)
+class _LidarPass:
+    """One pass's LiDAR points in the world (`cloud`), the believed camera <- sensor transform that placed them and
+    the LiDAR box depth settings of `lift.lidar`."""
+
+    cloud: PassCloud
+    T_cam_sensor: np.ndarray
+    settings: LidarSettings
+
+
+def _frame_ns(ctx: RunContext, idx: int) -> int:
+    """The time of frame `idx` in integer ns, on the clock of its side (the bundle's frame times)."""
+    plans = ctx.run.plans()
+    if plans is None:
+        raise ValueError(f"{ctx.run.root}: LiDAR box depth needs a shaken bundle with frame times")
+    return round(plans[idx].t * 1e9)
+
+
+def _noisy_points(ctx: RunContext, cfg: EvalAppConfig, file: LidarFile, noise_seed: int | None, *, scene: int,
+                  key: PassKey) -> NoisyPoints:
+    """The measured points of `key`'s side of `file` under `noise_seed` (`lidarsource.noisy_points`), kept in
+    `ctx._lidar_points` (see `RunContext`)."""
+    values = tuple(float(cfg.noise.factor(k)) for k in LIDAR_NOISE_KEYS)
+    face = side_code(key)
+    draw = (cfg.seed, str(file.folder), file.digest, file.device, noise_seed, values)
+    full = (*draw[:4], face, *draw[4:])
+    if any((*k[:4], *k[5:]) != draw for k in ctx._lidar_points):
+        ctx._lidar_points.clear()
+    if full not in ctx._lidar_points:
+        ctx._lidar_points[full] = lidarsource.noisy_points(file.points(key.side), cfg, noise_seed, scene=scene,
+                                                           side=face, unit=file.device)
+    return ctx._lidar_points[full]
+
+
+def _lidar_pass(ctx: RunContext, cfg: EvalAppConfig, file: LidarFile, noise_seed: int | None, *, scene: int,
+                key: PassKey, frames: Sequence[FrameInput],
+                cams: Mapping[PassKey, Mapping[int, Camera]] | None) -> _LidarPass:
+    """The LiDAR points of the pass `key` in the world, once per pass.
+
+    The points are the side's measured points (`_noisy_points`), placed by the believed camera <- sensor transform
+    of the pass pitch (`lidarsource.camera_from_sensor` on the true mount `lidarsource.sidecar_mount`) and the
+    cameras of the pass's `frames` at their frame times, in time order: the pose source's cameras `cams[key]`
+    before any `Camera.perturbed`, or the true cameras without a pose source (`pass_cloud`, with the file rows of
+    the points).
+    """
+    points = file.points(key.side)
+    noisy = _noisy_points(ctx, cfg, file, noise_seed, scene=scene, key=key)
+    T = lidarsource.camera_from_sensor(cfg, noise_seed, unit=file.device, scene=scene, pitch=key.pitch_deg,
+                                       T_body_sensor=lidarsource.sidecar_mount(file.folder))
+    cameras = [cams[key][f.idx] if cams is not None else ctx._frame_of[f.idx].camera for f in frames]
+    t_ns = np.array([_frame_ns(ctx, f.idx) for f in frames], dtype=np.int64)
+    order = np.argsort(t_ns, kind="stable")
+    cloud = pass_cloud(noisy.t_ns, noisy.p_sensor, noisy.rows, first_ns=points.first_ns, last_ns=points.last_ns,
+                       frame_t_ns=t_ns[order], frame_poses=np.stack([pose_matrix(cameras[i]) for i in order]),
+                       T_cam_sensor=T)
+    return _LidarPass(cloud=cloud, T_cam_sensor=T, settings=LidarSettings.from_lift(cfg.lift))
+
+
+def _frame_rows(ctx: RunContext, cfg: EvalAppConfig, key: PassKey, idx: int, noise_seed: int | None, *,
+                clean: np.ndarray, z_cam: np.ndarray, lidar: BoxLidar | None, z: np.ndarray, used: np.ndarray,
+                points: np.ndarray) -> dict[str, list]:
+    """The depth rows of frame `idx` (`DepthRows` columns), from the truth of `ctx` and the depths of the frame."""
+    n = len(ctx.dets[idx])
+    truth_ids = [int(t) for t in ctx.src[idx]]
+    target = ctx.tables[cfg.truth.variant].target_ids
+    depth_med = {r.id: r.depth_med for r in ctx.truth.records.get(idx, ())}
+    in_row = in_target_row(points, ctx.layout)
+    med = [depth_med.get(t) if t >= 0 else None for t in truth_ids]
+    return {"run_id": [ctx.run.meta.run_id] * n, "noise_seed": [noise_seed] * n, "side": [key.side] * n,
+            "pitch": [key.pitch_deg] * n, "idx": [idx] * n, "det": list(range(n)), "truth_id": truth_ids,
+            "counted": [t in target if t >= 0 else bool(in_row[d]) for d, t in enumerate(truth_ids)],
+            "bagged": [ctx.truth.fruits[t].bagged if t >= 0 else None for t in truth_ids],
+            "depth_med": [np.nan if m is None else m for m in med],
+            "z_cam_clean": list(clean), "z_cam": list(z_cam),
+            "z_lidar": [np.nan] * n if lidar is None else list(lidar.z),
+            "n_points": [0] * n if lidar is None else list(lidar.n_points), "z_used": list(z),
+            "used_lidar": list(used)}
+
+
+def _depth_forms(z: np.ndarray, clean: np.ndarray, frame: FrameInput, D: Detections, cfg: EvalAppConfig,
+                 noise_seed: int, *, scene: int, key: PassKey) -> np.ndarray:
+    """The camera box depths `z` (after the depth noise) of the detections `D` of `frame`, the frame with its true
+    camera, times the error forms of the `noise` keys that are set, in this order:
+
+    - `depth_persist_sigma`: `1 + p(X)`, p the persistent field of the side (`depth_persist_field`, step 20, keyed
+      `(cfg.seed, noise_seed, 20, scene, *side_code(key))`, length `depth_persist_len_m`) at the points X that the
+      lift makes of the clean depths `clean` on the true camera (p 0 where a clean depth gives no point);
+    - `depth_scale_sigma`: `1 + s`, s the scale of the pass (`depth_scale`, step 21, keyed
+      `(cfg.seed, noise_seed, 21, scene, *pass_key_code(key))`);
+    - `depth_bias_rel`: `1 + depth_bias_rel`.
+
+    A key set to 0 draws like any other value and leaves the depths as they are; NaN stays NaN.
+    """
+    nz, out = cfg.noise, np.asarray(z, dtype=np.float64)
+    if nz.depth_persist_sigma is not None:
+        field = depth_persist_field((cfg.seed, noise_seed, STEP_DEPTH_PERSIST, scene, *side_code(key)),
+                                    nz.depth_persist_sigma, nz.depth_persist_len_m)
+        X = lift_points(D.boxes, D.labels, clean, frame.camera, cfg.lift)
+        at = np.isfinite(X).all(axis=1)
+        p = np.zeros(len(out))
+        p[at] = field(X[at])
+        out = out * (1.0 + p)
+    if nz.depth_scale_sigma is not None:
+        s = depth_scale((cfg.seed, noise_seed, STEP_DEPTH_SCALE, scene, *pass_key_code(key)), nz.depth_scale_sigma)
+        out = out * (1.0 + s)
+    if nz.depth_bias_rel is not None:
+        out = out * (1.0 + nz.depth_bias_rel)
+    return out
 
 
 def _track_passes(ctx: RunContext, cfg: EvalAppConfig, noise_seed: int | None, *,
@@ -428,9 +593,21 @@ def _track_passes(ctx: RunContext, cfg: EvalAppConfig, noise_seed: int | None, *
     `pose.source=file`), or from its true camera when that gives None. The fusion takes `fusion`,
     or without it the bundle's `fusion_inputs` (with the IMU file of `open_imu_file`; None without
     fusion). With `noise_seed`, a pass's bias is drawn before its frames, and each frame's camera then
-    gets `Camera.perturbed`, then its chosen depth `perturb_depth` (after the depth error is taken)
-    and, with `noise.depth_k` set, `depth_k_noise` on the depth before noise. The lift and the tracker
-    use these cameras; `track_pass` runs once per pass on the frames that carry them.
+    gets `Camera.perturbed`, then its chosen depth `perturb_depth` (after the depth error is taken),
+    with `noise.depth_k` set `depth_k_noise` on the depth before noise and, with an error form key of
+    `DEPTH_FORM_KEYS` set, the error forms (`_depth_forms`, read on the frame's true camera). The lift
+    and the tracker use these cameras; `track_pass` runs once per pass on the frames that carry them.
+
+    Under a LiDAR box depth (`LIDAR_DEPTHS`) the camera box depth is the `box_far` depth of the same
+    `lift` values, and after the camera depth noise each frame takes the LiDAR depth of its boxes from
+    the points of its pass (`_lidar_pass`) within `lift.lidar.window_s` of the frame time (`window`)
+    and joins it with the camera depth (`combine_depth`). Under `lift.depth=lidar` the points are
+    matched to the boxes on the pose source's camera before `Camera.perturbed` (`box_lidar_depth`).
+    Under `lift.depth=lidar_oracle` each detection takes the points the labels give its truth fruit
+    (`lidarsource.oracle_box_depth` on that camera), the labels of each side read once
+    (`lidarsource.read_labels`, checked against the sidecar) before any pass. With
+    `lift.lidar_files`, each pass also keeps its depth rows (`_frame_rows`) and, under a tracker other
+    than the oracle, the `TrackTrace` of its `track_pass`.
     """
     st, scene, nz = cfg.stages, ctx.run.meta.seed, cfg.noise
     if fusion is None:
@@ -438,38 +615,77 @@ def _track_passes(ctx: RunContext, cfg: EvalAppConfig, noise_seed: int | None, *
     cams = model_cameras(ctx.run.frames, ctx.passes, cfg, noise_seed, scene=scene,
                          base_step_m=ctx.run.meta.base_step_m, plans=ctx.run.plans(),
                          pose_file=open_pose_file(ctx, cfg), fusion=fusion)
+    lidar_file = open_lidar_file(ctx, cfg)
+    lidar_depth = cfg.lift.depth in LIDAR_DEPTHS
+    camera_lift = cfg.lift.model_copy(update={"depth": "box_far"}) if lidar_depth else cfg.lift
+    keep_rows = cfg.lift.lidar_files is not None
+    forms = any(getattr(nz, k) is not None for k in DEPTH_FORM_KEYS)
+    oracle = cfg.lift.depth == "lidar_oracle"
+    labels: dict[str, lidarsource.LidarLabels] = {}   # truth-label pairing: each side's labels, read before any pass
+    if oracle:
+        for side in dict.fromkeys(key.side for key in ctx.passes):
+            labels[side] = lidarsource.read_labels(lidar_file.folder, side, n_points=len(lidar_file.points(side).t_ns))
     out: list[_PassTrack] = []
     for key, frames in ctx.passes.items():
         bias = None if noise_seed is None else pass_bias(
             noise_rng(cfg.seed, noise_seed, STEP_BIAS, scene, *pass_key_code(key)), nz.pass_bias_m)
+        lp = counts = half = None
+        if lidar_file is not None:
+            lp = _lidar_pass(ctx, cfg, lidar_file, noise_seed, scene=scene, key=key, frames=frames, cams=cams)
+            half = None if lp.settings.window_s is None else round(lp.settings.window_s * 1e9)
+            counts = {"frames": 0, "cloud_points": len(lp.cloud.t_ns), "window_points": 0}
         points, seen = {}, []   # `seen`: the frames with the cameras the tracker and the lift use
         depth_errs: list[np.ndarray] = []
+        rows: list[dict[str, list]] = []
         for f in frames:
             D = ctx.dets[f.idx]
-            z = D.depth_m if cfg.lift.depth == "det_depth" else ctx.box_depth(f.idx, cfg.lift)
+            z = D.depth_m if cfg.lift.depth == "det_depth" else ctx.box_depth(f.idx, camera_lift)
             if cfg.lift.depth != "det_depth" and D.depth_m is not None:
                 e = z - D.depth_m
                 depth_errs.append(e[np.isfinite(e)])
             if cams is not None:
                 f = replace(f, camera=cams[key][f.idx])
+            unshaken = f.camera   # the pose source's camera: the LiDAR points are placed and seen with it
+            clean = z
             if noise_seed is not None:
                 f = replace(f, camera=f.camera.perturbed(noise_rng(cfg.seed, noise_seed, STEP_POSE, scene, f.idx),
                                                          nz.pose_trans_sigma_m, nz.pose_rot_sigma_deg, bias))
-                clean = z
                 z = perturb_depth(z, noise_rng(cfg.seed, noise_seed, STEP_DEPTH, scene, f.idx),
                                   nz.depth_rel_sigma, nz.depth_dropout)
                 if nz.depth_k is not None:
                     z = z + depth_k_noise((cfg.seed, noise_seed, STEP_DEPTH_K, scene, f.idx), clean, nz.depth_k)
+                if forms:
+                    z = _depth_forms(z, clean, ctx._frame_of[f.idx], D, cfg, noise_seed, scene=scene, key=key)
+            z_cam, lidar, used = z, None, np.zeros(len(D), dtype=bool)
+            if lp is not None:
+                near = window(lp.cloud, _frame_ns(ctx, f.idx), half)
+                if oracle:
+                    lidar = lidarsource.oracle_box_depth(ctx.src[f.idx], unshaken, near, labels[key.side],
+                                                         lp.settings)
+                else:
+                    lidar = box_lidar_depth(D.boxes, z_cam, unshaken, near, lp.settings)
+                z, used = combine_depth(z_cam, lidar, lp.settings)
+                counts["frames"] += 1
+                counts["window_points"] += len(near.t_ns)
             points[f.idx] = lift_points(D.boxes, D.labels, z, f.camera, cfg.lift)
             seen.append(f)
+            if keep_rows:
+                rows.append(_frame_rows(ctx, cfg, key, f.idx, noise_seed, clean=clean, z_cam=z_cam, lidar=lidar,
+                                        z=z, used=used, points=points[f.idx]))
         depth_err = depth_error_stats(np.concatenate(depth_errs)) if depth_errs else None
+        trace = None
         if st.track == "oracle":   # one track per id already: no in-pass repair
             tracks = oracle_tracks(key, seen, ctx.dets, ctx.src, points)
         else:
-            tracks = repair_pass(track_pass(seen, ctx.dets, points, cfg.tracker, method=st.track),
+            trace = TrackTrace() if keep_rows else None
+            tracks = repair_pass(track_pass(seen, ctx.dets, points, cfg.tracker, method=st.track, trace=trace),
                                  cfg.tracker.repair_m)
+        pass_rows = None
+        if keep_rows:
+            pass_rows = DepthRows(**{name: [v for r in rows for v in r[name]] for name in DepthRows.COLUMNS})
         out.append(_PassTrack(key=key, frames=frames, cameras={f.idx: f.camera for f in seen}, tracks=tracks,
-                              depth_errs=depth_errs, depth_err=depth_err))
+                              depth_errs=depth_errs, depth_err=depth_err, rows=pass_rows, lidar_counts=counts,
+                              trace=trace))
     return out
 
 
@@ -604,8 +820,8 @@ def evaluate(ctx: RunContext, cfg: EvalAppConfig, *, subsets: bool = False, nois
     times and IMU streams, under `pose.source=file` from the IMU file that
     `open_imu_file` opens once per context; None without fusion) are made once
     per call and handed to `_track_passes`. With `noise_seed`, every such camera gets `Camera.perturbed`, and
-    every chosen depth gets `perturb_depth` (and, with `noise.depth_k`,
-    `depth_k_noise`) after `depth_err` is taken; scoring always uses the truth.
+    every chosen depth gets `perturb_depth` (and, with `noise.depth_k`, `depth_k_noise`, and with an
+    error form key set, `_depth_forms`) after `depth_err` is taken; scoring always uses the truth.
     With a pose section the result also has `pose` (`pose_settings`; its `cache`
     is `pose_cache_entry` of the pose cache read, None under `pose.source=truth`,
     its `imu` the fusion inputs' `imu` and its `fusion` `fusion_entry`, both None
@@ -619,6 +835,17 @@ def evaluate(ctx: RunContext, cfg: EvalAppConfig, *, subsets: bool = False, nois
     With `subsets` (which needs `stop_after=y6`), the result also has `subsets`
     (`_score_subsets`): the passes' tracks are reused, and Y6 is scored again on
     each subset of `pass_subsets`.
+    Under a LiDAR box depth (`LIDAR_DEPTHS`; see `_track_passes`) the result also
+    has `lidar` (`lidarsource.lidar_entry` of the file `open_lidar_file` opens,
+    with the true mount of its sidecar). With `lift.lidar_files` it also has
+    `camera_depth_sha256` (`_camera_depth_sha256`) and `depth_rows`, the
+    `DepthRows` of every pass in order; they are not a JSON value, so the
+    experiment folder writer takes them out first (`lidarsource.pop_depth_rows`).
+    With `lift.lidar_files` and a tracker other than the oracle it also has
+    `mechanism`, counts for the report only (`mechanism_entry`): the passes'
+    `TrackTrace` counts, the `split_fragments` of the tracked passes (after the
+    in-pass repair) and, when the hybrid dedup ran (`stages.dedup=hybrid`, Y6),
+    the `band_blocked_pairs` of the scored tracks it took (None otherwise).
     """
     check_pose_supported(cfg, protected=ctx.allow_test)
     _check_config(ctx, cfg, ctx.prepared.get("det_seed") if noise_seed is None else noise_seed)
@@ -670,7 +897,34 @@ def evaluate(ctx: RunContext, cfg: EvalAppConfig, *, subsets: bool = False, nois
         out["cache"] = _cache_result(ctx)
     if subsets:
         out["subsets"] = _score_subsets(ctx, cfg, stages, y6)
+    if cfg.lift.lidar_files is not None:
+        rows = DepthRows.concat(p.rows for p in staged)
+        lidar_file = open_lidar_file(ctx, cfg)
+        if lidar_file is not None:
+            counts = {k: sum(p.lidar_counts[k] for p in staged) for k in ("frames", "cloud_points", "window_points")}
+            out["lidar"] = lidarsource.lidar_entry(
+                cfg, file=lidar_file, mount=lidarsource.sidecar_mount(lidar_file.folder),
+                mount_rpy_deg=lidarsource.sidecar_mount_rpy(lidar_file.folder, ctx.run.meta.crop), rows=rows,
+                counts=counts)
+        out["camera_depth_sha256"] = _camera_depth_sha256(cfg, noise_seed, rows)
+        out["depth_rows"] = rows
+        if st.track != "oracle":
+            blocked = None
+            if st.dedup == "hybrid" and y6 is not None:
+                blocked = band_blocked_pairs([s.tracks for s in stages], ctx.src, ctx.layout, cfg.dedup,
+                                             keep=[s.keep for s in stages])
+            out["mechanism"] = mechanism_entry([p.trace for p in staged],
+                                               split_fragments([p.tracks for p in staged], ctx.src), blocked)
     return out
+
+
+def _camera_depth_sha256(cfg: EvalAppConfig, noise_seed: int | None, rows: DepthRows) -> str:
+    """The sha256 (64 hex characters) of the camera box depths after the camera depth noise and before any joining,
+    in frame order (`rows.z_cam` as float64 bytes), when that noise was drawn: with `noise_seed` and a key of
+    `CAMERA_DEPTH_NOISE_KEYS` other than 0. Otherwise `"none"`."""
+    if noise_seed is None or all(cfg.noise.factor(k) == 0 for k in CAMERA_DEPTH_NOISE_KEYS):
+        return "none"
+    return hashlib.sha256(np.ascontiguousarray(rows.z_cam, dtype=np.float64).tobytes()).hexdigest()
 
 
 def _score_subsets(ctx: RunContext, cfg: EvalAppConfig, stages: Sequence[_PassStage], y6_all: dict) -> list[dict]:

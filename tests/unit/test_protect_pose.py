@@ -18,6 +18,7 @@ import yaml
 from typer.testing import CliRunner
 
 import counting.evaluation.fusion as fusion_module
+import counting.evaluation.protect as protect
 import counting.evaluation.record as record
 from counting.cli import app
 from counting.config.eval_schema import EvalAppConfig
@@ -63,6 +64,13 @@ IMU_NOISE = {"gyro_n": 1.16e-3, "acc_n": 4.97e-3, "gyro_w": 1.82e-5, "acc_w": 4.
 _ROW_ARGS = {"kind": "pose_vo", "date": "2026-11-13T00:00:00+00:00", "config_rel": "configs/pose/frozen/apple_vo.yaml",
              "config_hash": "h" * 16, "extra": "opencv:5.0.0", "fingerprint": "f" * 64, "digest": "d" * 64,
              "commit": "c" * 40}
+
+
+@pytest.fixture(autouse=True)
+def reopen_closed_seeds(monkeypatch):
+    """Reopen the closed held-out seeds for these tests: their fake bundles keep seed 1003, and the rules they
+    check apply to the open held-out seeds too. The closed list itself is checked in test_protect_depth.py."""
+    monkeypatch.setattr(protect, "CLOSED_TEST_SEEDS", frozenset())
 
 
 def _bundle(root: Path, seed: int) -> Path:

@@ -12,6 +12,7 @@ import pytest
 import yaml
 from typer.testing import CliRunner
 
+import counting.evaluation.protect as protect
 import counting.evaluation.record as record_module
 import counting.evaluation.runner as runner_module
 import counting.evaluation.sweep as sweep_module
@@ -39,6 +40,13 @@ MISSING = "configs/eval/frozen/apple_missing.yaml"     # its bundle path does no
 OLD_LOG = "configs/eval/frozen/apple_old_log.yaml"     # MISSING, with its own output folder `old_log`
 CLEAN = {"commit": "a" * 40, "dirty": False, "diff_sha256": None}
 runner = CliRunner()
+
+
+@pytest.fixture(autouse=True)
+def reopen_closed_seeds(monkeypatch):
+    """Reopen the closed held-out seeds for these tests: their fake bundles keep seeds 1000 to 1002, and the rules
+    they check apply to the open held-out seeds too. The closed list itself is checked in test_protect_depth.py."""
+    monkeypatch.setattr(protect, "CLOSED_TEST_SEEDS", frozenset())
 
 
 def _git(repo, *args):

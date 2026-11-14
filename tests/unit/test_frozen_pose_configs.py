@@ -3,7 +3,8 @@ odometry settings and their noiseless-depth twin (the pose cache folders of the 
 the judged IMU profile, and the odometry drift profile and odometry factor sigmas that the pose ladder and the drift
 profile grid carry. Then the frozen held-out configs of the pose ladder: each is a val config with the held-out
 scenes, tuning off and the digests of its detection caches, pose caches and judged IMU files pinned, and its rungs
-and the held-out drift grids pass the held-out checks."""
+and the held-out drift grids pass the held-out checks. Its held-out seeds are closed for good, so the request itself
+is refused."""
 
 import re
 from pathlib import Path
@@ -130,15 +131,11 @@ def test_frozen_pose_test_configs_follow_val():
 
 def test_frozen_pose_test_requests_pass_the_rung_checks():
     ladder = load_ladder(LADDER_PATH)
-    clean = {"commit": "c" * 40, "dirty": False, "diff_sha256": None}
     held_out = [n for n in [*ladder["rungs"], *ladder["baselines"]] if n not in ladder["val_only"]]
     six = ["L3", "L4_drift", "LV", "LVI", "L5", "L5VI"]
     for crop in ("apple", "pear"):
         for name, rungs in ((f"{crop}_test_pose", held_out), (f"{crop}_test_pose_c1", six)):
-            path = EVAL / "frozen" / f"{name}.yaml"
-            cfg = load_yaml_model(path, EvalAppConfig)
-            check_test_request(cfg, config_path=path, sets=[], runs=[], files=_files(), grid=None, ladder=ladder,
-                               repo=ROOT, code=clean)
+            cfg = load_yaml_model(EVAL / "frozen" / f"{name}.yaml", EvalAppConfig)
             check_test_pose_rungs(cfg, {n: (n, rung_config(cfg, ladder, n)) for n in rungs}, ladder)
         cfg = load_yaml_model(EVAL / "frozen" / f"{crop}_test_pose.yaml", EvalAppConfig)
         for grid in TEST_GRIDS:
@@ -148,3 +145,16 @@ def test_frozen_pose_test_requests_pass_the_rung_checks():
             cells = sweep_cells(cfg, load_grid(POSE / f"{grid}.yaml"), ladder)
             with pytest.raises(ProtectionError, match="that axis runs on val only|runs on val only"):
                 check_test_pose_rungs(cfg, {f"{c.point.name} @ {c.base}": (c.base, c.cfg) for c in cells}, ladder)
+
+
+def test_earlier_held_out_requests_are_closed():
+    ladder = load_ladder(LADDER_PATH)
+    clean = {"commit": "c" * 40, "dirty": False, "diff_sha256": None}
+    phrase = "split=test: --splits lists held-out seeds that are closed for good: [1003, 1004, 1005]"
+    for crop in ("apple", "pear"):
+        for name in (f"{crop}_test_pose", f"{crop}_test_pose_c1"):
+            path = EVAL / "frozen" / f"{name}.yaml"
+            cfg = load_yaml_model(path, EvalAppConfig)
+            with pytest.raises(ProtectionError, match=re.escape(phrase)):
+                check_test_request(cfg, config_path=path, sets=[], runs=[], files=_files(), grid=None, ladder=ladder,
+                                   repo=ROOT, code=clean)

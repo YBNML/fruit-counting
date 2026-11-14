@@ -6,8 +6,12 @@ than following each other, so `L3→L5` is the detector's share. The report-only
 and `L5→L5_L4base` come last. `path_pairs` is the part of those pairs that leads to `L5`; its
 rows add up to `L5`'s error minus the first rung's.
 
-A ladder with a pose rung (`POSE_ONLY_RUNGS`) takes instead the `POSE_PAIRS` whose two rungs both
-ran (`ladder_pairs`).
+A ladder with a pose rung (`POSE_ONLY_RUNGS`: a rung of `POSE_PAIRS` other than the `SHARED_RUNGS`, which a
+ladder without pose rungs has too) takes instead the `POSE_PAIRS` whose two rungs both ran (`ladder_pairs`). The
+pose ladder's pairs come first, then those of the LiDAR depth ladder: each camera-only rung to its LiDAR depth
+rung (`_ld`), the depth unit to the navigation unit (`_ldn`), `L3→L3_ld`, `LVI_ld→L5VI_ld`, the pairing on the
+labels to the pairing on the points (`L4_drift_ld_orc→L4_drift_ld`), the true detection or VO depth to the
+camera's (`LVI_ddd→LVI`, `LVI_ddv→LVI`) and `L3_dd→L3`.
 
 `budget_rows` gives one row per pair and bundle, then a `pooled` row over the bundles. A row's
 `d_e` is the change of (U - G) / G between the two rungs, and each ledger term of `TERMS` is its
@@ -29,13 +33,18 @@ from counting.evaluation.verdict import JUDGED_PITCHES, pool_rung
 
 # Rungs that branch off L3 instead of following each other on the main chain.
 BRANCH_RUNGS = ("L4_base", "L5")
-# The (from, to) rung pairs of a ladder with pose rungs, in table order.
+# The (from, to) rung pairs of a ladder with pose rungs, in table order: the pose ladder's, then the LiDAR depth's.
 POSE_PAIRS = (("L3", "L4_drift"), ("L3", "LVI"), ("L5", "L5VI"), ("LVI", "L5VI"), ("L4_drift_noimu", "L4_drift"),
               ("LV", "LVI"), ("LV_ref", "LV"), ("L4_drift_know", "L4_drift"), ("L4_drift_noal", "L4_drift"),
               ("LVI_first", "LVI"), ("LVI_fits", "LVI"), ("L4_drift_c1x", "L4_drift"), ("LVI_c1x", "LVI"),
-              ("LVI_dd", "LVI"), ("L3", "L3_al"))
+              ("LVI_dd", "LVI"), ("L3", "L3_al"),
+              ("L4_drift", "L4_drift_ld"), ("LVI", "LVI_ld"), ("L5VI", "L5VI_ld"), ("L4_drift_ld", "L4_drift_ldn"),
+              ("LVI_ld", "LVI_ldn"), ("L3", "L3_ld"), ("LVI_ld", "L5VI_ld"), ("L4_drift_ld_orc", "L4_drift_ld"),
+              ("LVI_ddd", "LVI"), ("LVI_ddv", "LVI"), ("L3_dd", "L3"))
+# The rungs of `POSE_PAIRS` that a ladder without pose rungs has too.
+SHARED_RUNGS = frozenset({"L3", "L5", "L3_dd"})
 # The rungs that only a pose ladder has; any of them in a ladder's rungs selects `POSE_PAIRS`.
-POSE_ONLY_RUNGS = frozenset(n for pair in POSE_PAIRS for n in pair) - {"L3", "L5"}
+POSE_ONLY_RUNGS = frozenset(n for pair in POSE_PAIRS for n in pair) - SHARED_RUNGS
 # The ledger terms of a budget row; `n_pred - n_truth` is their sum with `_SIGN`.
 TERMS = ("fp_bg", "fp_off", "boundary", "dup_track", "dup_cross", "miss_det", "miss_drop", "miss_merge")
 _SIGN = {t: -1 if t.startswith("miss_") else 1 for t in TERMS}

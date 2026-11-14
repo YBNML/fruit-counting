@@ -35,10 +35,10 @@ be built from `results.json` alone without rereading the bundles. The y1 rows of
 `judged_y1`) and name the pitches. For a noisy rung these are the seed means of each seed's
 judged-pitch pool, and the spread is over those pools.
 
-`PITCH_JUDGED_RUNGS` are rungs L5 and L5VI. A rung L5 row names every `JUDGED_PITCHES[crop]`
-pitch; a rung L5VI row names only those its passes ran (the pitches of every bundle's
-`y1.passes`), and `[]` when it ran none of them (a camera configuration without a judged pitch),
-its value and `ok` then being None.
+`PITCH_JUDGED_RUNGS` are rungs L5, L5VI and L5VI_ld (L5VI with the LiDAR box depth). `judged_pitches`
+gives the pitches a row names: every `JUDGED_PITCHES[crop]` pitch for rung L5; for the `RAN_PITCH_RUNGS`
+L5VI and L5VI_ld only those their passes ran (the pitches of every bundle's `y1.passes`), and `[]` when
+they ran none of them (a camera configuration without a judged pitch), the value and `ok` then being None.
 
 A pose criteria table names its judged camera configuration (`judged_config`). When the base
 config's camera configuration (`ladder_verdicts`' `config_label`, from `pose.config_label`) is
@@ -69,7 +69,9 @@ POOLED_KEYS = {
 # The camera pitches (deg) of the passes and detection groups judged on a learned detector, per crop.
 JUDGED_PITCHES = {"pear": (45.0, 70.0), "apple": (30.0, 50.0)}
 # Rungs whose y1 is judged on the `JUDGED_PITCHES` passes alone; the other pitches are report-only there.
-PITCH_JUDGED_RUNGS = ("L5", "L5VI")
+PITCH_JUDGED_RUNGS = ("L5", "L5VI", "L5VI_ld")
+# The `PITCH_JUDGED_RUNGS` rungs whose rows name only the judged pitches their passes ran (`judged_pitches`).
+RAN_PITCH_RUNGS = ("L5VI", "L5VI_ld")
 
 _LEDGER_FIELDS = tuple(f.name for f in fields(Ledger))
 
@@ -137,6 +139,17 @@ def judged_y1(item: Mapping, crop: str) -> dict:
     return pool_views([{"y1": item["y1"], "y6": None}], JUDGED_PITCHES[crop])["y1"]
 
 
+def judged_pitches(rung_name: str, rungs: Sequence[Mapping], crop: str) -> list[float]:
+    """The pitches that the y1 rows of `PITCH_JUDGED_RUNGS` rung `rung_name` name, given that rung of every
+    bundle (`rungs`): for a `RAN_PITCH_RUNGS` rung, the `JUDGED_PITCHES[crop]` pitches its passes ran in some
+    bundle (ascending, `[]` when none); for any other rung, every `JUDGED_PITCHES[crop]` pitch."""
+    pitches = list(JUDGED_PITCHES[crop])
+    if rung_name in RAN_PITCH_RUNGS:
+        ran = {float(p["pitch"]) for r in rungs for p in r["y1"]["passes"]}
+        pitches = sorted(set(pitches) & ran)
+    return pitches
+
+
 def ladder_pooled(run_entries: Sequence[Mapping], crop: str | None = None) -> dict[str, dict]:
     """`{rung: pool_rung([every bundle's that rung])}`, in the first bundle's rung order.
 
@@ -192,9 +205,9 @@ def ladder_verdicts(
 
     The y1 rows of a `PITCH_JUDGED_RUNGS` rung are judged on the `JUDGED_PITCHES[crop]` passes
     alone (pooled: `pooled[rung]["y1_judged"]`, from `ladder_pooled(..., crop=crop)`; per scene:
-    `judged_y1`) and carry `"pitches"`; without such a pass, their values and `ok` are None. Rung L5's
-    `"pitches"` is `JUDGED_PITCHES[crop]`; rung L5VI's keeps only the pitches its passes ran in some
-    bundle (ascending, `[]` when none).
+    `judged_y1`) and carry `"pitches"` (`judged_pitches`: rung L5's is `JUDGED_PITCHES[crop]`; a
+    `RAN_PITCH_RUNGS` rung's keeps only the pitches its passes ran in some bundle, ascending, `[]` when
+    none); without such a pass, their values and `ok` are None.
 
     With `criteria["judged_config"]` set and `config_label` a name that differs from it, every row
     also gets `"report_config": config_label` (its `ok` as computed); otherwise no row has the key.
@@ -217,10 +230,7 @@ def ladder_verdicts(
                 pooled_vals, scene_vals = pooled[rung_name]["y1_judged"], [judged_y1(r, crop) for r in rungs]
                 spreads = [_range([judged_y1(v, crop) for v in r["per_seed"]]) if r.get("noisy") else None
                            for r in rungs]
-                pitches = list(JUDGED_PITCHES[crop])
-                if rung_name == "L5VI":
-                    ran = {float(p["pitch"]) for r in rungs for p in r["y1"]["passes"]}
-                    pitches = sorted(set(pitches) & ran)
+                pitches = judged_pitches(rung_name, rungs, crop)
             else:
                 pooled_vals, scene_vals = pooled[rung_name][kind], [r[kind][metrics_key] for r in rungs]
                 spreads = [r["spread"][kind][metrics_key] if r.get("noisy") else None for r in rungs]

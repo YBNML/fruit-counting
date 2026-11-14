@@ -29,7 +29,9 @@ true time, the drive's body must stay within `STANDSTILL_TOL_M` of its position 
 or the run stops with `ValueError`. Unset or 0 is no standstill.
 
 Extrinsic error. `imu_errors` draws the camera-to-IMU calibration error (noise step 11) the fusion
-believes: one for the reference camera under the rig, one per pass pitch without it.
+believes: one for the reference camera under the rig, one per pass pitch without it. Each comes from
+`imu_extr_error`, which a navigation-unit LiDAR depth also calls, fused or not, so the LiDAR and the fusion
+share one error.
 
 Floors. A start prior sigma is never below `START_SIGMA_FLOOR` and a bias prior sigma never below
 `BIAS_SIGMA_FLOOR`: a start error key that is unset or 0, or a noiseless IMU, would otherwise give a
@@ -98,14 +100,28 @@ def has_gtsam() -> bool:
     return importlib.util.find_spec("gtsam") is not None
 
 
+def imu_extr_error(cfg: EvalAppConfig, noise_seed: int | None, *, scene: int, pitch: float) -> np.ndarray | None:
+    """The camera-to-IMU calibration error `dX_imu` of the reference camera at `pitch`, with or without fusion.
+
+    Only with `noise_seed` and an `imu_extr_*` key set (0 included); otherwise None. It is
+    `seeded_rigid((cfg.seed, noise_seed, STEP_IMU_EXTR, scene, round(pitch * 1000)), imu_extr_trans_mm / 1000,
+    imu_extr_rot_deg)`, an unset key counting as 0. The caller picks the pitch: `pose.rig_ref` under the rig, the
+    pass pitch without it.
+    """
+    nz = cfg.noise
+    if noise_seed is None or all(getattr(nz, key) is None for key in _EXTR_KEYS):
+        return None
+    return seeded_rigid((cfg.seed, noise_seed, STEP_IMU_EXTR, scene, round(float(pitch) * 1000)),
+                        nz.factor("imu_extr_trans_mm") / 1000.0, nz.factor("imu_extr_rot_deg"))
+
+
 def imu_errors(cfg: EvalAppConfig, noise_seed: int | None, *, scene: int,
                pitches: Iterable[float]) -> dict[float, np.ndarray]:
     """The camera-to-IMU calibration error `dX_imu` of each reference camera, keyed by its pitch `float(q)`.
 
     Only with `pose.fuse=imu`, `noise_seed` and an `imu_extr_*` key set (0 included); otherwise `{}`. The
     reference camera is the one at `pose.rig_ref` under the rig and each distinct pitch q of `pitches` (the
-    caller's pass pitches) without it, and gets `seeded_rigid((cfg.seed, noise_seed, STEP_IMU_EXTR, scene,
-    round(q * 1000)), imu_extr_trans_mm / 1000, imu_extr_rot_deg)`, an unset key counting as 0.
+    caller's pass pitches) without it, and gets `imu_extr_error` at q.
     """
     pose, nz = cfg.pose, cfg.noise
     if (pose is None or pose.fuse != "imu" or noise_seed is None
@@ -116,8 +132,7 @@ def imu_errors(cfg: EvalAppConfig, noise_seed: int | None, *, scene: int,
         q = float(q)
         if any(abs(q - p) <= _PITCH_TOL for p in out):
             continue
-        out[q] = seeded_rigid((cfg.seed, noise_seed, STEP_IMU_EXTR, scene, round(q * 1000)),
-                              nz.factor("imu_extr_trans_mm") / 1000.0, nz.factor("imu_extr_rot_deg"))
+        out[q] = imu_extr_error(cfg, noise_seed, scene=scene, pitch=q)
     return out
 
 

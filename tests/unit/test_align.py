@@ -63,8 +63,9 @@ def test_alignment_settings_and_draw_steps(tmp_path):              # the configs
         with pytest.raises(ValidationError, match=re.escape(message)):
             fake_cfg(tmp_path, "apple", "pose.rig_ref=30", "align.mode=[tracks,row_plane]", *sets)
     steps = (noise_module.STEP_ALIGN, noise_module.STEP_ALIGN_THIN, noise_module.STEP_STRUCT)
+    depth_steps = ("STEP_LIDAR", "STEP_LIDAR_EXTR", "STEP_DEPTH_PERSIST", "STEP_DEPTH_SCALE")   # 18 to 21
     others = {getattr(noise_module, n) for n in dir(noise_module)
-              if n.startswith("STEP_") and n not in ("STEP_ALIGN", "STEP_ALIGN_THIN", "STEP_STRUCT")}
+              if n.startswith("STEP_") and n not in ("STEP_ALIGN", "STEP_ALIGN_THIN", "STEP_STRUCT", *depth_steps)}
     assert steps == (15, 16, 17) and max(others) == 14 and not others & set(steps)
 
 

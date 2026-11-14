@@ -131,3 +131,43 @@ def interpolate_pose(times: np.ndarray, poses: np.ndarray, t: float) -> np.ndarr
     out[:3, :3] = a[:3, :3] @ rigid(w * turn, np.zeros(3))[:3, :3]
     out[:3, 3] = (1.0 - w) * a[:3, 3] + w * b[:3, 3]
     return out
+
+
+def interpolate_poses(times: np.ndarray, poses: np.ndarray, t: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    """The rotations (M, 4) and positions (M, 3) at the times `t` (M) from `poses` (N x 4 x 4) at ascending `times`
+    (N), float64.
+
+    The rule of `interpolate_pose`: between two neighbouring frames the position is linear in time and the rotation
+    is the slerp of the two rotations. No 4 x 4 is built per time: a rotation is a unit quaternion in scipy's order
+    (x, y, z, w), and each time is worked out element by element, so it gets the same bytes whatever other times
+    share the call. Nothing is held at the ends: a time outside [times[0], times[-1]] raises `ValueError`.
+    """
+    times = np.asarray(times, dtype=np.float64)
+    poses = np.asarray(poses, dtype=np.float64)
+    t = np.asarray(t, dtype=np.float64).reshape(-1)
+    n = len(times)
+    if n == 0 or poses.shape != (n, 4, 4):
+        raise ValueError(f"interpolate_poses needs poses (N, 4, 4) at N >= 1 times; got {poses.shape} at {n}")
+    outside = ~((t >= times[0]) & (t <= times[-1]))
+    if outside.any():
+        raise ValueError(f"{int(outside.sum())} of {t.size} times are outside the frame times "
+                         f"[{times[0]!r}, {times[-1]!r}]")
+    frame_quat = Rotation.from_matrix(poses[:, :3, :3]).as_quat()
+    if n == 1:
+        return np.repeat(frame_quat, t.size, axis=0), np.repeat(poses[:, :3, 3], t.size, axis=0)
+    j = np.clip(np.searchsorted(times, t, side="right"), 1, n - 1)
+    a, b = j - 1, j
+    w = (t - times[a]) / (times[b] - times[a])
+    # The turn of each frame step, Log(R_a^T R_b), and the share w of it: Exp(w * turn) as a quaternion d.
+    turns = Rotation.from_matrix(np.einsum("nji,njk->nik", poses[:-1, :3, :3], poses[1:, :3, :3])).as_rotvec()
+    v = w[:, None] * turns[a]
+    angle = np.sqrt(v[:, 0] ** 2 + v[:, 1] ** 2 + v[:, 2] ** 2)
+    half = np.divide(np.sin(angle / 2.0), angle, out=np.full(t.size, 0.5), where=angle > 0)
+    dx, dy, dz, dw = v[:, 0] * half, v[:, 1] * half, v[:, 2] * half, np.cos(angle / 2.0)
+    qx, qy, qz, qw = frame_quat[a].T
+    quat = np.column_stack([qw * dx + qx * dw + qy * dz - qz * dy,      # q_a * d, the rotation R_a Exp(w * turn)
+                            qw * dy - qx * dz + qy * dw + qz * dx,
+                            qw * dz + qx * dy - qy * dx + qz * dw,
+                            qw * dw - qx * dx - qy * dy - qz * dz])
+    trans = (1.0 - w)[:, None] * poses[a, :3, 3] + w[:, None] * poses[b, :3, 3]
+    return quat, trans

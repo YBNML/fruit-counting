@@ -210,6 +210,20 @@ COMMITTED_HASHES = {"apple_dev": "38b74b45e42d9213", "pear_dev": "b85d292df18d82
                     "frozen/apple_test_oracle": "a5d60d44aaf799f2",
                     "frozen/pear_test_oracle": "7fcb765786bad4bb",
                     "frozen/apple_test_d1": "a78a8e26beafabb6", "frozen/pear_test_d1": "1c6708892241aec8"}
+COMMITTED_HASHES.update({
+    "frozen/apple_test_pose": "a28bf1f9b5f9e100",
+    "frozen/pear_test_pose": "9ab3b69b1578c8af",
+    "frozen/apple_test_pose_c1": "37f1e8cb03405363",
+    "frozen/pear_test_pose_c1": "115aec2e4d6177e3",
+    "apple_val_pose_c2": "68b3bcc78b0ad85d",
+    "apple_val_pose_c1": "110bec94fe8a3691",
+    "apple_val_pose_c3": "eeb99d76e51af7f3",
+    "apple_val_pose_c1v": "45e3875698ec57b1",
+    "pear_val_pose_c2": "49417084f2bdd78e",
+    "pear_val_pose_c1": "47f883f92ed67fc8",
+    "pear_val_pose_c3": "5f7cd87ec2149be6",
+    "pear_val_pose_c1v": "b200e8ecc5d32055",
+})
 
 
 def test_committed_config_hashes_unchanged():

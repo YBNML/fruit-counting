@@ -84,9 +84,90 @@ class DetectorConfig(BaseModel):
         return self.post if self.post is not None else CachePostConfig()
 
 
+# The depth methods of `lift.depth` that take a box depth from the LiDAR points.
+LIDAR_DEPTHS = ("lidar", "lidar_oracle")
+
+
+class LidarLiftConfig(BaseModel):
+    """How a box takes its depth from the LiDAR points (`lift.depth` lidar or lidar_oracle).
+
+    `match` picks the points of a box: `far` runs the far-cluster box depth on the sparse LiDAR depth image
+    (`far_min_frac`, `far_gap_m`), `gate` keeps the points of the centre rectangle of the box (side ratio
+    `box_frac`) within `gate_k` believed camera sigmas of the camera box depth, and `map` reads the map of the
+    pass's points. `window_s` is the half width (s) of the time window of points around the frame, or `pass` for
+    every point of the pass (`map` only). `combine` joins the LiDAR depth and the camera box depth: `replace`
+    takes the LiDAR depth, `ivw` weighs the two by their believed inverse variances; a box with fewer than
+    `min_points` points keeps the camera box depth. The believed sigmas are `belief_cam_rel` times the camera box
+    depth and `belief_range_m`, shrunk with the point count; they read no noise key.
+
+    Every knob has its start value; with the section set, all of them are in the dump and the config hash.
+    """
+
+    model_config = ConfigDict(extra="forbid", allow_inf_nan=False)
+    match: Literal["far", "gate", "map"] = "gate"
+    window_s: float | Literal["pass"] = 0.5
+    combine: Literal["replace", "ivw"] = "ivw"
+    min_points: int = Field(3, ge=1)
+    gate_k: float = Field(3.0, gt=0)
+    box_frac: float = Field(0.5, gt=0, le=1)
+    far_min_frac: float = Field(0.25, gt=0, le=1)
+    far_gap_m: float = Field(0.03, gt=0)
+    belief_cam_rel: float = Field(0.02, gt=0)
+    belief_range_m: float = Field(0.02, gt=0)
+
+    @field_validator("window_s")
+    @classmethod
+    def _check_window(cls, v: float | str) -> float | str:
+        if v != "pass" and not v > 0:
+            raise ValueError("lift.lidar.window_s must be > 0 or pass")
+        return v
+
+    @model_validator(mode="after")
+    def _check_pass_window(self) -> LidarLiftConfig:
+        if self.window_s == "pass" and self.match != "map":
+            raise ValueError("lift.lidar.window_s=pass needs lift.lidar.match=map")
+        return self
+
+
+class LidarFiles(BaseModel):
+    """A folder of LiDAR files of one simulated unit (`unit`: the depth unit or the navigation unit), the sha256
+    of the simulation config that made them, the simulator commits they came from, and the sha256 of each
+    bundle's `lidar.json` bytes, keyed by run."""
+
+    model_config = ConfigDict(extra="forbid")
+    dir: str
+    unit: Literal["depth", "nav"]
+    sim_config_sha256: str
+    sim_commits: list[str] = Field(min_length=1)
+    digests: dict[str, str] = Field(default_factory=dict)
+
+    @field_validator("sim_config_sha256")
+    @classmethod
+    def _check_config_digest(cls, v: str) -> str:
+        if not re.fullmatch(r"[0-9a-f]{64}", v):
+            raise ValueError("sim_config_sha256 must be a 64-character lowercase hex digest")
+        return v
+
+    @field_validator("sim_commits")
+    @classmethod
+    def _check_commits(cls, v: list[str]) -> list[str]:
+        for commit in v:
+            if not re.fullmatch(r"[0-9a-f]{40}", commit):
+                raise ValueError(f"sim_commits must hold 40-character lowercase hex commits, got {commit!r}")
+        return v
+
+    @field_validator("digests")
+    @classmethod
+    def _check_digest_format(cls, v: dict[str, str]) -> dict[str, str]:
+        for key, value in v.items():
+            if not re.fullmatch(r"[0-9a-f]{64}", value):
+                raise ValueError(f"digests[{key}] must be a 64-character lowercase hex digest")
+        return v
+
+
 class LiftConfig(BaseModel):
     model_config = ConfigDict(extra="forbid")
-    depth: Literal["det_depth", "box_median", "box_far"] = "box_median"
+    depth: Literal["det_depth", "box_median", "box_far", "lidar", "lidar_oracle"] = "box_median"
     # box_median only: side ratio of the centre rectangle of the box.
     box_frac: float = Field(default=0.5, gt=0, le=1)
     # box_far only (far_*): scale of the ellipse inscribed in the box, depth gap (m) that splits
@@ -97,10 +178,20 @@ class LiftConfig(BaseModel):
     center_offset_m: dict[Literal["fruit", "bag"], float] = Field(
         default_factory=lambda: {"fruit": 0.02, "bag": 0.03}
     )
+    # LiDAR box depth (`LIDAR_DEPTHS`): its knobs, the LiDAR file folders by name and the chosen one. A config
+    # with another depth method may hold them too. Unset, they stay out of the dump and the config hash.
+    lidar: LidarLiftConfig | None = Field(default=None, exclude_if=_unset)
+    lidar_files: dict[str, LidarFiles] | None = Field(default=None, exclude_if=_unset)
+    lidar_file: str | None = Field(default=None, exclude_if=_unset)
 
     def offset(self, label: int) -> float:
         key = "bag" if label == 1 else "fruit"
         return self.center_offset_m.get(key, 0.0)
+
+    def lidar_unit(self) -> str | None:
+        """The unit (`depth` or `nav`) of the chosen LiDAR file, or None without one."""
+        files = (self.lidar_files or {}).get(self.lidar_file) if self.lidar_file is not None else None
+        return None if files is None else files.unit
 
 
 # Pose-model noise keys of `noise`, in the order the reports list them. Drift keys shape the body odometry
@@ -117,6 +208,16 @@ POSE_NOISE_KEYS = DRIFT_KEYS + IMU_LEVEL_KEYS + IMU_BELIEF_KEYS + GPS_KEYS
 # The drift keys of the body odometry flow (walk, scale and heading rate). A file source reads its flow from the
 # pose file, so its config does not set them.
 FLOW_KEYS = ("drift_step_trans_mm", "drift_step_rot_deg", "drift_scale_sigma", "drift_rate_deg_per_m")
+# LiDAR noise keys of `noise` (range, range near the sensor, angle, dropout and bias), the camera-LiDAR extrinsic
+# keys of a depth-unit LiDAR, and the error form keys of the camera depth (persistent part, scale and proportional
+# bias).
+LIDAR_NOISE_KEYS = ("lidar_range_sigma_m", "lidar_range_sigma_near_m", "lidar_near_range_m", "lidar_ang_sigma_deg",
+                    "lidar_dropout", "lidar_range_bias_m")
+LIDAR_EXTR_KEYS = ("lidar_extr_trans_mm", "lidar_extr_rot_deg")
+DEPTH_FORM_KEYS = ("depth_persist_sigma", "depth_persist_len_m", "depth_scale_sigma", "depth_bias_rel")
+# The keys above whose size is noise (`NoiseConfig.is_zero`): all but the two lengths.
+DEPTH_NOISE_LEVEL_KEYS = tuple(key for key in LIDAR_NOISE_KEYS + LIDAR_EXTR_KEYS + DEPTH_FORM_KEYS
+                               if key not in ("lidar_near_range_m", "depth_persist_len_m"))
 
 
 def _factor() -> Any:
@@ -127,8 +228,9 @@ def _factor() -> Any:
 class NoiseConfig(BaseModel):
     """Pose and depth noise, and the noise seeds; factors must be finite.
 
-    The pose-model keys (`POSE_NOISE_KEYS`) are unset by default. A key set to 0 is present (it is in
-    `pose_keys`) but adds no noise (`is_zero` still holds).
+    The pose-model keys (`POSE_NOISE_KEYS`) and the LiDAR and depth error keys (`depth_keys`) are unset by
+    default. A key set to 0 is present (it is in `pose_keys` or `depth_keys`) but adds no noise (`is_zero` still
+    holds).
     """
 
     model_config = ConfigDict(extra="forbid", allow_inf_nan=False)
@@ -180,6 +282,25 @@ class NoiseConfig(BaseModel):
     gps_end_h_m: float | None = _factor()
     # Row-end GPS fixes (m): a fix at the first and the last frame of each flow; vertical sigma.
     gps_end_v_m: float | None = _factor()
+    # LiDAR range noise sigma (m); within lidar_near_range_m (m) of the sensor, lidar_range_sigma_near_m (m).
+    lidar_range_sigma_m: float | None = Field(default=None, ge=0, exclude_if=_unset)
+    lidar_range_sigma_near_m: float | None = Field(default=None, ge=0, exclude_if=_unset)
+    lidar_near_range_m: float | None = Field(default=None, gt=0, exclude_if=_unset)
+    # LiDAR beam angle noise sigma per axis (deg) and the share of points dropped.
+    lidar_ang_sigma_deg: float | None = Field(default=None, ge=0, exclude_if=_unset)
+    lidar_dropout: float | None = Field(default=None, ge=0, le=1, exclude_if=_unset)
+    # LiDAR range bias (m, any sign).
+    lidar_range_bias_m: float | None = Field(default=None, exclude_if=_unset)
+    # Camera-LiDAR extrinsic error of a depth-unit LiDAR (mm, deg), drawn apart from the camera-IMU one.
+    lidar_extr_trans_mm: float | None = _factor()
+    lidar_extr_rot_deg: float | None = _factor()
+    # Persistent part of the camera depth error: relative sigma and its correlation length along the pass (m).
+    depth_persist_sigma: float | None = Field(default=None, ge=0, exclude_if=_unset)
+    depth_persist_len_m: float | None = Field(default=None, gt=0, exclude_if=_unset)
+    # Depth scale error of each camera and pass (ratio).
+    depth_scale_sigma: float | None = Field(default=None, ge=0, exclude_if=_unset)
+    # Depth bias proportional to the depth (ratio, any sign).
+    depth_bias_rel: float | None = Field(default=None, gt=-1, lt=1, exclude_if=_unset)
 
     @field_validator("seeds")
     @classmethod
@@ -196,16 +317,22 @@ class NoiseConfig(BaseModel):
             and self.depth_rel_sigma == 0
             and self.depth_dropout == 0
             and all(self.factor(key) == 0 for key in POSE_NOISE_KEYS)
+            and all(abs(self.factor(key)) == 0 for key in DEPTH_NOISE_LEVEL_KEYS)
         )
 
     def factor(self, name: str) -> float:
-        """The value of noise factor `name`; 0.0 for an unset pose-model key."""
+        """The value of noise factor `name`; 0.0 for an unset pose-model, LiDAR or depth error key."""
         value = getattr(self, name)
         return 0.0 if value is None else value
 
     def pose_keys(self) -> list[str]:
         """The pose-model noise keys that are set (a key set to 0 included), in `POSE_NOISE_KEYS` order."""
         return [key for key in POSE_NOISE_KEYS if getattr(self, key) is not None]
+
+    def depth_keys(self) -> list[str]:
+        """The LiDAR noise, LiDAR extrinsic and depth error form keys that are set (a key set to 0 included), in
+        `LIDAR_NOISE_KEYS`, `LIDAR_EXTR_KEYS` then `DEPTH_FORM_KEYS` order."""
+        return [key for key in LIDAR_NOISE_KEYS + LIDAR_EXTR_KEYS + DEPTH_FORM_KEYS if getattr(self, key) is not None]
 
 
 class PoseFiles(BaseModel):
@@ -366,6 +493,57 @@ class DedupConfig(BaseModel):
     band_m: float = Field(default=0.10, ge=0)
 
 
+# Held-out seeds already judged: no split=test request may list them again, and no other split may hold them.
+CLOSED_TEST_SEEDS: frozenset[int] = frozenset(range(1000, 1006))
+# The first held-out seed: a splits file lists every seed from it up under test only, so no other split (dev, val,
+# exp or train) scores a held-out bundle, judged or not.
+HELD_OUT_FIRST_SEED = 1000
+# The held-out seeds of the frozen configs written before the protect section. The same seeds as the closed ones,
+# kept apart because the two mean different things: a frozen config needs a protect section for any other seed.
+LEGACY_TEST_SEEDS: frozenset[int] = frozenset(range(1000, 1006))
+
+
+def _check_sha256(value: str, what: str) -> str:
+    if not re.fullmatch(r"[0-9a-f]{64}", value):
+        raise ValueError(f"{what} must be a 64-character lowercase hex digest")
+    return value
+
+
+class PinnedPath(BaseModel):
+    """A file of the counting repository (`path`, relative to it) and the sha256 of its bytes."""
+
+    model_config = ConfigDict(extra="forbid")
+    path: str
+    sha256: str
+
+    @field_validator("sha256")
+    @classmethod
+    def _check_digest(cls, v: str) -> str:
+        return _check_sha256(v, "sha256")
+
+
+class ProtectConfig(BaseModel):
+    """The held-out requests a frozen config may serve: its ladder, splits and criteria files with their sha256,
+    the output folder it writes into, the judged rungs, each allowed `--rungs` list (in order) and each allowed
+    grid (repository path -> sha256). Only the field shapes are checked here; the request checks hold the rules."""
+
+    model_config = ConfigDict(extra="forbid")
+    ladder: PinnedPath
+    splits: PinnedPath
+    criteria: PinnedPath
+    output_dir: str
+    judged: list[str] = Field(min_length=1)
+    ladders: list[list[str]] = Field(min_length=1)
+    grids: dict[str, str] = Field(default_factory=dict)
+
+    @field_validator("grids")
+    @classmethod
+    def _check_grid_digests(cls, v: dict[str, str]) -> dict[str, str]:
+        for path, digest in v.items():
+            _check_sha256(digest, f"grids[{path}]")
+        return v
+
+
 class EvalAppConfig(BaseModel):
     model_config = ConfigDict(extra="forbid")
     run_name: str
@@ -389,6 +567,8 @@ class EvalAppConfig(BaseModel):
     output_dir: str = "runs/eval"
     # Pass subsets (names from the pass-subset table) whose rung L5 row is judged too; read by eval ladder only.
     verdict_subsets: list[str] | None = Field(default=None, min_length=1, exclude_if=_unset)
+    # The held-out requests a frozen config serves; unset, it stays out of the dump and the config hash.
+    protect: ProtectConfig | None = Field(default=None, exclude_if=_unset)
 
     @model_validator(mode="after")
     def _check_stage_combinations(self) -> EvalAppConfig:
@@ -433,7 +613,15 @@ class EvalAppConfig(BaseModel):
         ):
             shown = "[" + ", ".join(f"{p:g}" for p in pitches) + "]"
             raise ValueError(f"pose.rig_ref={pose.rig_ref:g} is not one of passes.pitches {shown}")
-        if pose.fuse != "imu" and (key := first(IMU_LEVEL_KEYS + IMU_BELIEF_KEYS + GPS_KEYS)):
+        # A navigation-unit LiDAR holds the IMU, so its depth takes the camera-IMU extrinsic keys without fusion.
+        imu_extr = ("imu_extr_trans_mm", "imu_extr_rot_deg")
+        lidar_depth = self.lift.depth in LIDAR_DEPTHS
+        fused = IMU_LEVEL_KEYS + IMU_BELIEF_KEYS + GPS_KEYS
+        if lidar_depth and self.lift.lidar_unit() == "nav":
+            fused = tuple(key for key in fused if key not in imu_extr)
+        if pose.fuse != "imu" and (key := first(fused)):
+            if lidar_depth and key in imu_extr:
+                raise ValueError(f"noise.{key} needs pose.fuse=imu or a navigation-unit LiDAR depth")
             raise ValueError(f"noise.{key} needs pose.fuse=imu")
         if pose.source == "file" and (key := first(IMU_LEVEL_KEYS)):
             raise ValueError(f"noise.{key} needs pose.source=truth; a file source takes its IMU noise from the "
@@ -458,6 +646,36 @@ class EvalAppConfig(BaseModel):
         if pose.anchor == "first_truth" and (key := first(start_keys)):
             raise ValueError(f"noise.{key} is a start error of pose.anchor=nominal; pose.anchor=first_truth "
                              "starts at the truth")
+        return self
+
+    @model_validator(mode="after")
+    def _check_depth_settings(self) -> EvalAppConfig:
+        """Refuse LiDAR settings that contradict each other, and LiDAR or depth error keys a config would not use."""
+        lift, nz = self.lift, self.noise
+        lidar_depth = lift.depth in LIDAR_DEPTHS
+        if lift.lidar_file is not None and lift.lidar_files is None:
+            raise ValueError("lift.lidar_file needs lift.lidar_files")
+        if lift.lidar_file is not None and lift.lidar_file not in lift.lidar_files:
+            names = ", ".join(lift.lidar_files)
+            raise ValueError(f"lift.lidar_file={lift.lidar_file} is not one of lift.lidar_files [{names}]")
+        if lidar_depth and (lift.lidar is None or lift.lidar_files is None or lift.lidar_file is None):
+            raise ValueError(f"lift.depth={lift.depth} needs lift.lidar, lift.lidar_files and lift.lidar_file")
+        present = nz.depth_keys()
+
+        def first(keys: tuple[str, ...]) -> str | None:
+            return next((key for key in present if key in keys), None)
+
+        if not lidar_depth and (key := first(LIDAR_NOISE_KEYS + LIDAR_EXTR_KEYS)):
+            raise ValueError(f"noise.{key} needs lift.depth=lidar or lidar_oracle")
+        if lift.lidar_unit() != "depth" and (key := first(LIDAR_EXTR_KEYS)):
+            raise ValueError(f"noise.{key} needs a depth-unit LiDAR file (lift.lidar_file)")
+        for a, b in (("lidar_range_sigma_near_m", "lidar_near_range_m"),
+                     ("depth_persist_sigma", "depth_persist_len_m")):
+            if (a in present) != (b in present):
+                raise ValueError(f"noise.{a} and noise.{b} go together")
+        # A frame time offset would move the frame times that place the LiDAR points.
+        if lidar_depth and nz.drift_time_offset_s is not None:
+            raise ValueError(f"noise.drift_time_offset_s is not supported with lift.depth={lift.depth}")
         return self
 
     def is_noisy(self) -> bool:
@@ -485,6 +703,13 @@ class SplitsConfig(BaseModel):
                     seen[seed] = name
         if overlap:
             raise ValueError(f"splits overlap: {sorted(overlap)}")
+        closed = sorted(seed for seed, name in seen.items() if seed in CLOSED_TEST_SEEDS and name != "test")
+        if closed:
+            raise ValueError(f"seeds {closed} are closed for good and may only be listed under test")
+        held = sorted(seed for seed, name in seen.items() if seed >= HELD_OUT_FIRST_SEED and name != "test")
+        if held:
+            raise ValueError(f"seeds {held} are held out (every seed from {HELD_OUT_FIRST_SEED} up) and may only be "
+                             "listed under test")
         return self
 
     def split_of(self, seed: int) -> str | None:

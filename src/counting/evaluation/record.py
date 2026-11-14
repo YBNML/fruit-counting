@@ -104,7 +104,7 @@ def request_extra(
 def build_record(
     *, cfg: EvalAppConfig, runs: Sequence[dict], code: dict, timings: dict, started: str, finished: str,
     extra: dict | None = None, detector: dict | None = None, pose_caches: Sequence[dict] | None = None,
-    imu_files: Sequence[dict] | None = None, fusion: dict | None = None,
+    imu_files: Sequence[dict] | None = None, fusion: dict | None = None, lidar_files: Sequence[dict] | None = None,
 ) -> dict:
     """Assemble a `record.json` payload. Carries no machine name.
 
@@ -112,8 +112,9 @@ def build_record(
     default `detector` entry, which names `cfg.stages.det` and its noise. `pose_caches`
     (the CLI's list of the pose caches the results read) adds a `pose_caches` entry;
     without it the record has none. Likewise `imu_files` (the IMU files the results
-    read) adds an `imu_files` entry and `fusion` (the gtsam version, the CPU count and
-    the sha256 of each fixed fusion settings file the results ran with) a `fusion` entry.
+    read) adds an `imu_files` entry, `fusion` (the gtsam version, the CPU count and
+    the sha256 of each fixed fusion settings file the results ran with) a `fusion` entry
+    and `lidar_files` (the LiDAR files the results read) a `lidar_files` entry.
     """
     if detector is None:
         detector = {"name": cfg.stages.det,
@@ -137,4 +138,6 @@ def build_record(
         record["imu_files"] = list(imu_files)
     if fusion is not None:
         record["fusion"] = fusion
+    if lidar_files is not None:
+        record["lidar_files"] = list(lidar_files)
     return record
