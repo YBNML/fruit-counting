@@ -1,0 +1,47 @@
+# Depth ladder. rungs form the judgement chain; baselines are the camera-only pairs of the judged rungs, report rungs
+# and the structure rungs of the depth grids. A LiDAR depth rung (suffix _ld: the depth unit, _ldn: the navigation
+# unit) changes lift.depth and lift.lidar_file only; the LiDAR depth knobs (lift.lidar) and the pinned LiDAR files
+# (lift.lidar_files) come from the base config. The LiDAR noise blocks hold the values of the simulator's counting
+# contract, all six keys written out.
+noise_blocks:        # named noise values and odometry factor sigmas the rungs combine through YAML anchors; the runner does not read this key
+  vo: &vo {drift_scale_sigma: 0.0045, drift_rate_deg_per_m: 0.045, drift_step_trans_mm: 2.1, drift_step_rot_deg: 0.039}
+  start: &start {pass_side_trans_m: 0.05, pass_side_rot_deg: 0.5}
+  rig: &rig {rig_extr_trans_mm: 14.0, rig_extr_rot_deg: 0.4}
+  depth: &depth {depth_rel_sigma: 0.02, depth_dropout: 0.05}
+  imu: &imu {imu_gyro_n: 1.16e-3, imu_acc_n: 4.97e-3, imu_gyro_w: 1.82e-5, imu_acc_w: 4.75e-4, imu_gyro_b0_dps: 1.0, imu_acc_b0_mg: 4.0, imu_temp_k: 1.0}
+  imu_belief: &imu_belief {imu_time_offset_ms: 0.0, imu_extr_trans_mm: 10.0, imu_extr_rot_deg: 0.3}
+  sigma: &sigma {vo_sigma_trans_mm: 0.99, vo_sigma_rot_deg: 0.021}   # pose.vio of every rung that fuses a file pose source
+  lidar: &lidar {lidar_range_sigma_m: 0.02, lidar_range_sigma_near_m: 0.03, lidar_near_range_m: 1.0, lidar_ang_sigma_deg: 0.15, lidar_dropout: 0.05, lidar_range_bias_m: 0.0}
+  lidar_extr: &lidar_extr {lidar_extr_trans_mm: 10.0, lidar_extr_rot_deg: 0.3}   # the depth unit's own camera-LiDAR extrinsic error
+rungs:
+  L3:          {stages: &l3 {track: landmark, center: measured, assign: grid}, pose: {}}
+  L4_drift_ld: {stages: *l3, pose: &drift {rig: true, fuse: imu}, align: &al {mode: [tracks, row_plane]},
+                lift: &ld {depth: lidar, lidar_file: depth}, noise: &drift_ld {<<: [*vo, *start, *rig, *depth, *imu, *imu_belief, *lidar, *lidar_extr]}}
+  LVI_ld:      {stages: *l3, pose: &lvi {source: file, cache: vo, rig: true, fuse: imu, imu: imu_ext, vio: *sigma}, align: *al,
+                lift: *ld, noise: &lvi_ld {<<: [*start, *rig, *depth, *imu_belief, *lidar, *lidar_extr]}}
+  L5:          {stages: &l5 {det: cached, track: landmark, center: measured, assign: grid}, pose: {}}
+  L5VI_ld:     {stages: *l5, pose: *lvi, align: *al, lift: *ld, noise: *lvi_ld}
+baselines:
+  # the camera-only pairs of the judged rungs: the same rungs on the camera box depth of the base config
+  L4_drift:         {stages: *l3, pose: *drift, align: *al, noise: {<<: [*vo, *start, *rig, *depth, *imu, *imu_belief]}}
+  LVI:              {stages: *l3, pose: *lvi, align: *al, noise: &lvi_cam {<<: [*start, *rig, *depth, *imu_belief]}}
+  L5VI:             {stages: *l5, pose: *lvi, align: *al, noise: *lvi_cam}
+  # report rungs
+  L3_dd:            {stages: *l3, pose: {}, lift: {depth: det_depth}}                         # true box depth: the box choice share
+  L3_ld:            {stages: *l3, pose: {}, lift: *ld, noise: {<<: [*lidar, *lidar_extr]}}      # true poses: the LiDAR depth path alone
+  LVI_dd:           {stages: *l3, pose: &lvi_dd {source: file, cache: vo_dd, rig: true, fuse: imu, imu: imu_ext, vio: *sigma}, align: *al,
+                     noise: &lvi_exact {<<: [*start, *rig, *imu_belief]}}
+  LVI_ddd:          {stages: *l3, pose: *lvi, align: *al, noise: *lvi_exact}     # exact detection depth, odometry depth noise
+  LVI_ddv:          {stages: *l3, pose: *lvi_dd, align: *al, noise: *lvi_cam}    # exact odometry depth, detection depth noise
+  # truth-label pairing on the evaluation side: the points labelled with the detection's truth fruit, mixed returns of
+  # two surfaces left out; the pairing upper bound
+  L4_drift_ld_orc:  {stages: *l3, pose: *drift, align: *al, lift: {depth: lidar_oracle, lidar_file: depth}, noise: *drift_ld}
+  # the navigation unit in place of the depth unit; its extrinsic error is the camera-IMU one (imu_extr_* of imu_belief)
+  L4_drift_ldn:     {stages: *l3, pose: *drift, align: *al, lift: &ldn {depth: lidar, lidar_file: nav},
+                     noise: {<<: [*vo, *start, *rig, *depth, *imu, *imu_belief, *lidar]}}
+  LVI_ldn:          {stages: *l3, pose: *lvi, align: *al, lift: *ldn, noise: {<<: [*start, *rig, *depth, *imu_belief, *lidar]}}
+  # structure rungs of the depth grids: no camera noise (each grid's common block adds it)
+  B_drift:          {stages: *l3, pose: *drift, align: *al}
+  B_drift_ld:       {stages: *l3, pose: *drift, align: *al, lift: *ld}
+  B_drift_ld_noise: {stages: *l3, pose: *drift, align: *al, lift: *ld, noise: {<<: [*lidar, *lidar_extr]}}   # with the judged LiDAR noise
+val_only: []         # no rung of this ladder runs on val only

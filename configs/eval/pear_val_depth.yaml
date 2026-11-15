@@ -1,0 +1,46 @@
+# Base config of the depth ladder on val: the c2 pose config on the shaken val scenes (val seed 200; seed 201 runs
+# with --run), the LiDAR files of the depth unit and the navigation unit pinned by digest, the LiDAR depth knobs and
+# the judged configuration label c2l.
+run_name: pear_val_depth
+crop: pear
+split: val                 # tuning runs pick settings here; never a verdict
+tuning: true               # must be false for split=test
+runs: [~/datasets/orchard_synth/pear/val_s200_shake]
+truth: {variant: count1}
+passes: {pitches: [20, 70], sides: [A, B], step_m: null}
+stages: {det: oracle, track: landmark, center: measured, dedup: self_side, assign: grid}
+detector: {positives: count1, cache: runs/detect/88e8c93628216703, noise: null}
+lift:
+  depth: box_far
+  box_frac: 0.5
+  center_offset_m: {bag: 0.04}
+  lidar: {match: gate, window_s: 0.5, combine: ivw, min_points: 3, gate_k: 3.0, box_frac: 0.5, far_min_frac: 0.25, far_gap_m: 0.03, belief_cam_rel: 0.02, belief_range_m: 0.02}
+  lidar_files:
+    depth:
+      dir: ~/datasets/orchard_synth/pear/lidar/ab3576dcd4f1dcfd
+      unit: depth
+      sim_config_sha256: "ab3576dcd4f1dcfde7860df779b33e43ca8af837115428cea401a4cfb4f7eb39"
+      sim_commits: ["461664412594c5587b35ee8931f940a502ab31af"]
+      digests:
+        pear_s200_55c0ef00: "c11f874cc501b1685e9a28cb21bd8dc4fad95e43e5530e52b61716633b717efd"
+        pear_s201_11ab5d03: "906cb6360b77e451f919685c8351b50376a89d6281b6d660e04b3ca4d9fd23b4"
+    nav:
+      dir: ~/datasets/orchard_synth/pear/lidar/374e38b829225209
+      unit: nav
+      sim_config_sha256: "374e38b82922520925fee8af448065d5b4e83299b852726fc6e5d2478b1ca252"
+      sim_commits: ["461664412594c5587b35ee8931f940a502ab31af"]
+      digests:
+        pear_s200_55c0ef00: "4152f61e7b919c07541c6371162f94eae676092d3da0563ee8d8ffd33c801abb"
+        pear_s201_11ab5d03: "7e60ad6317a01c972e13e51951264171e48f16855ab8c5cdf634257b2b6cb877"
+noise: {pose_trans_sigma_m: 0, pose_rot_sigma_deg: 0, pass_bias_m: 0, depth_rel_sigma: 0, depth_dropout: 0, seeds: [0, 1, 2]}
+tracker: {predict: pose, gate_px_frac: 0.5, gate_m: 0.10, max_gap: null, repair_m: 0.18, min_obs: 1, score_hi: 0.9, score_lo: 0.1, min_obs_cached: 3, depth_gate: soft}
+dedup: {radius_m: 0.135, band_m: 0.10}
+pose:
+  rig_ref: 20
+  config_label: c2l
+  caches: {vo: {dir: runs/pose/a45a4d9dca516ca8}, vo_dd: {dir: runs/pose/510f2d4b21947576}}   # configs/pose/frozen/pear_vo.yaml and pear_vo_dd.yaml
+  imu_files: {imu_ext: {dir: runs/imu/682fc7ac53717171}}   # configs/pose/frozen/imu_ext.yaml, the judged IMU profile
+align: {mode: none, segment_m: 6.0, pair_radius_m: 0.5, min_pairs: 20, oracle_sigma_m: 0.02}   # knobs chosen on val; roll_pitch_sigma_deg unset: its start value
+seed: 0
+stop_after: y6
+output_dir: runs/eval_depth_val

@@ -1,0 +1,57 @@
+# Held-out run of the depth ladder for the judged configuration c2l; every setting was fixed on val. The protect section
+# pins the ladder, splits, criteria and grid files and the allowed requests; a held-out request is refused while a
+# cache or LiDAR file digest is missing.
+run_name: apple_test_depth
+crop: apple
+split: test                # held-out run; every setting below was fixed on val and is never tuned here
+tuning: false
+runs: [~/datasets/orchard_synth/apple/test_s1006_shake, ~/datasets/orchard_synth/apple/test_s1007_shake,
+       ~/datasets/orchard_synth/apple/test_s1008_shake]
+truth: {variant: count1}
+passes: {pitches: [10, 50], sides: [A, B], step_m: null}
+stages: {det: oracle, track: landmark, center: measured, dedup: hybrid, assign: grid}
+detector: {positives: count1, cache: runs/detect/88e8c93628216703, noise: null}
+lift:
+  depth: box_far
+  box_frac: 0.5
+  center_offset_m: {fruit: 0.02, bag: 0.03}
+  lidar: {match: gate, window_s: 0.5, combine: ivw, min_points: 3, gate_k: 3.0, box_frac: 0.5, far_min_frac: 0.25, far_gap_m: 0.03, belief_cam_rel: 0.02, belief_range_m: 0.02}
+  lidar_files:
+    depth:
+      dir: ~/datasets/orchard_synth/apple/lidar/ab3576dcd4f1dcfd
+      unit: depth
+      sim_config_sha256: "ab3576dcd4f1dcfde7860df779b33e43ca8af837115428cea401a4cfb4f7eb39"
+      sim_commits: ["461664412594c5587b35ee8931f940a502ab31af"]
+      digests: {}
+    nav:
+      dir: ~/datasets/orchard_synth/apple/lidar/374e38b829225209
+      unit: nav
+      sim_config_sha256: "374e38b82922520925fee8af448065d5b4e83299b852726fc6e5d2478b1ca252"
+      sim_commits: ["461664412594c5587b35ee8931f940a502ab31af"]
+      digests: {}
+noise: {pose_trans_sigma_m: 0, pose_rot_sigma_deg: 0, pass_bias_m: 0, depth_rel_sigma: 0, depth_dropout: 0, seeds: [0, 1, 2]}
+tracker: {predict: pose, gate_px_frac: 0.5, gate_m: 0.05, max_gap: null, repair_m: 0.08, min_obs: 1, score_hi: 0.6, score_lo: 0.2, min_obs_cached: 4, depth_gate: soft}
+dedup: {radius_m: 0.09, band_m: 0.05}
+pose:
+  rig_ref: 10
+  config_label: c2l
+  caches: {vo: {dir: runs/pose/b16b37e34b609dd2}, vo_dd: {dir: runs/pose/52ad7d4423dea8fb}}   # configs/pose/frozen/apple_vo.yaml and apple_vo_dd.yaml
+  imu_files: {imu_ext: {dir: runs/imu/682fc7ac53717171}}   # configs/pose/frozen/imu_ext.yaml, the judged IMU profile
+align: {mode: none, segment_m: 3.0, pair_radius_m: 0.5, roll_pitch_sigma_deg: 1.0, min_pairs: 20, oracle_sigma_m: 0.02}   # knobs chosen on val
+seed: 0
+stop_after: y6
+output_dir: runs/eval_depth
+protect:
+  ladder: {path: configs/eval/sweeps_depth/ladder_depth.yaml, sha256: "7345da190947ea327d189ad9a947ee7adc60dadbd8bda03f61d5984e446d2580"}
+  splits: {path: configs/eval/splits_depth.yaml, sha256: "139b6645ffa503e4430fbe18300e3328b73f4beb03cdbbf82c1e5fe734f88401"}
+  criteria: {path: configs/eval/criteria_depth.yaml, sha256: "6fbddc8f96c5a4e09a27d3c3fd9e196503b183a68c23130c7a08c8794c4b8530"}
+  output_dir: runs/eval_depth
+  judged: [L4_drift_ld, LVI_ld, L5VI_ld]   # the first one sets the values of the val-only axes
+  ladders:
+    - [L3, L5, L3_dd, L3_ld, L4_drift_ld, LVI_ld, L5VI_ld, L4_drift, LVI, L5VI, LVI_dd, LVI_ddd, LVI_ddv, L4_drift_ld_orc, L4_drift_ldn, LVI_ldn]
+  grids:
+    configs/eval/sweeps_depth/depth_cam.yaml: "81736430f174d22319ba828299e7d3f33444d073b840061060ebe91482dc502d"
+    configs/eval/sweeps_depth/depth_lidar.yaml: "c2465c0fed79bbd26a3bf4470c8cb14a027cf61d3679bbe1353db74a6e4e0986"
+    configs/eval/sweeps_depth/extr_ld.yaml: "49bc4e381fef17ddf93c4e4da0376a68f653f698b17c1697ce3f9d806845257a"
+    configs/eval/sweeps_depth/profiles_ld.yaml: "fca31abf1f0eaaf0690ec6d23dc9eab67d6258a9407608986ae5e30c5e8fef2c"
+    configs/eval/sweeps_depth/depth_forms.yaml: "b9c389170fbcd282db1a8b4e91da5c59d050d25b6a07fa5a83f049d436c312f7"
