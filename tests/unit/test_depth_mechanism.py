@@ -151,8 +151,8 @@ def test_unjoined_fragments_and_band_blocks():
     B, sb = _pass(side_b, 100, [[2.0, ROW_Y + 0.01, 1.5], [3.0, ROW_Y, 1.5], [4.0, ROW_Y + 0.01, 1.5]],
                   [[7], [9], [11]])      # fruit 9 is 0.10 m apart, beyond the radius; 10 and 11 are two fruit
     assert band_blocked_pairs([A, B], {**sa, **sb}, LAYOUT, BAND) == 1
-    A2, sa2 = _pass(PassKey(10.0, "A", 2), 200, [[2.0, ROW_Y + 0.01, 1.5]], [[7]])   # the same side: not counted
-    assert band_blocked_pairs([A, A2], {**sa, **sa2}, LAYOUT, BAND) == 0
+    same_side, src_same = _pass(PassKey(10.0, "A", 2), 200, [[2.0, ROW_Y + 0.01, 1.5]], [[7]])   # not counted
+    assert band_blocked_pairs([A, same_side], {**sa, **src_same}, LAYOUT, BAND) == 0
 
     passes, src = two_sides(ROW_Y + 0.07, ROW_Y + 0.01)     # the blocked pair, and a bridge on side A in the band
     bridge, src_bridge = _pass(PassKey(10.0, "A", 2), 200, [[2.0, ROW_Y + 0.03, 1.5]], [[7]])

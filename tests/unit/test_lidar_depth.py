@@ -244,6 +244,18 @@ def test_gate_falls_back_to_far_without_camera_depth():
     assert box_lidar_depth(boxes, z_cam, SMALL, cloud, _settings(match="far")).z.tobytes() == far.z.tobytes()
 
 
+def test_truth_label_pairing_keeps_the_points_on_the_image():
+    from counting.evaluation import lidarsource
+
+    X = np.array([[0.0, 0.0, 1.0], [0.01, 0.0, 1.1], [0.0, 0.01, 1.2], [-2.0, 0.0, 1.5], [0.0, 0.0, -1.0]])
+    cloud = PassCloud(t_ns=np.arange(5, dtype=np.int64), X_w=X, index=np.arange(5, dtype=np.int64))
+    labels = lidarsource.LidarLabels(side="A", fruit_id=np.full(5, 7, np.uint16), part=np.full(5, 3, np.uint8),
+                                     mixed=np.zeros(5, np.uint8))
+    got = lidarsource.oracle_box_depth(np.array([7]), SMALL, cloud, labels, _settings())
+    assert got.n_points.tolist() == [3] and got.members[0].tolist() == [0, 1, 2]   # row 3 off the image, 4 behind
+    assert got.z.tolist() == pytest.approx([1.1])
+
+
 def test_combine_replace_ivw_and_skip():
     z_cam = np.array([2.0, 2.0, np.nan, 2.0])
     lidar = BoxLidar(z=np.array([1.9, 1.9, 1.9, np.nan]), n_points=np.array([4, 2, 4, 0]),

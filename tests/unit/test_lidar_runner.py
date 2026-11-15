@@ -288,6 +288,15 @@ def test_trajectory_labels_and_noise_keys_do_not_reach_the_lidar_depth(case, mon
     assert members > 0
 
 
+def test_lidar_pairing_takes_the_camera_before_the_frame_pose_noise(case):
+    jitter = {"noise": {"pose_trans_sigma_m": 0.05, "pose_rot_sigma_deg": 1.0, "pass_bias_m": 0.05}}
+    a, b = case.evaluate(case.config(DRIFT_LD), 0), case.evaluate(case.config(DRIFT_LD, jitter), 0)
+    assert _without_rows(a) != _without_rows(b)              # the frame pose noise reaches the lift
+    for column in ("z_lidar", "n_points", "used_lidar", "z_used"):
+        assert np.asarray(getattr(a["depth_rows"], column)).tobytes() == \
+            np.asarray(getattr(b["depth_rows"], column)).tobytes(), column
+
+
 def _hand_rows() -> DepthRows:
     """Six detections: three counted truth-matched ones (LiDAR used, camera fallback, dropout), one off the counted
     row, and two counted ones without a truth match (LiDAR used, fallback)."""
@@ -629,6 +638,24 @@ def test_depth_forms_in_evaluate(case):
                            criteria=None).splitlines()
     assert [line for line in report if line.startswith("- LiDAR·깊이 오차 잡음:")] == \
         ["- LiDAR·깊이 오차 잡음: depth_bias_rel 0.01"]
+
+
+def test_persistent_depth_field_is_one_per_side(case):
+    from counting.evaluation import runner as runner_module
+
+    cfg, ctx = case.config(TRUE, {"noise": PERSIST}), case.ctx
+    camera_lift = cfg.lift.model_copy(update={"depth": "box_far"})
+    key = next(iter(ctx.passes))
+    f = ctx.passes[key][len(ctx.passes[key]) // 2]
+    clean = ctx.box_depth(f.idx, camera_lift)
+
+    def forms(k) -> bytes:
+        return runner_module._depth_forms(clean, clean, ctx._frame_of[f.idx], ctx.dets[f.idx], cfg, 0,
+                                          scene=case.run.meta.seed, key=k).tobytes()
+
+    pitch = next(k for k in ctx.passes if k.side == key.side and k.pitch_deg != key.pitch_deg)
+    side = next(k for k in ctx.passes if k.side != key.side)
+    assert forms(pitch) == forms(key) != forms(side)
 
 
 def test_lidar_files_join_the_fingerprint_and_record(case, tmp_path):

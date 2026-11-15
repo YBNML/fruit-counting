@@ -18,7 +18,7 @@ import os
 import subprocess
 import sys
 from dataclasses import dataclass
-from math import ceil, cos, floor, radians, sin, tan
+from math import ceil, cos, floor, radians, sin
 from pathlib import Path
 from typing import Iterable, Mapping, Sequence
 
@@ -112,6 +112,9 @@ def load_splits() -> SplitsConfig:
 # --- fake orchard_synth render bundle ------------------------------------------------------
 
 HFOV_DEG = 69.0
+# tan(radians(HFOV_DEG / 2)) as a fixed double: libm tan is not correctly rounded on every platform, and one ulp of
+# it moves a box edge that falls on a pixel boundary, and with it the bundle fingerprint.
+TAN_HALF_HFOV = 0.6872809586016132
 COUNT1 = {"visib_min": 0.25, "px_min": 20}
 SIDES = ("A", "B")
 _NEAR_M = 0.05
@@ -390,7 +393,7 @@ def write_run(
     dim = dict(dim or {})
     occlude = {int(oid): frozenset(int(i) for i in idxs) for oid, idxs in (occlude or {}).items()}
     width, height = size
-    fx = (width / 2) / tan(radians(HFOV_DEG / 2))
+    fx = (width / 2) / TAN_HALF_HFOV
     target_row = n_rows // 2
     row_ys = _r6(r * sc.row_spacing for r in range(n_rows))
     spec_trees, objects = _build_trees(sc, n_rows, trees_per_row)

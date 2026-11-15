@@ -4,6 +4,7 @@ the evaluation side, join the bundle fingerprint, and are checked against the ri
 import dataclasses
 import hashlib
 import json
+import math
 import shutil
 from pathlib import Path
 
@@ -56,6 +57,16 @@ def test_straight_bundles_keep_their_bytes(apple_run):
     run = SynthRun.open(apple_run)
     assert run.meta.run_id == "apple_s5_74edf9bb" and run.meta.shake is False and run.plans() is None
     assert run_fingerprint(apple_run) == run.meta.fingerprint
+
+
+def test_straight_bundle_bytes_do_not_follow_the_platform_tan(tmp_path, monkeypatch):
+    """The fake focal length is a fixed double, so a libm tan one ulp off leaves the bundle bytes as pinned."""
+    from tests.unit import synthfake
+
+    half = math.radians(synthfake.HFOV_DEG / 2)
+    assert abs(synthfake.TAN_HALF_HFOV - math.tan(half)) <= math.ulp(synthfake.TAN_HALF_HFOV)
+    monkeypatch.setattr(synthfake, "tan", lambda x: math.nextafter(math.tan(x), 0.0), raising=False)
+    assert run_fingerprint(write_run(tmp_path, crop="apple"))[:8] == "74edf9bb"
 
 
 def test_shake_bundle_opens_as_a_sequence(shake_run):

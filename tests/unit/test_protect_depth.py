@@ -54,6 +54,7 @@ UNITS = {"depth": ((0.0, 0.0, 0.1), "ab" * 32), "nav": ((0.0, 0.0, 0.5), "cd" * 
 # Files of the stand-in repository, by their repository paths.
 SPLITS = "configs/eval/splits_depth.yaml"
 SPLITS_B = "configs/eval/splits_depth_b.yaml"           # the same bytes at another path
+SPLITS_MIXED = "configs/eval/splits_depth_mixed.yaml"   # test seeds 1005 (closed for good) and 1006 (a new one)
 SPLITS_POSE = "configs/eval/splits_pose.yaml"
 SPLITS_FIRST = "configs/eval/splits.yaml"
 CRITERIA = "configs/eval/criteria_depth.yaml"
@@ -120,8 +121,9 @@ def _variant_rungs() -> dict:
     """More rungs on those of the small ladder. `lift_*` change one lift setting (`lift_det_depth` only the depth
     method); `ld_range0`, `ldn_ang0` and `orc_ang0` take the LiDAR depth (of the depth unit, of the navigation unit,
     of the truth-label pairing) with a LiDAR range or angle sigma of 0; `ld_range03` moves the LiDAR range sigma off
-    the files' contract, and `ld_no_bias` and `ld_no_dropout` leave out one LiDAR noise key. `B_drift_ld` is a grid
-    base on the LiDAR depth without any noise, whose grid adds the noise in its common block."""
+    the files' contract, and `ld_no_bias` and `ld_no_dropout` leave out one LiDAR noise key. `ld_extr12` and
+    `ldn_imu_rot04` move the extrinsic error off the contract, of the depth unit and of the navigation unit.
+    `B_drift_ld` is a grid base on the LiDAR depth without any noise, whose grid adds the noise in its common block."""
     small = _small_ladder()["rungs"]
     ld, ldn, orc = small["L4_drift_ld"], small["L4_drift_ldn"], small["L4_drift_ld_orc"]
     return {"B_drift_ld": {"pose": {"rig": True}, "lift": {"depth": "lidar"}},
@@ -135,6 +137,8 @@ def _variant_rungs() -> dict:
             "ldn_ang0": _merge(ldn, {"noise": {"lidar_ang_sigma_deg": 0.0}}),
             "orc_ang0": _merge(orc, {"noise": {"lidar_ang_sigma_deg": 0.0}}),
             "ld_range03": _merge(ld, {"noise": {"lidar_range_sigma_m": 0.03}}),
+            "ld_extr12": _merge(ld, {"noise": {"lidar_extr_trans_mm": 12.0}}),
+            "ldn_imu_rot04": _merge(ldn, {"noise": {"imu_extr_rot_deg": 0.4}}),
             "ld_no_bias": _without(ld, "lidar_range_bias_m"),
             "ld_no_dropout": _without(ld, "lidar_dropout")}
 
@@ -261,9 +265,10 @@ def depth_held(tmp_path_factory):
     of both units beside them) and the val bundle `val` (seed 200).
 
     `repo` commits copies of the depth, pose and first splits (and the depth splits again as `SPLITS_B`), of the
-    committed pose ladder and of the fixed fusion settings; the small ladder (`_small_ladder`, again as `LADDER_B`)
-    and its copy whose rung L3 widens `protect.ladders` (`LADDER_WIDE`); the criteria judging L4_drift_ld (again as
-    `CRITERIA_B`) and the criteria judging L4_drift (`CRITERIA_OTHER`); the grids `GRID` (on L4_drift_ld), `GRID_B`
+    committed pose ladder and of the fixed fusion settings; the splits `SPLITS_MIXED` (a closed seed and a new
+    held-out seed under test); the small ladder (`_small_ladder`, again as `LADDER_B`) and its copy whose rung L3
+    widens `protect.ladders` (`LADDER_WIDE`); the criteria judging L4_drift_ld (again as `CRITERIA_B`) and the
+    criteria judging L4_drift (`CRITERIA_OTHER`); the grids `GRID` (on L4_drift_ld), `GRID_B`
     and `GRID_L3` (on L3); a `.gitignore` that ignores `runs/`; and these configs. Under configs/eval/frozen/:
     `apple_test_depth` (`cfg`): the c2 dev
     pose config on the held-out bundles at 10 deg, one noise seed, `pose.config_label` c2l, both LiDAR file folders
@@ -309,6 +314,7 @@ def depth_held(tmp_path_factory):
     for rel in (SPLITS, SPLITS_POSE, SPLITS_FIRST, POSE_LADDER, FUSE_FIXED):
         put(rel, (ROOT / rel).read_text(encoding="utf-8"))
     put(SPLITS_B, (ROOT / SPLITS).read_text(encoding="utf-8"))
+    put(SPLITS_MIXED, yaml.safe_dump({"dev": [5], "val": [200], "test": [1005, 1006], "exp": [300], "train": [100]}))
     ladder = _small_ladder()
     for rel in (LADDER, LADDER_B):
         put(rel, yaml.safe_dump(ladder, sort_keys=False))     # rungs in the order written
@@ -468,7 +474,8 @@ def test_closed_seeds_are_listed_and_refused(depth_held, tmp_path):
     depth = load_yaml_model(ROOT / SPLITS, SplitsConfig)
     assert depth.test == list(TEST_SEEDS) and not set(depth.test) & CLOSED_TEST_SEEDS
     for cfg in (h.cfg, h.open_cfg):
-        for rel, seeds in ((SPLITS_FIRST, [1000, 1001, 1002]), (SPLITS_POSE, [1003, 1004, 1005])):
+        for rel, seeds in ((SPLITS_FIRST, [1000, 1001, 1002]), (SPLITS_POSE, [1003, 1004, 1005]),
+                           (SPLITS_MIXED, [1005])):     # refused for the closed seed before the protect section
             with pytest.raises(ProtectionError, match=re.escape(
                     f"split=test: --splits lists held-out seeds that are closed for good: {seeds}")):
                 _check(h, cfg, files={"--splits": h.repo / rel, "--criteria": h.repo / CRITERIA})
@@ -935,7 +942,9 @@ def test_judged_lidar_noise_matches_the_contract(depth_held, monkeypatch, reache
     variants = ["--config", frozen("apple_test_depth_variants"), "--ladder", LADDER_VARIANTS]
     off = "split=test: {}: noise.{} {} differs from the LiDAR contract value {}"
     for rung, key, value, contract in (("ld_range03", "lidar_range_sigma_m", 0.03, 0.02),
-                                       ("ld_no_dropout", "lidar_dropout", 0.0, 0.05)):    # unset: 0.0
+                                       ("ld_no_dropout", "lidar_dropout", 0.0, 0.05),    # unset: 0.0
+                                       ("ld_extr12", "lidar_extr_trans_mm", 12.0, 10.0),
+                                       ("ldn_imu_rot04", "imu_extr_rot_deg", 0.4, 0.3)):
         _late_refused(_invoke(h, monkeypatch, "ladder", *variants, "--rungs", rung),
                       off.format(rung, key, value, contract), reached)
     passing = [["ladder", *variants, "--rungs", "ld_no_bias"],           # unset: 0.0, the contract value

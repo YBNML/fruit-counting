@@ -60,7 +60,7 @@ from counting.geometry.lidarfile import (
 )
 from counting.geometry.noise import STEP_LIDAR, STEP_LIDAR_EXTR, lidar_point_noise, seeded_rigid
 from counting.geometry.rig import believed_extrinsic, pitch_extrinsic
-from counting.multiview.lidardepth import BoxLidar, LidarSettings, PassCloud
+from counting.multiview.lidardepth import BoxLidar, LidarSettings, PassCloud, _on_image
 
 LIDAR_LABELS_FORMAT = "orchard-lidar-labels/1"
 _LABEL_ARRAYS = {"fruit_id": (np.uint16, (-1,)), "part": (np.uint8, (-1,)), "mixed": (np.uint8, (-1,))}
@@ -310,22 +310,22 @@ def oracle_box_depth(ids: np.ndarray, camera: Camera, cloud: PassCloud, labels: 
     """The truth-label pairing of each detection: the LiDAR depth of the points of its truth fruit.
 
     `ids` (n,) are the truth fruit ids of the detections (-1 for none). The points of a detection are the points of
-    `cloud` in front of `camera` whose labels, read at the point's file row (`cloud.index`, so a dropped point
-    leaves the others' labels in place), give its fruit id, a fruit or bag part (`ORACLE_PARTS`) and a `mixed`
-    other than `ORACLE_MIXED_OUT`. Its depth is the median of their camera-plane depths, its count their number
-    and its members their file rows, ascending. A detection without a truth fruit, or without such a point, gets
-    NaN, 0 and no member. The pairing takes the place of the box match of `s.match` and reads none of the knobs of
-    `s`; `combine_depth` then joins its depths as it joins those of a box match.
+    `cloud` on the image of `camera` (in front of it and on a pixel inside the image, as the box matches take them)
+    whose labels, read at the point's file row (`cloud.index`, so a dropped point leaves the others' labels in
+    place), give its fruit id, a fruit or bag part (`ORACLE_PARTS`) and a `mixed` other than `ORACLE_MIXED_OUT`.
+    Its depth is the median of their camera-plane depths, its count their number and its members their file rows,
+    ascending. A detection without a truth fruit, or without such a point, gets NaN, 0 and no member. The pairing
+    takes the place of the box match of `s.match` and reads none of the knobs of `s`; `combine_depth` then joins its
+    depths as it joins those of a box match.
     """
     ids = np.asarray(ids, dtype=np.int64).reshape(-1)
     rows = np.asarray(cloud.index, dtype=np.int64)
     fruit = labels.fruit_id[rows].astype(np.int64)
     pos = np.flatnonzero(np.isin(labels.part[rows], ORACLE_PARTS) & (labels.mixed[rows] != ORACLE_MIXED_OUT)
                          & np.isin(fruit, ids[ids > 0]))
-    with np.errstate(divide="ignore", invalid="ignore"):
-        _, z = camera.project(cloud.X_w[pos])
-    front = z > 0
-    pos, z, fruit = pos[front], z[front], fruit[pos[front]]
+    img = _on_image(camera, cloud.X_w[pos])   # in front of the camera and on a pixel of the image, as a box match
+    pos, z = pos[img.pos], img.z
+    fruit = fruit[pos]
     depth = np.full(len(ids), np.nan)
     count = np.zeros(len(ids), dtype=np.int64)
     members = []
