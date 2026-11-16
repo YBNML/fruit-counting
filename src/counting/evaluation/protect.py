@@ -54,12 +54,14 @@ repository, not from the current directory. With the rung or sweep cell configs,
 `check_test_lift` refuses one that changes a lift setting other than the depth method and the LiDAR file
 (`LIDAR_LIFT_KEYS`), and `check_test_lidar_rungs` refuses one on a LiDAR box depth without LiDAR range and angle
 noise (except the cells of a grid's `baseline` point), and a judged rung that does not take the LiDAR depth of the
-depth unit with its extrinsic error. Right after `check_test_bundles`, `check_test_seed_set` needs the bundles to
-hold every test seed of the splits, so a request on part of them cannot run first. Last before scoring, a config
-with `lift.lidar_files` runs `check_test_lidar_files`: each pinned LiDAR file folder of each bundle is the pinned,
-judged one made from that bundle by a clean simulator commit the config expects, all of them share one simulator
-commit, and every requested ladder rung on the LiDAR depth sets the noise values of its files' contract. Its
-refusals, including the read and check errors of the LiDAR files, are all `ProtectionError`.
+depth unit with its extrinsic error, unless the criteria judge a camera configuration (`judges_lidar`) and the judged
+rung takes a camera box depth (`CAMERA_BOX_DEPTHS`); a judged rung on any other depth (a LiDAR box depth or
+det_depth) is held to that rule whatever the criteria. Right after `check_test_bundles`, `check_test_seed_set` needs
+the bundles to hold every test seed of the splits, so a request on part of them cannot run first. Last before
+scoring, a config with `lift.lidar_files` runs `check_test_lidar_files`: each pinned LiDAR file folder of each bundle
+is the pinned, judged one made from that bundle by a clean simulator commit the config expects, all of them share
+one simulator commit, and every requested ladder rung on the LiDAR depth sets the noise values of its files'
+contract. Its refusals, including the read and check errors of the LiDAR files, are all `ProtectionError`.
 
 Every split=test run that writes its results adds one row (`LOG_HEADER` columns) to the
 `test_log.csv` of its output folder (`held_out_output_root`) with `append_log_row`;
@@ -126,6 +128,12 @@ LIDAR_LIFT_KEYS = ("depth", "lidar_file")   # the lift settings a held-out rung 
 # The LiDAR noise a held-out rung on the LiDAR depth needs above 0: the range and the beam angle sigmas.
 LIDAR_SIGMA_KEYS = ("lidar_range_sigma_m", "lidar_ang_sigma_deg")
 LIDAR_VARIANT = "judged"   # the sidecar variant of the LiDAR files a held-out run reads
+# Camera configurations whose criteria judge a LiDAR box depth: their judged rungs need the depth unit's LiDAR depth.
+LIDAR_JUDGED_CONFIGS: frozenset[str] = frozenset({"c2l"})
+# The camera box depth methods: a judged rung on one of them may pass under criteria that judge a camera configuration
+# (`judges_lidar`); a judged rung on any other depth (a LiDAR box depth, or det_depth, which takes the truth depth)
+# keeps the LiDAR rule.
+CAMERA_BOX_DEPTHS = ("box_median", "box_far")
 
 
 @dataclass(frozen=True)
@@ -480,8 +488,21 @@ def check_test_lift(cfg: EvalAppConfig, configs: Mapping[str, EvalAppConfig]) ->
                                       f"change only {' and '.join(f'lift.{k}' for k in LIDAR_LIFT_KEYS)}")
 
 
+def judges_lidar(criteria: Mapping | None) -> bool:
+    """Whether `criteria` (a criteria table as read, or None) holds its judged rungs to the LiDAR depth.
+
+    Criteria naming a judged configuration (`judged_config`, a non-empty name) outside `LIDAR_JUDGED_CONFIGS` judge
+    a camera configuration and give False. Criteria without one, with an empty one or with one that is not a name
+    keep the LiDAR rule, as the verdict reads an empty judged configuration as none; so do no criteria and a table
+    that is not a mapping.
+    """
+    jc = criteria.get("judged_config") if isinstance(criteria, Mapping) else None
+    return not (isinstance(jc, str) and jc) or jc in LIDAR_JUDGED_CONFIGS
+
+
 def check_test_lidar_rungs(
-    cfg: EvalAppConfig, configs: Mapping[str, EvalAppConfig], *, baseline_cells: Collection[str] = ()
+    cfg: EvalAppConfig, configs: Mapping[str, EvalAppConfig], *, baseline_cells: Collection[str] = (),
+    lidar_judged: bool = True,
 ) -> None:
     """Refuse a split=test LiDAR rung or sweep cell without LiDAR noise, and a judged rung off the LiDAR depth.
 
@@ -491,6 +512,12 @@ def check_test_lidar_rungs(
     `lift.depth=lidar` (not the truth-label pairing), a depth-unit LiDAR file and each `LIDAR_EXTR_KEYS` extrinsic
     error above 0. The first broken rule is named. The rung configs keep the frozen protect section
     (`check_test_rung_protect` runs first), so the judged rungs are read from `cfg`.
+
+    The judged-rung rule has two branches. With `lidar_judged` False (the pinned criteria judge a camera
+    configuration: `judges_lidar`), a judged rung on a camera box depth (`CAMERA_BOX_DEPTHS`) passes it. A judged
+    rung on any other depth (a LiDAR box depth, or det_depth, which takes the truth depth) is held to it whatever
+    `lidar_judged` says, and so is a judged rung on a camera box depth when `lidar_judged` is True, the default:
+    a call that does not read the criteria keeps the LiDAR rule. The noise rule does not depend on `lidar_judged`.
 
     `baseline_cells` names the sweep cells of a grid's `baseline` point, which the noise rule skips: such a cell is
     the grid's base rung as the ladder writes it, which may be a structure rung without noise when the grid's
@@ -506,6 +533,8 @@ def check_test_lidar_rungs(
                                           f"{c.noise.factor(key)}; held-out LiDAR rungs need LiDAR range and angle "
                                           "noise above 0")
         if name not in judged:
+            continue
+        if c.lift.depth in CAMERA_BOX_DEPTHS and not lidar_judged:
             continue
         if c.lift.depth != "lidar":
             raise ProtectionError(f"split=test: judged rung {name} needs lift.depth=lidar, got {c.lift.depth}")

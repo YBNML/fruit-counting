@@ -7,7 +7,8 @@ the split pieces of a track inside one pass; `dedup` uses it to fuse tracks
 of all passes into landmarks. Its `hybrid` mode keeps tracks within `band_m`
 past the centre plane and joins tracks of different sides only when both lie
 inside the band, so band 0 equals `self_side` and an unbounded band equals
-`merge`.
+`merge`. `dedup` may also join cross-side pairs with one track outside the
+band when the two are mutually nearest (`join`).
 """
 
 from __future__ import annotations
@@ -150,6 +151,37 @@ def landmarks_from_groups(
     )
 
 
+JOIN_RULES = ("either_mutual",)   # cross-side join rules of `hybrid` beside the band rule (join=None)
+
+
+def mutual_cross_pairs(
+    X: np.ndarray, side: Sequence[str], near: Sequence[bool], radius_m: float
+) -> set[tuple[int, int]]:
+    """Item pairs `(a, b)`, a < b, that the `"either_mutual"` rule lets `hybrid` join across sides.
+
+    Of the pairs of different sides within `radius_m` that do not both lie
+    inside the band (`near`), those whose two items are each other's nearest
+    item of the other side, taken over all items with a finite point (the
+    entered tracks) and with no distance bound.
+    """
+    X = np.asarray(X, dtype=float).reshape(-1, 3)
+    ok = np.flatnonzero(np.isfinite(X).all(axis=1))
+    if len(ok) < 2:
+        return set()
+    pairs = ok[cKDTree(X[ok]).query_pairs(radius_m, output_type="ndarray")]   # a < b, original numbers
+    cross = [(int(a), int(b)) for a, b in pairs.tolist() if side[a] != side[b] and not (near[a] and near[b])]
+    nearest: dict[int, int] = {}   # item -> its nearest item of the other side
+    for s in ("A", "B"):
+        own = [i for i in ok if side[i] == s]
+        other = np.array([i for i in ok if side[i] != s], dtype=int)
+        if not own or not len(other):
+            continue
+        _, j = cKDTree(X[other]).query(X[own], k=1)
+        for i, jj in zip(own, np.atleast_1d(j)):
+            nearest[int(i)] = int(other[int(jj)])
+    return {(a, b) for a, b in cross if nearest.get(a) == b and nearest.get(b) == a}
+
+
 def dedup(
     passes: Sequence[PassTracks],
     keep: Sequence[np.ndarray],
@@ -157,6 +189,7 @@ def dedup(
     cfg: DedupConfig,
     *,
     mode: Literal["self_side", "merge", "hybrid"],
+    join: Literal["either_mutual"] | None = None,
 ) -> Landmarks:
     """Fuse the kept tracks of all passes into landmarks within `cfg.radius_m`.
 
@@ -166,7 +199,18 @@ def dedup(
     past the centre plane and joins tracks of different sides only when
     both lie inside the band (`|y - row_y| < cfg.band_m`), so band 0 equals
     `self_side` and an unbounded band equals `merge`.
+
+    `join` changes the cross-side rule of `hybrid` only: None keeps the band
+    rule; `"either_mutual"` also joins two tracks of different sides within
+    `cfg.radius_m` when not both lie inside the band, if each is the other's
+    nearest entered track of the other side (`mutual_cross_pairs`). With
+    2 * band_m > radius_m, two entered tracks of different sides within
+    radius_m always have one inside the band, except an aisle-A track
+    exactly on its bound `row_y - band_m`, which `side_filter` keeps and the
+    band test leaves out.
     """
+    if join is not None and join not in JOIN_RULES:
+        raise ValueError(f"unknown dedup join rule: {join!r}")
     if mode not in ("self_side", "merge", "hybrid"):
         raise ValueError(f"unknown dedup mode: {mode!r}")
     items: list[tuple[int, int]] = []   # (pass index, track number); position = cluster item number
@@ -180,7 +224,11 @@ def dedup(
         allow = lambda a, b: side[a] == side[b]
     elif mode == "hybrid":
         near = (np.abs(X[:, 1] - layout.row_y) < cfg.band_m).tolist()   # inside the band around the plane
-        allow = lambda a, b: side[a] == side[b] or (near[a] and near[b])
+        if join is None:
+            allow = lambda a, b: side[a] == side[b] or (near[a] and near[b])
+        else:                                                            # "either_mutual", counted once
+            mutual = mutual_cross_pairs(X, side, near, cfg.radius_m)
+            allow = lambda a, b: side[a] == side[b] or (near[a] and near[b]) or (min(a, b), max(a, b)) in mutual
     else:                                                                # merge: no side rule
         allow = None
     groups = cluster(X, [{i: passes[i].frames[t]} for i, t in items], cfg.radius_m, allow=allow)

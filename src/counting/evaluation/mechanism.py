@@ -1,8 +1,9 @@
 """Report-only counts of the tracker and dedup mechanisms, read against the truth (scoring side).
 
 `split_fragments` measures how far apart the tracks of one fruit stay in a pass after the in-pass repair,
-`band_blocked_pairs` counts the cross-side pairs of one fruit that the dedup band keeps apart, and `mechanism_entry`
-joins them with the tracker's `TrackTrace` counts into a result's `mechanism` entry. None of them changes a count.
+`band_blocked_pairs` counts the cross-side pairs of one fruit that the dedup band keeps apart (and, with a cross-side
+join rule, those of them the rule still leaves apart), and `mechanism_entry` joins them with the tracker's
+`TrackTrace` counts into a result's `mechanism` entry. None of them changes a count.
 """
 
 from __future__ import annotations
@@ -50,7 +51,7 @@ def split_fragments(tracks: Sequence[PassTracks], src: Mapping[int, np.ndarray])
 
 def band_blocked_pairs(
     tracks: Sequence[PassTracks], src: Mapping[int, np.ndarray], layout: OrchardLayout, cfg: DedupConfig, *,
-    keep: Sequence[np.ndarray] | None = None,
+    keep: Sequence[np.ndarray] | None = None, join: str | None = None,
 ) -> int:
     """The pairs of tracks from passes on different sides with the same majority source id and centres at most
     `cfg.radius_m` apart that the band keeps apart: one of the two or both lie outside the band
@@ -60,10 +61,12 @@ def band_blocked_pairs(
 
     A track counts when its `keep` entry is True (every track without `keep`), `side_filter` keeps it under the
     hybrid mode, its majority is not -1 and its centre is finite; these are the tracks the hybrid dedup takes.
+    With `join`, the same pairs that the dedup with that cross-side rule still leaves in different landmarks (the
+    result's `cross_pairs_apart`); the pairs counted are those the band rule keeps apart either way.
     """
     if keep is None:
         keep = [np.ones(len(tr.X), dtype=bool) for tr in tracks]
-    lm = dedup(tracks, keep, layout, cfg, mode="hybrid")
+    lm = dedup(tracks, keep, layout, cfg, mode="hybrid", join=join)
     pass_index = {tr.pass_key: i for i, tr in enumerate(tracks)}
     landmark_of = {(pass_index[k], t): u for u, m in enumerate(lm.members) for k, t in m}
     X, side, majority, landmark = [], [], [], []
@@ -86,13 +89,18 @@ def _percentile(values: np.ndarray, q: float) -> float | None:
     return float(np.percentile(values, q)) if len(values) else None
 
 
-def mechanism_entry(traces: Sequence[TrackTrace], fragments: np.ndarray, band_blocked: int | None) -> dict:
+def mechanism_entry(traces: Sequence[TrackTrace], fragments: np.ndarray, band_blocked: int | None, *,
+                    cross_pairs_apart: int | None = None) -> dict:
     """A result's `mechanism` entry: the summed `TrackTrace` counts of the passes, the count, median and 90th
     percentile (m) of the `split_fragments` distances (None without any) and the `band_blocked_pairs` count (None
-    where no hybrid dedup ran)."""
+    where no hybrid dedup ran). With `cross_pairs_apart` (the `band_blocked_pairs` count under the hybrid dedup's
+    cross-side join rule) the entry ends with that count too; without it the entry has the four keys alone."""
     fragments = np.asarray(fragments, dtype=float)
-    return {"soft_depth_pairs": sum(t.soft_depth_pairs for t in traces),
-            "births": {k: sum(t.births[k] for t in traces) for k in BIRTH_CAUSES},
-            "fragments": {"n": len(fragments), "p50_m": _percentile(fragments, 50),
-                          "p90_m": _percentile(fragments, 90)},
-            "band_blocked_pairs": band_blocked}
+    out = {"soft_depth_pairs": sum(t.soft_depth_pairs for t in traces),
+           "births": {k: sum(t.births[k] for t in traces) for k in BIRTH_CAUSES},
+           "fragments": {"n": len(fragments), "p50_m": _percentile(fragments, 50),
+                         "p90_m": _percentile(fragments, 90)},
+           "band_blocked_pairs": band_blocked}
+    if cross_pairs_apart is not None:
+        out["cross_pairs_apart"] = cross_pairs_apart
+    return out

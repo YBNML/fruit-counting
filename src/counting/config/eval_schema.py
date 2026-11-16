@@ -491,6 +491,21 @@ class DedupConfig(BaseModel):
     model_config = ConfigDict(extra="forbid")
     radius_m: float = Field(default=0.04, gt=0)
     band_m: float = Field(default=0.10, ge=0)
+    # The hybrid mode's cross-side join rule beside the band rule; unset, the band rule alone. Learned-detector runs
+    # (stages.det=cached) read band_join_cached alone and never take band_join.
+    band_join: Literal["either_mutual"] | None = Field(default=None, exclude_if=_unset)
+    band_join_cached: Literal["either_mutual"] | None = Field(default=None, exclude_if=_unset)
+
+    def band_join_for(self, det: str) -> str | None:
+        """The cross-side join rule a run with detections `det` takes: `band_join_cached` for `det == "cached"`,
+        else `band_join`.
+
+        Unlike `TrackerConfig.min_obs_for`, the cached key does not fall back: with `band_join_cached` unset, a
+        cached run takes no rule (None) whatever `band_join` holds.
+        """
+        if det == "cached":
+            return self.band_join_cached
+        return self.band_join
 
 
 # Held-out seeds already judged: no split=test request may list them again, and no other split may hold them.
@@ -587,6 +602,27 @@ class EvalAppConfig(BaseModel):
             raise ValueError("detector.digests needs detector.cache")
         if self.split == "test" and self.tuning:
             raise ValueError("split=test requires tuning=false")
+        return self
+
+    @model_validator(mode="after")
+    def _check_band_join(self) -> EvalAppConfig:
+        """Refuse a cross-side join rule (`dedup.band_join`, `dedup.band_join_cached`) the dedup cannot hold.
+
+        A rule needs stages.dedup=hybrid, or oracle, which reads no rule and so takes one. Under hybrid a rule also
+        needs 2 * dedup.band_m > dedup.radius_m, so that of two entered tracks of different sides within radius_m
+        one lies inside the band (but for an aisle-A track exactly on the band's bound, which the side filter keeps
+        and the band test leaves out).
+        """
+        mode, dd = self.stages.dedup, self.dedup
+        for key in ("band_join", "band_join_cached"):
+            value = getattr(dd, key)
+            if value is None:
+                continue
+            if mode not in ("hybrid", "oracle"):
+                raise ValueError(f"dedup.{key}={value} needs stages.dedup=hybrid or oracle, got stages.dedup={mode}")
+            if mode == "hybrid" and not 2 * dd.band_m > dd.radius_m:
+                raise ValueError(f"dedup.{key}={value} needs 2 * dedup.band_m > dedup.radius_m, got band_m "
+                                 f"{dd.band_m:g} and radius_m {dd.radius_m:g}")
         return self
 
     @model_validator(mode="after")

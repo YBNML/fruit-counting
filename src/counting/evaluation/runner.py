@@ -845,7 +845,9 @@ def evaluate(ctx: RunContext, cfg: EvalAppConfig, *, subsets: bool = False, nois
     `mechanism`, counts for the report only (`mechanism_entry`): the passes'
     `TrackTrace` counts, the `split_fragments` of the tracked passes (after the
     in-pass repair) and, when the hybrid dedup ran (`stages.dedup=hybrid`, Y6),
-    the `band_blocked_pairs` of the scored tracks it took (None otherwise).
+    the `band_blocked_pairs` of the scored tracks it took (None otherwise), and
+    with a join rule `cross_pairs_apart` (`band_blocked_pairs` under that rule,
+    `DedupConfig.band_join_for` of the run's detections).
     """
     check_pose_supported(cfg, protected=ctx.allow_test)
     _check_config(ctx, cfg, ctx.prepared.get("det_seed") if noise_seed is None else noise_seed)
@@ -909,12 +911,16 @@ def evaluate(ctx: RunContext, cfg: EvalAppConfig, *, subsets: bool = False, nois
         out["camera_depth_sha256"] = _camera_depth_sha256(cfg, noise_seed, rows)
         out["depth_rows"] = rows
         if st.track != "oracle":
-            blocked = None
+            blocked = apart = None
             if st.dedup == "hybrid" and y6 is not None:
-                blocked = band_blocked_pairs([s.tracks for s in stages], ctx.src, ctx.layout, cfg.dedup,
-                                             keep=[s.keep for s in stages])
+                tracks, keep = [s.tracks for s in stages], [s.keep for s in stages]
+                blocked = band_blocked_pairs(tracks, ctx.src, ctx.layout, cfg.dedup, keep=keep)
+                join = cfg.dedup.band_join_for(st.det)
+                if join is not None:
+                    apart = band_blocked_pairs(tracks, ctx.src, ctx.layout, cfg.dedup, keep=keep, join=join)
             out["mechanism"] = mechanism_entry([p.trace for p in staged],
-                                               split_fragments([p.tracks for p in staged], ctx.src), blocked)
+                                               split_fragments([p.tracks for p in staged], ctx.src), blocked,
+                                               cross_pairs_apart=apart)
     return out
 
 
@@ -960,6 +966,7 @@ def _y6(ctx: RunContext, cfg: EvalAppConfig, stages: Sequence[_PassStage], table
     """Dedup the kept tracks of `stages` into landmarks, attribute them to trees, and score the row.
 
     `tables` (keys `VARIANTS`) is the truth of the frames of `stages`' passes: `ctx.tables` for every pass.
+    The dedup takes the join rule of the run's detections (`DedupConfig.band_join_for`).
     """
     st, layout, truth = cfg.stages, ctx.layout, ctx.truth
     G, G_any = tables[cfg.truth.variant], tables["any"]
@@ -971,7 +978,8 @@ def _y6(ctx: RunContext, cfg: EvalAppConfig, stages: Sequence[_PassStage], table
     if st.dedup == "oracle":
         lm, mode = oracle_dedup(tracks_list, keep_list, maj_list), "oracle"
     else:
-        lm, mode = dedup(tracks_list, keep_list, layout, cfg.dedup, mode=st.dedup), st.dedup
+        lm = dedup(tracks_list, keep_list, layout, cfg.dedup, mode=st.dedup, join=cfg.dedup.band_join_for(st.det))
+        mode = st.dedup
     pass_index = {t.pass_key: i for i, t in enumerate(tracks_list)}
     members = [[(pass_index[k], t) for k, t in m] for m in lm.members]
     lm_obs = [tuple(o for i, t in m for o in obs_list[i][t]) for m in members]

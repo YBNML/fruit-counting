@@ -378,10 +378,11 @@ def _run_eval(
        `check_test_pose_rungs` on the requested rungs (and the 2 x 2 base rung), the sweep cells
        or, for `eval run`, the config, then, for a config with a protect section, `check_test_lift`
        and `check_test_lidar_rungs` on the rung or sweep cell configs (its noise rule skips the cells
-       of the grid's `baseline` point); then the pose settings the runner does not run
-       (`check_pose_supported`, without its split=test stops for a request that passed the
-       split=test checks) of the config, of every requested rung (and the 2 x 2 base rung) or of
-       every sweep cell;
+       of the grid's `baseline` point, and its judged-rung rule passes a judged rung on a camera box
+       depth only when the criteria judge a camera configuration: `judges_lidar`); then the pose
+       settings the runner does not run (`check_pose_supported`, without its split=test stops for a
+       request that passed the split=test checks) of the config, of every requested rung (and the
+       2 x 2 base rung) or of every sweep cell;
     5. open every bundle in `cfg.runs` (a sweep checks each one's frame selection, split=test
        runs `check_test_bundles`, with a protect section `check_test_seed_set`, with
        `detector.cache` `check_test_caches`, with a pose section `check_test_trajectories` and
@@ -431,7 +432,7 @@ def _run_eval(
         append_log_row, check_test_bundles, check_test_caches, check_test_frozen_request, check_test_lidar_files,
         check_test_lidar_rungs, check_test_lift, check_test_log, check_test_once, check_test_pose_caches,
         check_test_pose_rungs, check_test_request, check_test_rung_protect, check_test_rungs, check_test_seed_set,
-        check_test_trajectories, earlier_log_runs, held_out_output_root, repo_relative,
+        check_test_trajectories, earlier_log_runs, held_out_output_root, judges_lidar, repo_relative,
     )
     from counting.evaluation.record import build_record, counting_repo, experiment_id, git_state, request_extra
     from counting.evaluation.report import SCHEMA_VERSION, ReproducibilityError, write_experiment
@@ -522,7 +523,7 @@ def _run_eval(
                 check_test_pose_rungs(cfg, {name: (name, rung_config(cfg, ladder, name)) for name in names}, ladder)
                 if cfg.protect is not None:
                     check_test_lift(cfg, rung_cfgs)
-                    check_test_lidar_rungs(cfg, rung_cfgs)
+                    check_test_lidar_rungs(cfg, rung_cfgs, lidar_judged=judges_lidar(criteria))
                 lidar_rungs = rung_cfgs
         elif kind == "sweep":
             check_set_overlap([s.split("=", 1)[0] for s in (set_ or [])], points)
@@ -536,7 +537,8 @@ def _run_eval(
                 if cfg.protect is not None:
                     check_test_lift(cfg, cell_cfgs)
                     check_test_lidar_rungs(cfg, cell_cfgs, baseline_cells=[
-                        f"{c.point.name} @ {c.base}" for c in cells if c.point.name == "baseline"])
+                        f"{c.point.name} @ {c.base}" for c in cells if c.point.name == "baseline"],
+                        lidar_judged=judges_lidar(criteria))
                 # sweep cells are not held to the LiDAR contract: a grid moves the noise on purpose
         elif protected is not None:
             check_test_pose_rungs(cfg, {"run": (None, cfg)}, None)

@@ -167,8 +167,9 @@ def pose_settings(cfg: EvalAppConfig, noise_seed: int | None, *, planned: bool =
     without an align section, a list for listed methods), the tracker and dedup settings the pose
     errors meet, `cache`: the pose cache a file source read (None for a truth source), `imu`: the IMU
     streams a fused run read (`FusionInputs.imu`; None without them), `fusion`: the fusion it ran
-    (`fusion.fusion_entry`; None without fusion) and, last, `flow`: the optical-flow cache the tracker
-    prediction read (None without one)."""
+    (`fusion.fusion_entry`; None without fusion), `flow`: the optical-flow cache the tracker
+    prediction read (None without one), and `dedup_band_join`, the cross-side join rule the hybrid
+    dedup took (`DedupConfig.band_join_for`), only when there is one."""
     pose, align = cfg.pose, cfg.align
     drift = drift_active(cfg, noise_seed)
     start = None
@@ -181,11 +182,14 @@ def pose_settings(cfg: EvalAppConfig, noise_seed: int | None, *, planned: bool =
         mode: str | list[str] = "none"
     else:
         mode = list(align.mode) if isinstance(align.mode, list) else align.mode
-    return {"config": pose.config_label, "source": pose.source, "drift": drift, "anchor": pose.anchor,
-            "start": start, "rig": pose.rig, "rig_ref": pose.rig_ref, "fuse": pose.fuse, "align": mode,
-            "predict": cfg.tracker.predict, "predict_window": cfg.tracker.predict_window, "dedup": cfg.stages.dedup,
-            "dedup_radius_m": cfg.dedup.radius_m, "dedup_band_m": cfg.dedup.band_m,
-            "gate_px_frac": cfg.tracker.gate_px_frac, "cache": cache, "imu": imu, "fusion": fusion, "flow": None}
+    out = {"config": pose.config_label, "source": pose.source, "drift": drift, "anchor": pose.anchor,
+           "start": start, "rig": pose.rig, "rig_ref": pose.rig_ref, "fuse": pose.fuse, "align": mode,
+           "predict": cfg.tracker.predict, "predict_window": cfg.tracker.predict_window, "dedup": cfg.stages.dedup,
+           "dedup_radius_m": cfg.dedup.radius_m, "dedup_band_m": cfg.dedup.band_m,
+           "gate_px_frac": cfg.tracker.gate_px_frac, "cache": cache, "imu": imu, "fusion": fusion, "flow": None}
+    if cfg.stages.dedup == "hybrid" and (join := cfg.dedup.band_join_for(cfg.stages.det)) is not None:
+        out["dedup_band_join"] = join
+    return out
 
 
 def pose_cache_entry(cfg: EvalAppConfig, pose_file: PoseFile | None) -> dict | None:
