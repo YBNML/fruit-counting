@@ -15,6 +15,10 @@ detector:
   positives: count1
   cache: runs/detect/88e8c93628216703
   noise: null
+  digests:                 # one pinned detection cache digest per bundle
+    pear_s1006_9373990c: "91aaaeec522f64c160defa9657625bc7c62c7fb122aec45bad7877c57da71095"
+    pear_s1007_49e403db: "866be756aef0c8e0d74ad3aea654500a6fee0f37ab320f0a2172c005491859de"
+    pear_s1008_673e55e8: "b6a1d692d9f05f83cb585927c955f358bd85a99be1b57edbfb0386e325a475da"
 lift: {depth: box_far, box_frac: 0.5, center_offset_m: {bag: 0.04}}
 noise: {pose_trans_sigma_m: 0, pose_rot_sigma_deg: 0, pass_bias_m: 0, depth_rel_sigma: 0, depth_dropout: 0, seeds: [0, 1, 2]}
 tracker: {predict: pose, gate_px_frac: 0.5, gate_m: 0.10, max_gap: null, repair_m: 0.18, min_obs: 1, score_hi: 0.9, score_lo: 0.1, min_obs_cached: 3, depth_gate: soft}
@@ -25,11 +29,23 @@ pose:
   caches:                   # configs/pose/frozen/pear_vo.yaml and pear_vo_dd.yaml; one pinned pose cache digest per bundle
     vo:
       dir: runs/pose/a45a4d9dca516ca8
+      digests:
+        pear_s1006_9373990c: "8d5771fbff4c37fcecb90c25aa4e77ffd0784150eb375fe90d816a95af7832bf"
+        pear_s1007_49e403db: "8838a4c68b731ff4bbcccfbd24ffe1aa23a4c841472798319548562f6da6a772"
+        pear_s1008_673e55e8: "efaf9cae9c1a21588ae4093f7d2172947f056f9ea3ff8f47e4d8b5d9a05b6c11"
     vo_dd:
       dir: runs/pose/510f2d4b21947576
+      digests:
+        pear_s1006_9373990c: "b1bc0d7daeb3baa0dcc53531a2c9d7014e88126702d30fcafbce3efd9b9a6020"
+        pear_s1007_49e403db: "1fa7848e4f6266c0c109faca3c6f0cdd15aa3feb3736d921b23ae7fd2df3fc7c"
+        pear_s1008_673e55e8: "3339b72be10601535b6ad0c5b7e3588a91c9b2b18c2d696808fe0ea686a1a336"
   imu_files:                # configs/pose/frozen/imu_ext.yaml, the judged IMU profile only; one pinned IMU file digest per bundle
     imu_ext:
       dir: runs/imu/682fc7ac53717171
+      digests:
+        pear_s1006_9373990c: "aa0e2c8908943d939aa264e975adc0c27e9aa787c7c87726f9c5e367f4755214"
+        pear_s1007_49e403db: "3f67da9df9841eb9fb97c288c4b2c20777b872f27358491534535aa5aca54798"
+        pear_s1008_673e55e8: "783f3549cc8a5dc4fa124e9fb2b81ce6773d1ec9be2294ec78a366091b909991"
 align: {mode: none, segment_m: 6.0, pair_radius_m: 0.5, min_pairs: 20, oracle_sigma_m: 0.02}   # knobs chosen on val; roll_pitch_sigma_deg unset: its start value
 seed: 0
 stop_after: y6

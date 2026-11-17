@@ -15,6 +15,10 @@ detector:
   positives: count1
   cache: runs/detect/88e8c93628216703
   noise: null
+  digests:                 # one pinned detection cache digest per bundle
+    apple_s1006_95468d66: "92453329458dfc1910795c93059c2525ca20947d03d6325f08dbf92a61749692"
+    apple_s1007_42067b5d: "fa647119d382fced9f62adba7c2711d056d274a1d709e2e2d54a0de8f2654dda"
+    apple_s1008_92e79245: "8c97a96ce9abc772081265746d056af3de8399be1d25195d5f8086112d916858"
 lift: {depth: box_far, box_frac: 0.5, center_offset_m: {fruit: 0.02, bag: 0.03}}
 noise: {pose_trans_sigma_m: 0, pose_rot_sigma_deg: 0, pass_bias_m: 0, depth_rel_sigma: 0, depth_dropout: 0, seeds: [0, 1, 2]}
 tracker: {predict: pose, gate_px_frac: 0.5, gate_m: 0.05, max_gap: null, repair_m: 0.08, min_obs: 1, score_hi: 0.6, score_lo: 0.2, min_obs_cached: 4, depth_gate: soft}
@@ -25,11 +29,23 @@ pose:
   caches:                   # configs/pose/frozen/apple_vo.yaml and apple_vo_dd.yaml; one pinned pose cache digest per bundle
     vo:
       dir: runs/pose/b16b37e34b609dd2
+      digests:
+        apple_s1006_95468d66: "9aaef4fe161a79fa825b4a883a1b0568b294233263ef6dd9b8c872945fbb6b2b"
+        apple_s1007_42067b5d: "f941cffe5d3e8dc3d3ac97f4431821a652b51ba0617f322ba61374a3a78c3262"
+        apple_s1008_92e79245: "7eb1c56de7bb6a468ce25d85cbce5b46e846f3708f8797894953c5b9a74515c5"
     vo_dd:
       dir: runs/pose/52ad7d4423dea8fb
+      digests:
+        apple_s1006_95468d66: "827d73f841299912708126ab9e068e7331499d37d36834666e00366e2440f96f"
+        apple_s1007_42067b5d: "27d68dbf265fa574395b96b460e2e1771bf4df53b8e9d66a90b08f3b9cbe2049"
+        apple_s1008_92e79245: "fd18ce2a5dfc843b4e616b139d444bcf26d672c3410064d332536eef35b44894"
   imu_files:                # configs/pose/frozen/imu_ext.yaml, the judged IMU profile only; one pinned IMU file digest per bundle
     imu_ext:
       dir: runs/imu/682fc7ac53717171
+      digests:
+        apple_s1006_95468d66: "14340d1939dae09b3b1970b370875403d922bf60c23e6be8f94c16f54b3c144b"
+        apple_s1007_42067b5d: "c8fec84cd28a0e8000fdf8f4398f8b82d75bf9ac8148fb40c69b143c025ad77d"
+        apple_s1008_92e79245: "93f604f2a59ffcfe67921698104e062ee25a5908d8b8fba54a4311dd67a7b5cf"
 align: {mode: none, segment_m: 3.0, pair_radius_m: 0.5, roll_pitch_sigma_deg: 1.0, min_pairs: 20, oracle_sigma_m: 0.02}   # knobs chosen on val
 seed: 0
 stop_after: y6

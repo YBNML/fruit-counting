@@ -53,8 +53,34 @@ GRID_CELLS = 11
 # The content digests the frozen configs pin, per crop and bundle run id: detection caches (det), pose caches (vo,
 # vo_dd) and judged IMU files (imu_ext).
 DIGESTS = {
-    "apple": {"det": {}, "vo": {}, "vo_dd": {}, "imu_ext": {}},
-    "pear": {"det": {}, "vo": {}, "vo_dd": {}, "imu_ext": {}},
+    "apple": {
+        "det": {"apple_s1006_95468d66": "92453329458dfc1910795c93059c2525ca20947d03d6325f08dbf92a61749692",
+                "apple_s1007_42067b5d": "fa647119d382fced9f62adba7c2711d056d274a1d709e2e2d54a0de8f2654dda",
+                "apple_s1008_92e79245": "8c97a96ce9abc772081265746d056af3de8399be1d25195d5f8086112d916858"},
+        "vo": {"apple_s1006_95468d66": "9aaef4fe161a79fa825b4a883a1b0568b294233263ef6dd9b8c872945fbb6b2b",
+               "apple_s1007_42067b5d": "f941cffe5d3e8dc3d3ac97f4431821a652b51ba0617f322ba61374a3a78c3262",
+               "apple_s1008_92e79245": "7eb1c56de7bb6a468ce25d85cbce5b46e846f3708f8797894953c5b9a74515c5"},
+        "vo_dd": {"apple_s1006_95468d66": "827d73f841299912708126ab9e068e7331499d37d36834666e00366e2440f96f",
+                  "apple_s1007_42067b5d": "27d68dbf265fa574395b96b460e2e1771bf4df53b8e9d66a90b08f3b9cbe2049",
+                  "apple_s1008_92e79245": "fd18ce2a5dfc843b4e616b139d444bcf26d672c3410064d332536eef35b44894"},
+        "imu_ext": {"apple_s1006_95468d66": "14340d1939dae09b3b1970b370875403d922bf60c23e6be8f94c16f54b3c144b",
+                    "apple_s1007_42067b5d": "c8fec84cd28a0e8000fdf8f4398f8b82d75bf9ac8148fb40c69b143c025ad77d",
+                    "apple_s1008_92e79245": "93f604f2a59ffcfe67921698104e062ee25a5908d8b8fba54a4311dd67a7b5cf"},
+    },
+    "pear": {
+        "det": {"pear_s1006_9373990c": "91aaaeec522f64c160defa9657625bc7c62c7fb122aec45bad7877c57da71095",
+                "pear_s1007_49e403db": "866be756aef0c8e0d74ad3aea654500a6fee0f37ab320f0a2172c005491859de",
+                "pear_s1008_673e55e8": "b6a1d692d9f05f83cb585927c955f358bd85a99be1b57edbfb0386e325a475da"},
+        "vo": {"pear_s1006_9373990c": "8d5771fbff4c37fcecb90c25aa4e77ffd0784150eb375fe90d816a95af7832bf",
+               "pear_s1007_49e403db": "8838a4c68b731ff4bbcccfbd24ffe1aa23a4c841472798319548562f6da6a772",
+               "pear_s1008_673e55e8": "efaf9cae9c1a21588ae4093f7d2172947f056f9ea3ff8f47e4d8b5d9a05b6c11"},
+        "vo_dd": {"pear_s1006_9373990c": "b1bc0d7daeb3baa0dcc53531a2c9d7014e88126702d30fcafbce3efd9b9a6020",
+                  "pear_s1007_49e403db": "1fa7848e4f6266c0c109faca3c6f0cdd15aa3feb3736d921b23ae7fd2df3fc7c",
+                  "pear_s1008_673e55e8": "3339b72be10601535b6ad0c5b7e3588a91c9b2b18c2d696808fe0ea686a1a336"},
+        "imu_ext": {"pear_s1006_9373990c": "aa0e2c8908943d939aa264e975adc0c27e9aa787c7c87726f9c5e367f4755214",
+                    "pear_s1007_49e403db": "3f67da9df9841eb9fb97c288c4b2c20777b872f27358491534535aa5aca54798",
+                    "pear_s1008_673e55e8": "783f3549cc8a5dc4fa124e9fb2b81ce6773d1ec9be2294ec78a366091b909991"},
+    },
 }
 
 
