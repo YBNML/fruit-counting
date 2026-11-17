@@ -3,9 +3,9 @@ stay out of the dump and the config hash; a run takes the key of its detections,
 key alone; and the config check takes a rule only under a dedup mode that can hold it, with a band wider than half
 the radius under `hybrid`. Under the rule the hybrid dedup also joins two tracks of different sides within the radius,
 not both inside the band, when each is the other's nearest track across; the frame rule still holds, the other modes
-ignore the rule, and without it the dedup gives the band rule's landmarks byte for byte. A run's dedup takes the rule of
-its detections; the pose settings name it and the mechanism counts the same-fruit pairs it leaves apart only where the
-hybrid dedup took a rule, and the rule's predictions ignore the truth ids."""
+ignore the rule, and without it the dedup gives the band rule's landmarks, points to the micrometre. A run's dedup
+takes the rule of its detections; the pose settings name it and the mechanism counts the same-fruit pairs it leaves
+apart only where the hybrid dedup took a rule, and the rule's predictions ignore the truth ids."""
 
 import hashlib
 import json
@@ -42,8 +42,9 @@ C = 3.75   # row_y of LAYOUT
 PASS_A30, PASS_B30, PASS_A50, PASS_B50 = (
     PassKey(30.0, "A", 2), PassKey(30.0, "B", 1), PassKey(50.0, "A", 2), PassKey(50.0, "B", 1))
 BAND = DedupConfig(radius_m=0.09, band_m=0.05)
-# the band rule's landmarks of these 300 draws (members, then points), as the code gave them before the join rule
-KEYLESS_SHA256 = "e01687f25297dd4a3c9d9e2606efa9d2236ef58f6deec99c57cdffb0fa6756cc"
+# the band rule's landmarks of these 300 draws (members, then points to the micrometre), as the code gave them before
+# the join rule
+KEYLESS_SHA256 = "763a59b5d8ac0d91e0c47cc53883175934c97a4ace009f522a72aa7108e215e6"
 DIFFERING_DRAWS = 160   # the count this rule gives on these 300 draws
 
 
@@ -71,6 +72,12 @@ def _sets(lm) -> set[frozenset]:
 def _bytes(lm) -> tuple[bytes, bytes]:
     """The landmarks as bytes: the members' repr, then the points."""
     return repr(lm.members).encode(), lm.X.tobytes()
+
+
+def _pinned_bytes(lm) -> tuple[bytes, bytes]:
+    """The landmarks as bytes to hash against a pinned value: the members' repr, then the points rounded to the
+    micrometre (the last bits of the drawn points differ between machines)."""
+    return repr(lm.members).encode(), np.round(lm.X, 6).tobytes()
 
 
 def _rule(pts: list[PassTracks], join: str | None, cfg: DedupConfig = BAND) -> set[frozenset]:
@@ -189,10 +196,11 @@ def test_band_edge_pair_follows_the_mutual_rule():
 
 def test_wide_band_leaves_no_cross_pair_outside_it():
     """With 2 * band_m > radius_m no two entered tracks of different sides within the radius lie both outside the
-    band; without a rule (no argument or None) the dedup gives the band rule's landmarks byte for byte; the join rule
-    changes the landmarks of DIFFERING_DRAWS of the 300 draws and gives the same bytes when called again."""
+    band; without a rule the dedup gives the same bytes with no argument as with None, and the band rule's landmarks,
+    points to the micrometre; the join rule changes the landmarks of DIFFERING_DRAWS of the 300 draws and gives the
+    same bytes when called again."""
     outside = differing = 0
-    plain_sha, none_sha = hashlib.sha256(), hashlib.sha256()
+    keyless_sha = hashlib.sha256()
     for pts in _draws(300):
         keep = _all(*pts)
         entered = [p.X[dedup_module.side_filter(p, LAYOUT, "hybrid", BAND.band_m)] for p in pts]
@@ -203,15 +211,15 @@ def test_wide_band_leaves_no_cross_pair_outside_it():
         outside += int(np.triu(close & (side[:, None] != side[None]) & out[:, None] & out[None], k=1).sum())
         plain = dedup_module.dedup(pts, keep, LAYOUT, BAND, mode="hybrid")
         none = dedup_module.dedup(pts, keep, LAYOUT, BAND, mode="hybrid", join=None)
-        for sha, lm in ((plain_sha, plain), (none_sha, none)):
-            for part in _bytes(lm):
-                sha.update(part)
+        assert _bytes(none) == _bytes(plain)
+        for part in _pinned_bytes(plain):
+            keyless_sha.update(part)
         joined = dedup_module.dedup(pts, keep, LAYOUT, BAND, mode="hybrid", join="either_mutual")
         again = dedup_module.dedup(pts, keep, LAYOUT, BAND, mode="hybrid", join="either_mutual")
         assert _bytes(again) == _bytes(joined)
         differing += joined.members != none.members
     assert outside == 0
-    assert (plain_sha.hexdigest(), none_sha.hexdigest()) == (KEYLESS_SHA256, KEYLESS_SHA256)
+    assert keyless_sha.hexdigest() == KEYLESS_SHA256
     assert differing == DIFFERING_DRAWS
 
 
