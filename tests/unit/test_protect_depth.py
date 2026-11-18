@@ -27,6 +27,7 @@ import yaml
 from pydantic import ValidationError
 from typer.testing import CliRunner
 
+import counting.config.eval_schema as eval_schema
 import counting.evaluation.fusion as fusion
 import counting.evaluation.protect as protect
 import counting.evaluation.record as record
@@ -259,6 +260,16 @@ def _commit_all(repo: Path) -> None:
                     "c"], check=True)
 
 
+@pytest.fixture(autouse=True)
+def reopen_closed_seeds(monkeypatch):
+    """Reopen the held-out seeds of the fake bundles (1006 to 1008) for these tests and keep 1000 to 1005 closed:
+    the request checks and the splits check read the closed list of the earlier held-out seeds, so the rules they
+    check hold for open held-out seeds and the closed-seed refusals name the same seeds. The closed list itself is
+    checked in test_closed_seeds_are_listed_and_refused."""
+    monkeypatch.setattr(protect, "CLOSED_TEST_SEEDS", LEGACY_TEST_SEEDS)
+    monkeypatch.setattr(eval_schema, "CLOSED_TEST_SEEDS", LEGACY_TEST_SEEDS)
+
+
 @pytest.fixture(scope="module")
 def depth_held(tmp_path_factory):
     """The stand-in repository `repo`, the held-out bundles `tests` (seeds 1006 to 1008, shaken, with the LiDAR files
@@ -470,9 +481,9 @@ def opened(monkeypatch):
 
 def test_closed_seeds_are_listed_and_refused(depth_held, tmp_path):
     h = depth_held
-    assert CLOSED_TEST_SEEDS == LEGACY_TEST_SEEDS == frozenset(range(1000, 1006))
+    assert CLOSED_TEST_SEEDS == frozenset(range(1000, 1009)) and LEGACY_TEST_SEEDS == frozenset(range(1000, 1006))
     depth = load_yaml_model(ROOT / SPLITS, SplitsConfig)
-    assert depth.test == list(TEST_SEEDS) and not set(depth.test) & CLOSED_TEST_SEEDS
+    assert depth.test == list(TEST_SEEDS) and set(depth.test) <= CLOSED_TEST_SEEDS
     for cfg in (h.cfg, h.open_cfg):
         for rel, seeds in ((SPLITS_FIRST, [1000, 1001, 1002]), (SPLITS_POSE, [1003, 1004, 1005]),
                            (SPLITS_MIXED, [1005])):     # refused for the closed seed before the protect section

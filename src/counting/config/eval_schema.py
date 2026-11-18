@@ -509,12 +509,12 @@ class DedupConfig(BaseModel):
 
 
 # Held-out seeds already judged: no split=test request may list them again, and no other split may hold them.
-CLOSED_TEST_SEEDS: frozenset[int] = frozenset(range(1000, 1006))
+CLOSED_TEST_SEEDS: frozenset[int] = frozenset(range(1000, 1009))
 # The first held-out seed: a splits file lists every seed from it up under test only, so no other split (dev, val,
 # exp or train) scores a held-out bundle, judged or not.
 HELD_OUT_FIRST_SEED = 1000
-# The held-out seeds of the frozen configs written before the protect section. The same seeds as the closed ones,
-# kept apart because the two mean different things: a frozen config needs a protect section for any other seed.
+# The held-out seeds of the frozen configs written before the protect section. They are closed as well, but kept
+# apart because the two mean different things: a frozen config needs a protect section for any other seed.
 LEGACY_TEST_SEEDS: frozenset[int] = frozenset(range(1000, 1006))
 
 
